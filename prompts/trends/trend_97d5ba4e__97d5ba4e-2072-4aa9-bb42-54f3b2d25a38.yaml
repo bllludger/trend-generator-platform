@@ -1,0 +1,14 @@
+name: trend_97d5ba4e
+display_name: Амур на розовом атласе
+trend_id: 97d5ba4e-2072-4aa9-bb42-54f3b2d25a38
+system_prompt: Создай стильный гламурный коллаж. Несколько ракурсов, элегантная композиция,
+  профессиональная обработка.
+scene_prompt: Создай стильный гламурный коллаж. Несколько ракурсов, элегантная композиция,
+  профессиональная обработка.
+subject_prompt: ''
+negative_prompt: вульгарность, низкое качество
+negative_scene: вульгарность, низкое качество
+style_preset:
+  style: collage
+  glamour: true
+  multi_angle: true

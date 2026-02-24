@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+
+{% block title %}Пользователь {{ user.telegram_id }} - Admin Panel{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>👤 Пользователь: {{ user.telegram_id }}</h2>
+    
+    <form method="post" action="/admin-ui/users/{{ user.telegram_id }}" style="margin-top: 1rem;">
+        <div class="form-group">
+            <label>Telegram ID</label>
+            <input type="text" value="{{ user.telegram_id }}" disabled>
+        </div>
+        <div class="form-group">
+            <label>Баланс токенов</label>
+            <input type="number" name="token_balance" value="{{ user.token_balance }}" required>
+        </div>
+        <div class="form-group">
+            <label>Подписка активна</label>
+            <select name="subscription_active" required>
+                <option value="true" {% if user.subscription_active %}selected{% endif %}>Да</option>
+                <option value="false" {% if not user.subscription_active %}selected{% endif %}>Нет</option>
+            </select>
+        </div>
+        <button type="submit" class="btn">Сохранить</button>
+        <a href="/admin-ui/users" class="btn btn-secondary">Назад</a>
+    </form>
+    {% if request.query_params.get("updated") %}
+    <div class="alert alert-success" style="margin-top: 1rem;">Пользователь обновлён</div>
+    {% endif %}
+</div>
+
+<div class="card">
+    <div class="flex-between">
+        <h3>Задачи пользователя</h3>
+        <div class="flex">
+            <a href="/admin-ui/jobs?telegram_id={{ user.telegram_id }}" class="btn btn-secondary" style="padding: 0.5rem 1rem;">Все задачи</a>
+            <button onclick="exportUserJobs()" class="btn btn-secondary" style="padding: 0.5rem 1rem;">📥 Экспорт</button>
+        </div>
+    </div>
+    <div id="user-jobs">Загрузка...</div>
+</div>
+
+<div class="card">
+    <h3>📊 Статистика пользователя</h3>
+    <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); margin-top: 1rem;">
+        <div>
+            <div style="font-size: 0.9rem; color: #666;">Всего задач</div>
+            <div style="font-size: 1.5rem; font-weight: 600;" id="user-total-jobs">-</div>
+        </div>
+        <div>
+            <div style="font-size: 0.9rem; color: #666;">Успешно</div>
+            <div style="font-size: 1.5rem; font-weight: 600; color: #2e7d32;" id="user-succeeded-jobs">-</div>
+        </div>
+        <div>
+            <div style="font-size: 0.9rem; color: #666;">Ошибок</div>
+            <div style="font-size: 1.5rem; font-weight: 600; color: #c62828;" id="user-failed-jobs">-</div>
+        </div>
+        <div>
+            <div style="font-size: 0.9rem; color: #666;">Успешность</div>
+            <div style="font-size: 1.5rem; font-weight: 600;" id="user-success-rate">-</div>
+        </div>
+    </div>
+</div>
+
+<script>
+fetch(`/admin/users/{{ user.telegram_id }}/jobs`, {
+    headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+})
+.then(r => r.json())
+.then(jobs => {
+    const div = document.getElementById('user-jobs');
+    if (jobs.length === 0) {
+        div.innerHTML = '<p>Задач нет</p>';
+        return;
+    }
+    const table = document.createElement('table');
+    table.innerHTML = `
+        <tr>
+            <th>ID</th>
+            <th>Тренд</th>
+            <th>Статус</th>
+            <th>Токены</th>
+            <th>Ошибка</th>
+            <th>Создана</th>
+        </tr>
+    `;
+    jobs.forEach(job => {
+        const row = table.insertRow();
+        row.insertCell().innerHTML = `<code style="font-size: 0.8rem;">${job.job_id.substring(0, 12)}...</code>`;
+        row.insertCell().textContent = job.trend_id.substring(0, 12);
+        row.insertCell().textContent = job.status;
+        row.insertCell().textContent = job.reserved_tokens;
+        row.insertCell().textContent = job.error_code || '-';
+        row.insertCell().textContent = new Date().toLocaleString('ru');
+    });
+    div.innerHTML = '';
+    div.appendChild(table);
+    
+    // Calculate stats
+    const total = jobs.length;
+    const succeeded = jobs.filter(j => j.status === 'SUCCEEDED').length;
+    const failed = jobs.filter(j => j.status === 'FAILED').length;
+    const successRate = total > 0 ? ((succeeded / total) * 100).toFixed(1) : 0;
+    
+    document.getElementById('user-total-jobs').textContent = total;
+    document.getElementById('user-succeeded-jobs').textContent = succeeded;
+    document.getElementById('user-failed-jobs').textContent = failed;
+    document.getElementById('user-success-rate').textContent = successRate + '%';
+})
+.catch(e => {
+    document.getElementById('user-jobs').innerHTML = '<p>Ошибка загрузки задач</p>';
+});
+
+function exportUserJobs() {
+    fetch(`/admin/users/{{ user.telegram_id }}/jobs`, {
+        headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+    })
+    .then(r => r.json())
+    .then(jobs => {
+        let csv = 'ID,Тренд,Статус,Токены,Ошибка,Создана\n';
+        jobs.forEach(job => {
+            csv += `${job.job_id},${job.trend_id},${job.status},${job.reserved_tokens},"${job.error_code || ''}","${new Date().toLocaleString('ru')}"\n`;
+        });
+        
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `user_{{ user.telegram_id }}_jobs_${new Date().toISOString().split('T')[0]}.csv`;
+        link.click();
+    })
+    .catch(e => alert('Ошибка экспорта: ' + e.message));
+}
+</script>
+{% endblock %}

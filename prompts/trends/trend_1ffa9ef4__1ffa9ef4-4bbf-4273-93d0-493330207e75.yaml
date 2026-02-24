@@ -1,0 +1,11 @@
+name: trend_1ffa9ef4
+display_name: Уютное утро в спальне
+trend_id: 1ffa9ef4-4bbf-4273-93d0-493330207e75
+system_prompt: ''
+scene_prompt: 'Студийная постановочная сцена '
+subject_prompt: ''
+negative_prompt: ''
+negative_scene: blurry face, incorrect pose, missing earmuffs, missing snow boots,
+  cropped limbs, distorted proportions, unnatural lighting, painterly or illustrated
+  look
+style_preset: ''

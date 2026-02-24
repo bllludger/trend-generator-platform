@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+
+{% block title %}Дашборд - Admin Panel{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>📊 Общая статистика</h2>
+    <div class="grid">
+        <div class="stat-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+            <h3>Всего пользователей</h3>
+            <div class="value" id="users-total">-</div>
+        </div>
+        <div class="stat-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+            <h3>Активных подписок</h3>
+            <div class="value" id="users-subscribed">-</div>
+        </div>
+        <div class="stat-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
+            <h3>Всего задач</h3>
+            <div class="value" id="jobs-total">-</div>
+        </div>
+        <div class="stat-card" style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);">
+            <h3>Задач за 24ч</h3>
+            <div class="value" id="jobs-window">-</div>
+        </div>
+        <div class="stat-card" style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);">
+            <h3>В очереди</h3>
+            <div class="value" id="queue-length">-</div>
+        </div>
+        <div class="stat-card" style="background: linear-gradient(135deg, #30cfd0 0%, #330867 100%);">
+            <h3>Успешных</h3>
+            <div class="value" id="jobs-succeeded">-</div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <h2>📈 Статусы задач</h2>
+    <div id="jobs-by-status"></div>
+</div>
+
+<div class="card">
+    <h2>🎨 Топ трендов (за 24ч)</h2>
+    <div id="trends-top"></div>
+</div>
+
+<div class="card">
+    <h2>⚡ Быстрые действия</h2>
+    <div class="flex" style="gap: 1rem; flex-wrap: wrap;">
+        <a href="/admin-ui/trends/new" class="btn btn-success">➕ Создать тренд</a>
+        <a href="/admin-ui/users" class="btn">👥 Пользователи</a>
+        <a href="/admin-ui/jobs?status=FAILED" class="btn btn-danger">❌ Ошибки</a>
+        <a href="/admin-ui/jobs?status=RUNNING" class="btn btn-warning">⏳ В работе</a>
+        <a href="/admin-ui/cleanup" class="btn btn-secondary">🧹 Очистка</a>
+    </div>
+</div>
+
+<div class="card">
+    <h2>📊 Дополнительная статистика</h2>
+    <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));">
+        <div class="stat-card" style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);">
+            <h3>Ошибок за 24ч</h3>
+            <div class="value" id="jobs-failed">-</div>
+        </div>
+        <div class="stat-card" style="background: linear-gradient(135deg, #30cfd0 0%, #330867 100%);">
+            <h3>Успешность</h3>
+            <div class="value" id="success-rate">-</div>
+        </div>
+        <div class="stat-card" style="background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);">
+            <h3>Среднее в день</h3>
+            <div class="value" id="avg-per-day">-</div>
+        </div>
+    </div>
+</div>
+
+<script>
+async function loadDashboard() {
+    try {
+        const resp = await fetch('/admin/telemetry?window_hours=24', {
+            headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+        });
+        const data = await resp.json();
+        
+        document.getElementById('users-total').textContent = data.users_total || 0;
+        document.getElementById('users-subscribed').textContent = data.users_subscribed || 0;
+        document.getElementById('jobs-total').textContent = data.jobs_total || 0;
+        document.getElementById('jobs-window').textContent = data.jobs_window || 0;
+        document.getElementById('queue-length').textContent = data.queue_length || 0;
+        
+        const succeeded = data.jobs_by_status?.SUCCEEDED || 0;
+        const failed = data.jobs_by_status?.FAILED || 0;
+        const running = data.jobs_by_status?.RUNNING || 0;
+        const created = data.jobs_by_status?.CREATED || 0;
+        
+        document.getElementById('jobs-succeeded').textContent = succeeded;
+        document.getElementById('jobs-failed').textContent = failed;
+        
+        // Success rate
+        const total = succeeded + failed;
+        const successRate = total > 0 ? ((succeeded / total) * 100).toFixed(1) : 0;
+        document.getElementById('success-rate').textContent = successRate + '%';
+        
+        // Average per day
+        const avgPerDay = data.jobs_window ? (data.jobs_window / 1).toFixed(0) : 0;
+        document.getElementById('avg-per-day').textContent = avgPerDay;
+        
+        // Jobs by status
+        const statusDiv = document.getElementById('jobs-by-status');
+        statusDiv.innerHTML = '';
+        if (data.jobs_by_status) {
+            const table = document.createElement('table');
+            table.innerHTML = '<tr><th>Статус</th><th>Количество</th></tr>';
+            for (const [status, count] of Object.entries(data.jobs_by_status)) {
+                const row = table.insertRow();
+                row.insertCell().textContent = status;
+                row.insertCell().textContent = count;
+            }
+            statusDiv.appendChild(table);
+        }
+        
+        // Top trends
+        const trendsDiv = document.getElementById('trends-top');
+        trendsDiv.innerHTML = '';
+        if (data.trend_analytics_window) {
+            const table = document.createElement('table');
+            table.innerHTML = '<tr><th>Тренд</th><th>Всего</th><th>Успешно</th><th>Ошибок</th><th>Выбрано</th></tr>';
+            data.trend_analytics_window.slice(0, 10).forEach(t => {
+                const row = table.insertRow();
+                row.insertCell().innerHTML = `${t.emoji} ${t.name}`;
+                row.insertCell().textContent = t.jobs_window || 0;
+                row.insertCell().textContent = t.succeeded_window || 0;
+                row.insertCell().textContent = t.failed_window || 0;
+                row.insertCell().textContent = t.selected_window || 0;
+            });
+            trendsDiv.appendChild(table);
+        }
+    } catch (e) {
+        console.error('Failed to load dashboard:', e);
+    }
+}
+
+loadDashboard();
+setInterval(loadDashboard, 30000); // Refresh every 30s
+</script>
+{% endblock %}

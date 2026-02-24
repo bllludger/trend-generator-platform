@@ -1,0 +1,11 @@
+name: prompt_generation
+system_prompt_prefix: "You are an image generation system. Follow the trend instructions precisely."
+negative_prompt_prefix: "negative_prompt: "
+safety_constraints: "no text generation, no chat."
+image_constraints_template: "size={size}, format={format}"
+
+model: "gemini-2.5-flash-image"   # или "gemini-3-pro-image-preview" для качества
+# provider по коду определяется по IMAGE_PROVIDER, так что этого достаточно
+size: "1024x1024"
+format: "png"
+temperature: 0.7

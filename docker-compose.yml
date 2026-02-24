@@ -1,0 +1,134 @@
+services:
+  admin-ui:
+    build:
+      context: ./admin-frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./app:/app/app
+      - ./migrations:/app/migrations
+      - ./prompts:/app/prompts
+      - ./data/generated_images:/data/generated_images
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f --connect-timeout 5 --max-time 10 http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 60s
+
+  worker:
+    build: .
+    command: ["celery", "-A", "app.core.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+      - ./migrations:/app/migrations
+      - ./prompts:/app/prompts
+      - ./data/generated_images:/data/generated_images
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build: .
+    command: ["celery", "-A", "app.core.celery_app.celery_app", "beat", "--loglevel=INFO"]
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  bot:
+    build: .
+    command: ["python", "-m", "app.bot.main"]
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+      - ./migrations:/app/migrations
+      - ./prompts:/app/prompts
+      - ./data/generated_images:/data/generated_images
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  cleanup:
+    build: .
+    command: ["uvicorn", "app.cleanup.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      - ./app:/app/app
+      - ./migrations:/app/migrations
+      - ./prompts:/app/prompts
+      - ./data/generated_images:/data/generated_images
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trends}
+      POSTGRES_USER: ${POSTGRES_USER:-trends}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trends}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trends} -d ${POSTGRES_DB:-trends}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:

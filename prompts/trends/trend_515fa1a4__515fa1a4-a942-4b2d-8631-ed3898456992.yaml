@@ -1,0 +1,14 @@
+name: trend_515fa1a4
+display_name: Ночной кадр в машине
+trend_id: 515fa1a4-a942-4b2d-8631-ed3898456992
+system_prompt: Создай романтичную сцену в салоне автомобиля. Интимная атмосфера, мягкий
+  свет, уютный момент вдвоем.
+scene_prompt: Создай романтичную сцену в салоне автомобиля. Интимная атмосфера, мягкий
+  свет, уютный момент вдвоем.
+subject_prompt: ''
+negative_prompt: экстерьер машины, улица
+negative_scene: экстерьер машины, улица
+style_preset:
+  mood: intimate
+  style: car_interior
+  couple: true

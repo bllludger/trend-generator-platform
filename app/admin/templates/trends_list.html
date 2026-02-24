@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+
+{% block title %}Тренды - Admin Panel{% endblock %}
+
+{% block content %}
+<div class="flex-between">
+    <h2>🎨 Управление трендами</h2>
+    <a href="/admin-ui/trends/new" class="btn btn-success">+ Создать тренд</a>
+</div>
+
+<div class="card">
+    <table>
+        <thead>
+            <tr>
+                <th>Эмодзи</th>
+                <th>Название</th>
+                <th>Описание</th>
+                <th>Порядок</th>
+                <th>Статус</th>
+                <th>Действия</th>
+            </tr>
+        </thead>
+        <tbody id="trends-table">
+            <tr><td colspan="6">Загрузка...</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<script>
+async function loadTrends() {
+    try {
+        const resp = await fetch('/admin/trends', {
+            headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+        });
+        const trends = await resp.json();
+        
+        const tbody = document.getElementById('trends-table');
+        tbody.innerHTML = '';
+        
+        trends.forEach(trend => {
+            const row = tbody.insertRow();
+            row.insertCell().textContent = trend.emoji;
+            row.insertCell().textContent = trend.name;
+            row.insertCell().textContent = trend.description.substring(0, 50) + '...';
+            row.insertCell().textContent = trend.order_index;
+            const statusCell = row.insertCell();
+            statusCell.innerHTML = trend.enabled 
+                ? '<span class="badge badge-success">Включен</span>'
+                : '<span class="badge badge-error">Выключен</span>';
+            const actionsCell = row.insertCell();
+            actionsCell.innerHTML = `
+                <a href="/admin-ui/trends/${trend.id}" class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.8rem;">Редактировать</a>
+                ${trend.enabled 
+                    ? `<button onclick="toggleTrend('${trend.id}', false)" class="btn btn-warning" style="padding: 0.25rem 0.5rem; font-size: 0.8rem;">Выключить</button>`
+                    : `<button onclick="toggleTrend('${trend.id}', true)" class="btn btn-success" style="padding: 0.25rem 0.5rem; font-size: 0.8rem;">Включить</button>`
+                }
+            `;
+        });
+    } catch (e) {
+        console.error('Failed to load trends:', e);
+        document.getElementById('trends-table').innerHTML = '<tr><td colspan="6">Ошибка загрузки</td></tr>';
+    }
+}
+
+async function toggleTrend(id, enabled) {
+    if (!confirm(`Вы уверены, что хотите ${enabled ? 'включить' : 'выключить'} этот тренд?`)) {
+        return;
+    }
+    
+    try {
+        const resp = await fetch(`/admin/trends/${id}`, {
+            headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+        });
+        const trend = await resp.json();
+        
+        trend.enabled = enabled;
+        
+        await fetch(`/admin/trends/${id}`, {
+            method: 'PUT',
+            headers: {
+                'X-Admin-Key': '{{ admin_api_key or "" }}',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(trend)
+        });
+        
+        loadTrends();
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+}
+
+// Show success messages
+const urlParams = new URLSearchParams(window.location.search);
+if (urlParams.get('saved') || urlParams.get('created') || urlParams.get('deleted')) {
+    const msg = urlParams.get('saved') ? 'Тренд сохранён' : 
+                urlParams.get('created') ? 'Тренд создан' : 
+                'Тренд удалён';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-success';
+    alert.textContent = msg;
+    document.querySelector('.card').insertBefore(alert, document.querySelector('.card').firstChild);
+    setTimeout(() => alert.remove(), 3000);
+}
+
+loadTrends();
+</script>
+{% endblock %}

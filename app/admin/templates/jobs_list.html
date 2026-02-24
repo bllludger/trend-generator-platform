@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+
+{% block title %}Задачи - Admin Panel{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="flex-between">
+        <h2>⚙️ Задачи</h2>
+        <div class="flex">
+            <select id="status-filter" onchange="loadJobs()" style="padding: 0.5rem;">
+                <option value="">Все статусы</option>
+                <option value="CREATED">Создана</option>
+                <option value="RUNNING">Выполняется</option>
+                <option value="SUCCEEDED">Успешно</option>
+                <option value="FAILED">Ошибка</option>
+            </select>
+            <input type="text" class="search-box" id="telegram-search" placeholder="Telegram ID..." 
+                   onkeyup="if(event.key==='Enter') loadJobs()">
+            <button onclick="exportJobs()" class="btn btn-secondary">📥 Экспорт CSV</button>
+        </div>
+    </div>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Telegram ID</th>
+                <th>Тренд</th>
+                <th>Статус</th>
+                <th>Токены</th>
+                <th>Ошибка</th>
+                <th>Создана</th>
+                <th>Действия</th>
+            </tr>
+        </thead>
+        <tbody id="jobs-table">
+            <tr><td colspan="8">Загрузка...</td></tr>
+        </tbody>
+    </table>
+    
+    <div class="pagination" id="pagination"></div>
+</div>
+
+<script>
+let currentPage = 1;
+let currentStatus = '';
+let currentTelegram = '';
+
+function loadJobs(page = 1, status = '', telegramId = '') {
+    currentPage = page;
+    currentStatus = status;
+    currentTelegram = telegramId;
+    
+    const params = new URLSearchParams({ page, page_size: 20 });
+    if (status) params.append('status', status);
+    if (telegramId) params.append('telegram_id', telegramId);
+    
+    fetch(`/admin/jobs?${params}`, {
+        headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+    })
+    .then(r => r.json())
+    .then(data => {
+        const tbody = document.getElementById('jobs-table');
+        tbody.innerHTML = '';
+        
+        if (data.items.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8">Задачи не найдены</td></tr>';
+            return;
+        }
+        
+        data.items.forEach(job => {
+            const row = tbody.insertRow();
+            row.insertCell().innerHTML = `<code style="font-size: 0.8rem;">${job.job_id.substring(0, 8)}...</code>`;
+            row.insertCell().textContent = job.telegram_id || '-';
+            row.insertCell().textContent = job.trend_name || job.trend_id.substring(0, 8);
+            
+            const statusCell = row.insertCell();
+            const statusBadge = {
+                'CREATED': '<span class="badge badge-info">Создана</span>',
+                'RUNNING': '<span class="badge badge-warning">Выполняется</span>',
+                'SUCCEEDED': '<span class="badge badge-success">Успешно</span>',
+                'FAILED': '<span class="badge badge-error">Ошибка</span>'
+            }[job.status] || job.status;
+            statusCell.innerHTML = statusBadge;
+            
+            row.insertCell().textContent = job.reserved_tokens;
+            row.insertCell().textContent = job.error_code || '-';
+            row.insertCell().textContent = new Date(job.created_at).toLocaleString('ru');
+            const actionsCell = row.insertCell();
+            actionsCell.innerHTML = `
+                <a href="/admin-ui/jobs/${job.job_id}" class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.8rem;">Детали</a>
+            `;
+        });
+        
+        // Pagination
+        const pagination = document.getElementById('pagination');
+        pagination.innerHTML = '';
+        if (data.pages > 1) {
+            for (let i = 1; i <= data.pages; i++) {
+                const span = document.createElement(i === page ? 'span' : 'a');
+                span.textContent = i;
+                span.className = i === page ? 'current' : '';
+                if (i !== page) {
+                    span.href = '#';
+                    span.onclick = (e) => { e.preventDefault(); loadJobs(i, currentStatus, currentTelegram); };
+                }
+                pagination.appendChild(span);
+            }
+        }
+    })
+    .catch(e => {
+        console.error('Failed to load jobs:', e);
+        document.getElementById('jobs-table').innerHTML = '<tr><td colspan="8">Ошибка загрузки</td></tr>';
+    });
+}
+
+document.getElementById('telegram-search').addEventListener('keyup', (e) => {
+    if (e.key === 'Enter') {
+        loadJobs(1, currentStatus, e.target.value);
+    }
+});
+
+function exportJobs() {
+    const params = new URLSearchParams({ page: 1, page_size: 1000 });
+    if (currentStatus) params.append('status', currentStatus);
+    if (currentTelegram) params.append('telegram_id', currentTelegram);
+    
+    fetch(`/admin/jobs?${params}`, {
+        headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+    })
+    .then(r => r.json())
+    .then(data => {
+        let csv = 'ID,Telegram ID,Тренд,Статус,Токены,Ошибка,Создана\n';
+        data.items.forEach(job => {
+            csv += `${job.job_id},"${job.telegram_id || ''}","${job.trend_name || job.trend_id}",${job.status},${job.reserved_tokens},"${job.error_code || ''}","${new Date(job.created_at).toLocaleString('ru')}"\n`;
+        });
+        
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `jobs_${new Date().toISOString().split('T')[0]}.csv`;
+        link.click();
+    })
+    .catch(e => alert('Ошибка экспорта: ' + e.message));
+}
+
+loadJobs();
+</script>
+{% endblock %}

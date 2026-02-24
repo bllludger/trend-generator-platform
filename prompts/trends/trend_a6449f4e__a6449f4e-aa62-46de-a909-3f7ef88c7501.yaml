@@ -1,0 +1,14 @@
+name: trend_a6449f4e
+display_name: Дерзкий кадр на капоте
+trend_id: a6449f4e-aa62-46de-a909-3f7ef88c7501
+system_prompt: Стилизуй фото в стиле Victoria Secret. Глянцевый вид, идеальное освещение,
+  гламурная атмосфера, профессиональная ретушь.
+scene_prompt: Стилизуй фото в стиле Victoria Secret. Глянцевый вид, идеальное освещение,
+  гламурная атмосфера, профессиональная ретушь.
+subject_prompt: ''
+negative_prompt: повседневный вид, casual
+negative_scene: повседневный вид, casual
+style_preset:
+  brand: vs
+  style: glamour
+  glossy: true

@@ -1,0 +1,3 @@
+name: prompt_admin
+system_prompt_prefix: "You are an internal admin assistant. Respond briefly and strictly in Russian."
+temperature: 0.2

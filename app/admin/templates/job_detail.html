@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}Задача {{ job.job_id }} - Admin Panel{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>⚙️ Задача: {{ job.job_id }}</h2>
+    
+    <table style="margin-top: 1rem;">
+        <tr><th>Поле</th><th>Значение</th></tr>
+        <tr><td>ID</td><td><code>{{ job.job_id }}</code></td></tr>
+        <tr><td>Telegram ID</td><td>{{ job.telegram_id or '-' }}</td></tr>
+        <tr><td>Тренд</td><td>{{ job.trend_name or job.trend_id }}</td></tr>
+        <tr><td>Статус</td><td>
+            {% if job.status == 'SUCCEEDED' %}
+                <span class="badge badge-success">Успешно</span>
+            {% elif job.status == 'FAILED' %}
+                <span class="badge badge-error">Ошибка</span>
+            {% elif job.status == 'RUNNING' %}
+                <span class="badge badge-warning">Выполняется</span>
+            {% else %}
+                <span class="badge badge-info">{{ job.status }}</span>
+            {% endif %}
+        </td></tr>
+        <tr><td>Зарезервировано токенов</td><td>{{ job.reserved_tokens }}</td></tr>
+        <tr><td>Код ошибки</td><td>{{ job.error_code or '-' }}</td></tr>
+        <tr><td>Создана</td><td>{{ job.created_at }}</td></tr>
+        <tr><td>Обновлена</td><td>{{ job.updated_at }}</td></tr>
+    </table>
+    
+    <div style="margin-top: 1rem;">
+        <a href="/admin-ui/jobs" class="btn btn-secondary">Назад к списку</a>
+        {% if job.telegram_id %}
+        <a href="/admin-ui/users/{{ job.telegram_id }}" class="btn">Профиль пользователя</a>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

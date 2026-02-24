@@ -1,0 +1,14 @@
+name: trend_f4582e73
+display_name: Низкий ракурс среди небоскребов
+trend_id: f4582e73-9f2d-412f-bbb2-0b0dbeb5cbdc
+system_prompt: Создай изображение фото как экспоната в престижной арт-галерее. Рама,
+  подсветка, белые стены музея.
+scene_prompt: Создай изображение фото как экспоната в престижной арт-галерее. Рама,
+  подсветка, белые стены музея.
+subject_prompt: ''
+negative_prompt: домашняя обстановка
+negative_scene: домашняя обстановка
+style_preset:
+  frame: elegant
+  style: gallery
+  museum: true

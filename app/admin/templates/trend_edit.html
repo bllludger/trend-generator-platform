@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+
+{% block title %}{% if trend %}Редактирование{% else %}Создание{% endif %} тренда - Admin Panel{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>{% if trend %}✏️ Редактирование тренда{% else %}➕ Создание нового тренда{% endif %}</h2>
+    
+    <form id="trend-form" method="post" action="{% if trend %}/admin-ui/trends/{{ trend.id }}{% else %}/admin-ui/trends{% endif %}">
+        <div class="form-group">
+            <label>Название *</label>
+            <input type="text" name="name" value="{{ trend.name if trend else '' }}" required>
+        </div>
+        
+        <div class="form-group">
+            <label>Эмодзи *</label>
+            <input type="text" name="emoji" value="{{ trend.emoji if trend else '' }}" required maxlength="2" placeholder="🎨">
+            <small style="color: #666;">Один эмодзи для отображения</small>
+        </div>
+        
+        <div class="form-group">
+            <label>Описание *</label>
+            <textarea name="description" required>{{ trend.description if trend else '' }}</textarea>
+        </div>
+        
+        <div class="form-group">
+            <label>System Prompt *</label>
+            <textarea name="system_prompt" required style="min-height: 150px; font-family: monospace;">{{ trend.system_prompt if trend else '' }}</textarea>
+            <small style="color: #666;">Основной промпт для генерации</small>
+        </div>
+        
+        <div class="form-group">
+            <label>Negative Prompt</label>
+            <textarea name="negative_prompt" style="min-height: 100px; font-family: monospace;">{{ trend.negative_prompt if trend else '' }}</textarea>
+            <small style="color: #666;">Что исключить из результата</small>
+        </div>
+        
+        <div class="form-group">
+            <label>Style Preset (JSON)</label>
+            <textarea name="style_preset" style="min-height: 100px; font-family: monospace;">{{ (trend.style_preset | tojson(indent=2)) if trend and trend.style_preset else '{}' }}</textarea>
+            <small style="color: #666;">JSON объект с настройками стиля</small>
+        </div>
+        
+        <div class="flex" style="gap: 1rem;">
+            <div class="form-group" style="flex: 1;">
+                <label>Максимум изображений</label>
+                <input type="number" name="max_images" value="{{ trend.max_images if trend else 1 }}" min="1" max="10">
+            </div>
+            
+            <div class="form-group" style="flex: 1;">
+                <label>Порядок сортировки</label>
+                <input type="number" name="order_index" value="{{ trend.order_index if trend else 0 }}" min="0">
+            </div>
+        </div>
+        
+        <div class="form-group">
+            <label>
+                <input type="checkbox" name="enabled" {% if not trend or trend.enabled %}checked{% endif %}>
+                Тренд активен
+            </label>
+        </div>
+        
+        <div class="flex" style="margin-top: 1.5rem;">
+            <button type="submit" class="btn">💾 Сохранить</button>
+            <a href="/admin-ui/trends" class="btn btn-secondary">❌ Отмена</a>
+            {% if trend %}
+            <button type="button" onclick="deleteTrend()" class="btn btn-danger">🗑️ Удалить</button>
+            {% endif %}
+        </div>
+    </form>
+</div>
+
+{% if trend %}
+<script>
+async function deleteTrend() {
+    if (!confirm('Вы уверены, что хотите удалить этот тренд? Он будет отключен.')) {
+        return;
+    }
+    
+    try {
+        const resp = await fetch('/admin/trends/{{ trend.id }}', {
+            method: 'DELETE',
+            headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+        });
+        if (resp.ok) {
+            window.location.href = '/admin-ui/trends?deleted=1';
+        } else {
+            alert('Ошибка при удалении');
+        }
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+}
+
+document.getElementById('trend-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    
+    // Parse style_preset JSON
+    let stylePreset = {};
+    try {
+        stylePreset = JSON.parse(formData.get('style_preset') || '{}');
+    } catch (err) {
+        alert('Ошибка в JSON style_preset: ' + err.message);
+        return;
+    }
+    
+    const payload = {
+        name: formData.get('name'),
+        emoji: formData.get('emoji'),
+        description: formData.get('description'),
+        system_prompt: formData.get('system_prompt'),
+        negative_prompt: formData.get('negative_prompt') || '',
+        style_preset: stylePreset,
+        max_images: parseInt(formData.get('max_images') || '1'),
+        order_index: parseInt(formData.get('order_index') || '0'),
+        enabled: formData.get('enabled') === 'on',
+    };
+    
+    try {
+        const url = '{% if trend %}/admin/trends/{{ trend.id }}{% else %}/admin/trends{% endif %}';
+        const method = '{% if trend %}PUT{% else %}POST{% endif %}';
+        
+        const resp = await fetch(url, {
+            method: method,
+            headers: {
+                'X-Admin-Key': '{{ admin_api_key or "" }}',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        
+        if (resp.ok) {
+            window.location.href = '/admin-ui/trends?saved=1';
+        } else {
+            const error = await resp.json();
+            alert('Ошибка: ' + (error.detail || 'Неизвестная ошибка'));
+        }
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+});
+</script>
+{% else %}
+<script>
+document.getElementById('trend-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    
+    let stylePreset = {};
+    try {
+        stylePreset = JSON.parse(formData.get('style_preset') || '{}');
+    } catch (err) {
+        alert('Ошибка в JSON style_preset: ' + err.message);
+        return;
+    }
+    
+    const payload = {
+        name: formData.get('name'),
+        emoji: formData.get('emoji'),
+        description: formData.get('description'),
+        system_prompt: formData.get('system_prompt'),
+        negative_prompt: formData.get('negative_prompt') || '',
+        style_preset: stylePreset,
+        max_images: parseInt(formData.get('max_images') || '1'),
+        order_index: parseInt(formData.get('order_index') || '0'),
+        enabled: formData.get('enabled') === 'on',
+    };
+    
+    try {
+        const resp = await fetch('/admin/trends', {
+            method: 'POST',
+            headers: {
+                'X-Admin-Key': '{{ admin_api_key or "" }}',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        
+        if (resp.ok) {
+            window.location.href = '/admin-ui/trends?created=1';
+        } else {
+            const error = await resp.json();
+            alert('Ошибка: ' + (error.detail || 'Неизвестная ошибка'));
+        }
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+});
+</script>
+{% endif %}
+{% endblock %}

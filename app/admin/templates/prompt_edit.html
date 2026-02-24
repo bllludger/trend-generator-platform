@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block title %}Редактирование промпта: {{ name }} - Admin Panel{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>📝 Редактирование промпта: {{ name }}</h2>
+    
+    <form method="post" action="/admin-ui/{% if 'trend-prompts' in request.url.path %}trend-prompts/{{ name }}{% else %}prompts/{{ name }}{% endif %}">
+        <div class="form-group">
+            <label>YAML конфигурация</label>
+            <textarea name="raw_yaml" required style="min-height: 500px; font-family: monospace; font-size: 0.9rem;">{{ raw_yaml }}</textarea>
+            <small style="color: #666;">Используйте YAML формат. Изменения сохраняются в файл.</small>
+        </div>
+        
+        <div class="flex" style="margin-top: 1rem;">
+            <button type="submit" class="btn">💾 Сохранить</button>
+            <a href="/admin-ui/{% if 'trend-prompts' in request.url.path %}trend-prompts{% else %}prompts{% endif %}" class="btn btn-secondary">❌ Отмена</a>
+        </div>
+    </form>
+</div>
+
+<div class="card">
+    <h3>ℹ️ Справка</h3>
+    <p>Доступные поля в промпте:</p>
+    <ul style="margin-left: 2rem; margin-top: 0.5rem;">
+        <li><code>name</code> - имя промпта</li>
+        <li><code>display_name</code> - отображаемое имя</li>
+        <li><code>system_prompt</code> - системный промпт</li>
+        <li><code>negative_prompt</code> - негативный промпт</li>
+        <li><code>style_preset</code> - настройки стиля (JSON объект)</li>
+        <li><code>model</code> - модель OpenAI</li>
+        <li><code>size</code> - размер изображения</li>
+        <li><code>format</code> - формат изображения</li>
+    </ul>
+</div>
+{% endblock %}

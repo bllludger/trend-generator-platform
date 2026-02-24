@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+
+{% block title %}Аудит - Admin Panel{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="flex-between">
+        <h2>📝 История аудита</h2>
+        <div class="flex">
+            <select id="action-filter" onchange="loadAudit()" style="padding: 0.5rem;">
+                <option value="">Все действия</option>
+                <option value="start">Старт</option>
+                <option value="trend_selected">Выбор тренда</option>
+                <option value="job_created">Создание задачи</option>
+                <option value="job_succeeded">Успешная задача</option>
+                <option value="job_failed">Ошибка задачи</option>
+                <option value="create">Создание</option>
+                <option value="update">Обновление</option>
+                <option value="delete">Удаление</option>
+            </select>
+        </div>
+    </div>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>Время</th>
+                <th>Актор</th>
+                <th>Действие</th>
+                <th>Сущность</th>
+                <th>ID</th>
+                <th>Данные</th>
+            </tr>
+        </thead>
+        <tbody id="audit-table">
+            <tr><td colspan="6">Загрузка...</td></tr>
+        </tbody>
+    </table>
+    
+    <div class="pagination" id="pagination"></div>
+</div>
+
+<script>
+let currentPage = 1;
+let currentAction = '';
+
+function loadAudit(page = 1, action = '') {
+    currentPage = page;
+    currentAction = action;
+    
+    const params = new URLSearchParams({ page, page_size: 50 });
+    if (action) params.append('action', action);
+    
+    fetch(`/admin/audit?${params}`, {
+        headers: { 'X-Admin-Key': '{{ admin_api_key or "" }}' }
+    })
+    .then(r => r.json())
+    .then(data => {
+        const tbody = document.getElementById('audit-table');
+        tbody.innerHTML = '';
+        
+        if (data.items.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6">Записи не найдены</td></tr>';
+            return;
+        }
+        
+        data.items.forEach(log => {
+            const row = tbody.insertRow();
+            row.insertCell().textContent = new Date(log.created_at).toLocaleString('ru');
+            row.insertCell().textContent = `${log.actor_type}${log.actor_id ? ':' + log.actor_id : ''}`;
+            row.insertCell().textContent = log.action;
+            row.insertCell().textContent = log.entity_type;
+            row.insertCell().innerHTML = log.entity_id 
+                ? `<code style="font-size: 0.8rem;">${log.entity_id.substring(0, 12)}...</code>`
+                : '-';
+            row.insertCell().innerHTML = `<pre style="font-size: 0.75rem; margin: 0;">${JSON.stringify(log.payload, null, 2).substring(0, 100)}...</pre>`;
+        });
+        
+        // Pagination
+        const pagination = document.getElementById('pagination');
+        pagination.innerHTML = '';
+        if (data.pages > 1) {
+            for (let i = 1; i <= data.pages; i++) {
+                const span = document.createElement(i === page ? 'span' : 'a');
+                span.textContent = i;
+                span.className = i === page ? 'current' : '';
+                if (i !== page) {
+                    span.href = '#';
+                    span.onclick = (e) => { e.preventDefault(); loadAudit(i, currentAction); };
+                }
+                pagination.appendChild(span);
+            }
+        }
+    })
+    .catch(e => {
+        console.error('Failed to load audit:', e);
+        document.getElementById('audit-table').innerHTML = '<tr><td colspan="6">Ошибка загрузки</td></tr>';
+    });
+}
+
+loadAudit();
+</script>
+{% endblock %}

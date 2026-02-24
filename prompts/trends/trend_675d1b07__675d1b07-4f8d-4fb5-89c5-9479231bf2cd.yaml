@@ -1,0 +1,56 @@
+name: trend_675d1b07
+display_name: Школьная любовь
+trend_id: 675d1b07-4f8d-4fb5-89c5-9479231bf2cd
+system_prompt: Создай триптих из трех кадров в стиле фото с вебкамеры ноутбука. Легкая
+  зернистость, естественное освещение от экрана.
+scene_prompt: 'A hand-drawn cartoon illustration showing two stylized human characters
+  standing back-to-back in a bedroom interior. The left character is a female-presenting
+  cartoon figure standing slightly forward, turned three-quarters to the left, holding
+  a smartphone up at arm’s length as if taking a mirror selfie. She has long straight
+  brown hair that falls past her shoulders, parted slightly off-center. Her face is
+  rounded with large simplified eyes; one eye is closed in a wink, the other open,
+  and her lips are puckered as if blowing a kiss. She is wearing an oversized short-sleeve
+  sports jersey in red with vertical blue stripes, loose gray pants, and socks. The
+  phone is rectangular, dark gray, with visible rear camera lenses. Her arm is bent
+  naturally, wrist angled inward toward the mirror.
+
+
+  Behind her, touching back-to-back, is a male-presenting cartoon figure facing the
+  opposite direction, turned three-quarters to the right. He has short black hair
+  with a rounded, slightly tousled silhouette. His facial expression is neutral, eyes
+  looking off to the side, not toward the viewer. He is holding a smartphone low in
+  one hand near his hip, screen facing inward. He is wearing a loose blue sports jersey
+  and light blue jeans with a relaxed fit, and socks. Their backs are in contact,
+  forming a mirrored, opposing pose.
+
+
+  The environment is a simple bedroom drawn with minimal line detail. A large bed
+  with a tall headboard is positioned behind them, covered in white bedding with visible
+  folds and creases. Pillows are loosely arranged. To the left side of the scene is
+  a tall mirror with a thin frame, angled slightly toward the characters, implied
+  by perspective lines. Behind the bed, faint vertical lines suggest curtains or drapes.
+  The background is mostly white with light gray linework, minimal shading, and no
+  detailed textures.
+
+
+  At the top of the illustration, centered slightly left, is the text “Love is…” in
+  a serif-style font, black, with a small red heart above the word “is.” At the bottom
+  of the illustration is a caption in two languages: first in Cyrillic script, then
+  in English, reading “…sharing your best sides with each other.” The text is centered
+  and rendered in a clean, readable font. The characters occupy the central vertical
+  area of the image, with generous white space around them.'
+subject_prompt: ''
+negative_prompt: профессиональное освещение, студийный свет
+negative_scene: Photorealism, realistic textures, detailed facial features, different
+  pose or orientation, different clothing colors or patterns, additional characters,
+  background clutter, dramatic lighting, shadows, perspective changes, altered text
+  content or placement, missing phones, incorrect body proportions.
+style_preset: 'Flat, hand-drawn cartoon illustration with clean black outlines and
+  soft, minimal shading. Colors are muted but clear: red and blue clothing contrasts
+  against a predominantly white background. Skin tones are light peach with subtle
+  blush on the cheeks. Lighting is even and diffuse with no visible light source,
+  shadows, or highlights beyond simple color fills. No realistic depth of field; all
+  elements are in equal focus. Perspective is slightly elevated, looking down at the
+  characters at a mild angle, but mostly frontal. Line weight is consistent, giving
+  a clean comic-strip aesthetic. The image is sharp with no grain or noise, resembling
+  a digital illustration rather than a photograph.'
