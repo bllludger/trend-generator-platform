@@ -157,8 +157,8 @@ class UserService:
 
     def debit_tokens_for_unlock(self, user: User, job_id: str, amount: int) -> bool:
         """
-        Списание токенов с баланса при разблокировке фото (кнопка «За N токен»).
-        Не используется при оплате unlock за Stars.
+        Списание HD-кредитов (promo first, затем paid) при разблокировке фото.
+        Обратная совместимость: старые вызовы продолжают работать, но списывают из hd_balance.
         Атомарно: row-level lock + HOLD и CAPTURE в ledger.
         Возвращает True если успешно.
         """
@@ -167,25 +167,21 @@ class UserService:
         try:
             if self._ledger_exists(user.id, job_id, "HOLD"):
                 return True  # уже списано
-            locked_user = (
-                self.db.query(User)
-                .filter(User.id == user.id)
-                .with_for_update()
-                .one()
-            )
-            if locked_user.token_balance < amount:
+
+            from app.services.hd_balance.service import HDBalanceService
+            hd_svc = HDBalanceService(self.db)
+            if not hd_svc.spend(user, amount):
                 return False
-            locked_user.token_balance -= amount
+
             ledger = TokenLedger(
-                user_id=locked_user.id,
+                user_id=user.id,
                 job_id=job_id,
                 operation="HOLD",
                 amount=amount,
             )
             self.db.add(ledger)
-            # Сразу CAPTURE (разблокировка = финальная операция)
             capture = TokenLedger(
-                user_id=locked_user.id,
+                user_id=user.id,
                 job_id=f"{job_id}:unlock",
                 operation="CAPTURE",
                 amount=amount,

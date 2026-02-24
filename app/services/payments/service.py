@@ -19,7 +19,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.pack import Pack
 from app.models.payment import Payment
+from app.models.session import Session as SessionModel
+from app.models.take import Take
 from app.models.user import User
+from app.services.sessions.service import SessionService
+from app.services.hd_balance.service import HDBalanceService
 
 logger = logging.getLogger(__name__)
 
@@ -209,31 +213,60 @@ class PaymentService:
         """
         Валидация pre_checkout_query.
         Returns: (ok, error_message)
+        Supports payloads: legacy (pack:...:user:...), session:{pack_id}, upgrade:{pack_id}:{session_id}
         """
+        # New session-based payloads
+        if payload.startswith("session:") or payload.startswith("upgrade:"):
+            user = self.db.query(User).filter(User.telegram_id == telegram_user_id).one_or_none()
+            if not user:
+                return False, "Пользователь не найден"
+            if user.is_access_blocked():
+                return False, "Ваш аккаунт заблокирован"
+            if not self._check_rate_limit(telegram_user_id):
+                return False, "Слишком много покупок. Попробуйте позже."
+
+            if payload.startswith("session:"):
+                pack_id = payload.split(":", 1)[1]
+                pack = self.get_pack(pack_id)
+                if not pack or not pack.enabled:
+                    return False, "Пакет недоступен"
+                if pack.is_trial and user.trial_purchased:
+                    return False, "Trial уже использован"
+            elif payload.startswith("upgrade:"):
+                parts = payload.split(":")
+                if len(parts) != 3:
+                    return False, "Некорректный payload"
+                pack_id, old_session_id = parts[1], parts[2]
+                pack = self.get_pack(pack_id)
+                if not pack or not pack.enabled:
+                    return False, "Пакет недоступен"
+                old_session = self.db.query(SessionModel).filter(SessionModel.id == old_session_id).one_or_none()
+                if not old_session or old_session.user_id != user.id:
+                    return False, "Сессия не найдена"
+
+            return True, ""
+
+        # Legacy payloads
         full_payload = self.resolve_payload(payload)
         parsed = self.parse_payload(full_payload)
         if not parsed.get("pack_id") or not parsed.get("user_id"):
             return False, "Некорректный payload"
 
-        # Проверяем соответствие Telegram ID
         user = self.db.query(User).filter(User.telegram_id == telegram_user_id).one_or_none()
         if not user:
             return False, "Пользователь не найден"
         if user.id != parsed["user_id"]:
             return False, "Несоответствие пользователя"
 
-        # Проверяем бан
         if user.is_access_blocked():
             return False, "Ваш аккаунт заблокирован"
 
-        # Проверяем пакет
         pack_id = parsed["pack_id"]
         if pack_id != "unlock":
             pack = self.get_pack(pack_id)
             if not pack or not pack.enabled:
                 return False, "Пакет недоступен"
 
-        # Rate-limit
         if not self._check_rate_limit(telegram_user_id):
             return False, "Слишком много покупок. Попробуйте позже."
 
@@ -452,6 +485,192 @@ class PaymentService:
             .filter(Payment.telegram_payment_charge_id == charge_id)
             .one_or_none()
         )
+
+    # ------------------------------------------------------------------
+    # Session-based purchases
+    # ------------------------------------------------------------------
+
+    def process_session_purchase(
+        self,
+        telegram_user_id: str,
+        telegram_payment_charge_id: str,
+        provider_payment_charge_id: str | None,
+        pack_id: str,
+        stars_amount: int,
+        payload: str,
+    ) -> tuple[Payment | None, SessionModel | None]:
+        """
+        Process session pack purchase: create Session, credit HD to user, record Payment.
+        Attaches free Take (from pre-session) to the new session if exists.
+        """
+        existing = (
+            self.db.query(Payment)
+            .filter(Payment.telegram_payment_charge_id == telegram_payment_charge_id)
+            .one_or_none()
+        )
+        if existing:
+            return existing, None
+
+        try:
+            user = (
+                self.db.query(User)
+                .filter(User.telegram_id == telegram_user_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if not user:
+                return None, None
+
+            pack = self.get_pack(pack_id)
+            if not pack:
+                return None, None
+
+            session_svc = SessionService(self.db)
+            hd_svc = HDBalanceService(self.db)
+
+            session = session_svc.create_session(user.id, pack_id)
+            hd_svc.credit_paid(user, pack.hd_amount or 0)
+
+            if pack.is_trial:
+                from sqlalchemy import update as sa_update
+                res = self.db.execute(
+                    sa_update(User)
+                    .where(User.id == user.id, (User.trial_purchased == False) | (User.trial_purchased == None))
+                    .values(trial_purchased=True)
+                )
+                if res.rowcount == 0:
+                    raise ValueError("Trial уже использован (race condition guard)")
+
+            # Attach free Take from pre-session
+            free_session = (
+                self.db.query(SessionModel)
+                .filter(
+                    SessionModel.user_id == user.id,
+                    SessionModel.pack_id == "free_preview",
+                    SessionModel.status == "active",
+                )
+                .first()
+            )
+            if free_session:
+                free_takes = self.db.query(Take).filter(Take.session_id == free_session.id).all()
+                for take in free_takes:
+                    session_svc.attach_take_to_session(take, session)
+                session.takes_used = min(len(free_takes), session.takes_limit)
+                free_session.status = "completed"
+                self.db.add(free_session)
+                self.db.add(session)
+
+            payment = Payment(
+                user_id=user.id,
+                telegram_payment_charge_id=telegram_payment_charge_id,
+                provider_payment_charge_id=provider_payment_charge_id,
+                pack_id=pack_id,
+                stars_amount=stars_amount,
+                tokens_granted=0,
+                status="completed",
+                payload=payload,
+                session_id=session.id,
+            )
+            self.db.add(payment)
+            self.db.flush()
+
+            logger.info(
+                "session_purchase_completed",
+                extra={
+                    "user_id": user.id,
+                    "pack_id": pack_id,
+                    "session_id": session.id,
+                    "hd_credited": pack.hd_amount,
+                },
+            )
+            return payment, session
+        except IntegrityError:
+            self.db.rollback()
+            return (
+                self.db.query(Payment)
+                .filter(Payment.telegram_payment_charge_id == telegram_payment_charge_id)
+                .one_or_none()
+            ), None
+
+    def process_session_upgrade(
+        self,
+        telegram_user_id: str,
+        telegram_payment_charge_id: str,
+        provider_payment_charge_id: str | None,
+        new_pack_id: str,
+        old_session_id: str,
+        stars_amount: int,
+        payload: str,
+    ) -> tuple[Payment | None, SessionModel | None]:
+        """
+        Process session upgrade: create new Session, credit HD, mark old as upgraded.
+        """
+        existing = (
+            self.db.query(Payment)
+            .filter(Payment.telegram_payment_charge_id == telegram_payment_charge_id)
+            .one_or_none()
+        )
+        if existing:
+            return existing, None
+
+        try:
+            user = (
+                self.db.query(User)
+                .filter(User.telegram_id == telegram_user_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if not user:
+                return None, None
+
+            new_pack = self.get_pack(new_pack_id)
+            old_session = self.db.query(SessionModel).filter(SessionModel.id == old_session_id).one_or_none()
+            if not new_pack or not old_session:
+                return None, None
+
+            old_pack = self.get_pack(old_session.pack_id)
+            credit_stars = old_pack.stars_price if old_pack else 0
+
+            session_svc = SessionService(self.db)
+            hd_svc = HDBalanceService(self.db)
+
+            new_session = session_svc.upgrade_session(old_session, new_pack_id, credit_stars)
+            old_hd = (old_pack.hd_amount or 0) if old_pack else 0
+            delta_hd = max(0, (new_pack.hd_amount or 0) - old_hd)
+            hd_svc.credit_paid(user, delta_hd)
+
+            payment = Payment(
+                user_id=user.id,
+                telegram_payment_charge_id=telegram_payment_charge_id,
+                provider_payment_charge_id=provider_payment_charge_id,
+                pack_id=new_pack_id,
+                stars_amount=stars_amount,
+                tokens_granted=0,
+                status="completed",
+                payload=payload,
+                session_id=new_session.id,
+            )
+            self.db.add(payment)
+            self.db.flush()
+
+            logger.info(
+                "session_upgrade_completed",
+                extra={
+                    "user_id": user.id,
+                    "old_session": old_session_id,
+                    "new_session": new_session.id,
+                    "pack_id": new_pack_id,
+                    "credit_stars": credit_stars,
+                },
+            )
+            return payment, new_session
+        except IntegrityError:
+            self.db.rollback()
+            return (
+                self.db.query(Payment)
+                .filter(Payment.telegram_payment_charge_id == telegram_payment_charge_id)
+                .one_or_none()
+            ), None
 
     # ------------------------------------------------------------------
     # Rate-limit (Redis — общий для всех воркеров/реплик бота)

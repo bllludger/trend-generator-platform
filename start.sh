@@ -353,6 +353,15 @@ fi
 if [ -f migrations/039_premium_packs.sql ]; then
     $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/039_premium_packs.sql 2>/dev/null || true
 fi
+if [ -f migrations/040_sessions_takes_favorites.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/040_sessions_takes_favorites.sql 2>/dev/null || true
+fi
+if [ -f migrations/041_migrate_tokens_to_hd.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/041_migrate_tokens_to_hd.sql 2>/dev/null || true
+fi
+if [ -f migrations/042_favorites_updated_at.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/042_favorites_updated_at.sql 2>/dev/null || true
+fi
 # Роль postgres: создать или обновить пароль (внешние клиенты/IDE часто подключаются как postgres → убираем FATAL в логах)
 if ! $COMPOSE_CMD exec -T db psql -U trends -d trends -c "
 DO \$\$

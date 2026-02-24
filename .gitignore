@@ -90,3 +90,6 @@ logs/
 
 # Docker
 .docker/
+
+.env
+.env.*

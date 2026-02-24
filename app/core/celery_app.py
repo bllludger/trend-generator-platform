@@ -14,6 +14,9 @@ celery_app = Celery(
     include=[
         "app.workers.tasks.broadcast",
         "app.workers.tasks.generation_v2",
+        "app.workers.tasks.generate_take",
+        "app.workers.tasks.deliver_hd",
+        "app.workers.tasks.watchdog_rendering",
         "app.referral.tasks",
     ],
 )
@@ -32,7 +35,15 @@ celery_app.conf.update(
             "task": "app.referral.tasks.process_pending_bonuses",
             "schedule": crontab(minute="*/30"),
         },
+        "reset-stuck-rendering": {
+            "task": "app.workers.tasks.watchdog_rendering.reset_stuck_rendering",
+            "schedule": crontab(minute="*/5"),
+        },
     },
 )
+
+celery_app.conf.task_routes = {
+    "app.workers.tasks.generate_take.generate_take": {"queue": "generation"},
+}
 
 celery_app.autodiscover_tasks(["app.workers.tasks", "app.referral"])

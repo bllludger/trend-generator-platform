@@ -35,7 +35,7 @@ services:
 
   worker:
     build: .
-    command: ["celery", "-A", "app.core.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    command: ["celery", "-A", "app.core.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=2", "-Q", "celery,generation"]
     env_file:
       - .env
     volumes:

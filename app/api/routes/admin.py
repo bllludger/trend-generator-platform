@@ -782,9 +782,24 @@ def payments_refund(payment_id: str, db: Session = Depends(get_db)):
 # ---------- Packs ----------
 @router.get("/packs")
 def packs_list(db: Session = Depends(get_db)):
-    svc = PaymentService(db)
     packs = db.query(Pack).order_by(Pack.order_index).all()
-    return [{"id": p.id, "name": p.name, "emoji": p.emoji, "tokens": p.tokens, "stars_price": p.stars_price, "enabled": p.enabled, "order_index": getattr(p, "order_index", 0)} for p in packs]
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "emoji": p.emoji,
+            "tokens": p.tokens,
+            "stars_price": p.stars_price,
+            "enabled": p.enabled,
+            "order_index": getattr(p, "order_index", 0),
+            "takes_limit": p.takes_limit,
+            "hd_amount": p.hd_amount,
+            "is_trial": p.is_trial,
+            "pack_type": p.pack_type,
+            "upgrade_target_pack_ids": p.upgrade_target_pack_ids,
+        }
+        for p in packs
+    ]
 
 
 @router.put("/packs/{pack_id}")
@@ -792,7 +807,12 @@ def packs_update(pack_id: str, payload: dict, db: Session = Depends(get_db)):
     pack = db.query(Pack).filter(Pack.id == pack_id).first()
     if not pack:
         raise HTTPException(404, "Pack not found")
-    for key in ("name", "emoji", "tokens", "stars_price", "enabled", "order_index", "description"):
+    allowed_keys = (
+        "name", "emoji", "tokens", "stars_price", "enabled", "order_index",
+        "description", "takes_limit", "hd_amount", "is_trial", "pack_type",
+        "upgrade_target_pack_ids",
+    )
+    for key in allowed_keys:
         if key in payload and payload[key] is not None:
             setattr(pack, key, payload[key])
     db.add(pack)
@@ -811,6 +831,11 @@ def packs_create(payload: dict, db: Session = Depends(get_db)):
         stars_price=int(payload.get("stars_price", 0)),
         enabled=bool(payload.get("enabled", True)),
         order_index=int(payload.get("order_index", 0)),
+        takes_limit=payload.get("takes_limit"),
+        hd_amount=payload.get("hd_amount"),
+        is_trial=bool(payload.get("is_trial", False)),
+        pack_type=payload.get("pack_type", "session"),
+        upgrade_target_pack_ids=payload.get("upgrade_target_pack_ids"),
     )
     db.add(pack)
     db.commit()
@@ -826,6 +851,49 @@ def packs_delete(pack_id: str, db: Session = Depends(get_db)):
     db.delete(pack)
     db.commit()
     return {"ok": True}
+
+
+# ---------- Sessions ----------
+from app.models.session import Session as SessionModel
+
+
+@router.get("/sessions")
+def sessions_list(
+    db: Session = Depends(get_db),
+    user_id: str | None = Query(None),
+    status: str | None = Query(None),
+    pack_id: str | None = Query(None),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List sessions with optional filters."""
+    q = db.query(SessionModel)
+    if user_id:
+        q = q.filter(SessionModel.user_id == user_id)
+    if status:
+        q = q.filter(SessionModel.status == status)
+    if pack_id:
+        q = q.filter(SessionModel.pack_id == pack_id)
+    total = q.count()
+    sessions = q.order_by(SessionModel.created_at.desc()).offset(offset).limit(limit).all()
+    return {
+        "total": total,
+        "items": [
+            {
+                "id": s.id,
+                "user_id": s.user_id,
+                "pack_id": s.pack_id,
+                "takes_limit": s.takes_limit,
+                "takes_used": s.takes_used,
+                "status": s.status,
+                "upgraded_from_session_id": s.upgraded_from_session_id,
+                "upgrade_credit_stars": s.upgrade_credit_stars,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+            }
+            for s in sessions
+        ],
+    }
 
 
 # ---------- Themes ----------

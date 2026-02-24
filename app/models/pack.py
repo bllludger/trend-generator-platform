@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import Boolean, Column, DateTime, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.db.base import Base
 
@@ -14,13 +15,21 @@ class Pack(Base):
     __tablename__ = "packs"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid4()))
-    name = Column(String, nullable=False)                    # "Starter"
+    name = Column(String, nullable=False)
     emoji = Column(String, nullable=False, default="")
-    tokens = Column(Integer, nullable=False)                 # 5 / 15 / 50 генераций
-    stars_price = Column(Integer, nullable=False)            # 25 / 65 / 175 Stars
-    description = Column(String, nullable=False, default="")  # "5 фото без watermark"
+    tokens = Column(Integer, nullable=False, default=0)
+    stars_price = Column(Integer, nullable=False)
+    description = Column(String, nullable=False, default="")
     enabled = Column(Boolean, nullable=False, default=True)
     order_index = Column(Integer, nullable=False, default=0)
+
+    # Session-based packs (MVP)
+    takes_limit = Column(Integer, nullable=True)
+    hd_amount = Column(Integer, nullable=True)
+    is_trial = Column(Boolean, nullable=False, default=False)
+    pack_type = Column(String, nullable=False, default="legacy")
+    upgrade_target_pack_ids = Column(JSONB, nullable=True)
+
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

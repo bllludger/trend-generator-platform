@@ -85,6 +85,10 @@ export function PacksPage() {
       description: pack.description != null ? String(pack.description) : undefined,
       enabled: Boolean(pack.enabled),
       order_index: pack.order_index != null ? Number(pack.order_index) : undefined,
+      takes_limit: pack.takes_limit ?? undefined,
+      hd_amount: pack.hd_amount ?? undefined,
+      is_trial: pack.is_trial ?? false,
+      pack_type: pack.pack_type ?? 'legacy',
     })
   }
 
@@ -100,6 +104,10 @@ export function PacksPage() {
         description: form.description,
         enabled: form.enabled,
         order_index: form.order_index,
+        takes_limit: form.takes_limit,
+        hd_amount: form.hd_amount,
+        is_trial: form.is_trial,
+        pack_type: form.pack_type,
       },
     })
   }
@@ -168,9 +176,10 @@ export function PacksPage() {
                   <TableHead>Порядок</TableHead>
                   <TableHead>ID</TableHead>
                   <TableHead>Название</TableHead>
-                  <TableHead>Токены</TableHead>
+                  <TableHead>Тип</TableHead>
+                  <TableHead>Снимки</TableHead>
+                  <TableHead>HD</TableHead>
                   <TableHead>Цена (Stars)</TableHead>
-                  <TableHead>Описание</TableHead>
                   <TableHead>Статус</TableHead>
                   <TableHead className="w-[120px]">Действия</TableHead>
                 </TableRow>
@@ -181,9 +190,14 @@ export function PacksPage() {
                     <TableCell>{p.order_index}</TableCell>
                     <TableCell className="font-mono text-xs">{p.id}</TableCell>
                     <TableCell>{p.emoji} {p.name}</TableCell>
-                    <TableCell>{p.tokens}</TableCell>
+                    <TableCell>
+                      <Badge variant={p.pack_type === 'session' ? 'default' : 'secondary'}>
+                        {p.pack_type || 'legacy'}{p.is_trial ? ' (trial)' : ''}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>{p.takes_limit ?? p.tokens}</TableCell>
+                    <TableCell>{p.hd_amount ?? '—'}</TableCell>
                     <TableCell>{p.stars_price}⭐</TableCell>
-                    <TableCell className="max-w-[200px] truncate text-muted-foreground">{String(p.description ?? '') || '—'}</TableCell>
                     <TableCell>
                       <Badge variant={p.enabled ? 'default' : 'secondary'}>{p.enabled ? 'Вкл' : 'Выкл'}</Badge>
                     </TableCell>
@@ -273,6 +287,51 @@ export function PacksPage() {
                 onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
                 placeholder="5 фото без watermark"
               />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label>Снимков (takes_limit)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={form.takes_limit != null ? Number(form.takes_limit) : ''}
+                  onChange={(e) => setForm((f) => ({ ...f, takes_limit: e.target.value ? parseInt(e.target.value) : undefined }))}
+                  placeholder="Пусто = legacy"
+                />
+              </div>
+              <div>
+                <Label>HD при покупке</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={form.hd_amount != null ? Number(form.hd_amount) : ''}
+                  onChange={(e) => setForm((f) => ({ ...f, hd_amount: e.target.value ? parseInt(e.target.value) : undefined }))}
+                  placeholder="Пусто = 0"
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label>Тип пакета</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={String(form.pack_type ?? 'legacy')}
+                  onChange={(e) => setForm((f) => ({ ...f, pack_type: e.target.value }))}
+                >
+                  <option value="legacy">legacy</option>
+                  <option value="session">session</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2 pt-8">
+                <input
+                  type="checkbox"
+                  id="is_trial"
+                  checked={!!form.is_trial}
+                  onChange={(e) => setForm((f) => ({ ...f, is_trial: e.target.checked }))}
+                  className="h-4 w-4 rounded"
+                />
+                <Label htmlFor="is_trial">Trial (1 раз на аккаунт)</Label>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>

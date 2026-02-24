@@ -240,7 +240,30 @@ export interface Pack {
   stars_price: number
   enabled: boolean
   order_index?: number
+  takes_limit?: number | null
+  hd_amount?: number | null
+  is_trial?: boolean
+  pack_type?: string
+  upgrade_target_pack_ids?: string[] | null
   [key: string]: unknown
+}
+
+export interface SessionItem {
+  id: string
+  user_id: string
+  pack_id: string
+  takes_limit: number
+  takes_used: number
+  status: string
+  upgraded_from_session_id?: string | null
+  upgrade_credit_stars: number
+  created_at: string
+  updated_at: string
+}
+
+export const sessionsService = {
+  list: (params: { user_id?: string; status?: string; pack_id?: string; limit?: number; offset?: number }) =>
+    api.get('/admin/sessions', { params }).then((r) => r.data),
 }
 
 export const paymentsService = {

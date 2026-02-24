@@ -22,7 +22,8 @@ class Payment(Base):
     tokens_granted = Column(Integer, nullable=False)          # сколько генераций начислено
     status = Column(String, nullable=False, default="completed")  # completed / refunded
     payload = Column(String, nullable=False)                  # верификационный payload
-    job_id = Column(String, nullable=True)                    # для unlock — ссылка на разблокируемый job
+    job_id = Column(String, nullable=True)
+    session_id = Column(String, nullable=True)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

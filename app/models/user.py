@@ -50,6 +50,12 @@ class User(Base):
     hd_credits_pending = Column(Integer, nullable=False, default=0)
     hd_credits_debt = Column(Integer, nullable=False, default=0)
     has_purchased_hd = Column(Boolean, nullable=False, default=False)
+
+    # Session-based HD balance (MVP)
+    hd_paid_balance = Column(Integer, nullable=False, default=0)
+    hd_promo_balance = Column(Integer, nullable=False, default=0)
+    free_takes_used = Column(Integer, nullable=False, default=0)
+    trial_purchased = Column(Boolean, nullable=False, default=False)
     
     def is_access_blocked(self) -> bool:
         """Check if user access is blocked (banned or suspended)."""

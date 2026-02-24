@@ -136,6 +136,42 @@ class TelegramClient:
             logger.error("Failed to send photo", extra={"error": str(e), "chat_id": chat_id})
             raise
 
+    def send_media_group(
+        self,
+        chat_id: str,
+        media: list[dict],
+    ) -> dict:
+        """Send media group (album) to chat. Each item: {type, media_path, caption?}."""
+        start = time.time()
+        try:
+            input_media = []
+            files = {}
+            for i, item in enumerate(media):
+                attach_key = f"photo_{i}"
+                input_media.append({
+                    "type": item.get("type", "photo"),
+                    "media": f"attach://{attach_key}",
+                    "caption": item.get("caption", ""),
+                })
+                f = open(item["media_path"], "rb")
+                files[attach_key] = (item["media_path"].split("/")[-1], f, "image/png")
+            data = {
+                "chat_id": str(int(chat_id)),
+                "media": json.dumps(input_media),
+            }
+            result = self._api_call("sendMediaGroup", data=data, files=files)
+            self._record_request("sendMediaGroup", "success", time.time() - start)
+            for key in files:
+                try:
+                    files[key][1].close()
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            self._record_request("sendMediaGroup", "error", time.time() - start)
+            logger.error("Failed to send media group", extra={"error": str(e), "chat_id": chat_id})
+            raise
+
     def send_document(
         self,
         chat_id: str,

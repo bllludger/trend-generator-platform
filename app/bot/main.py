@@ -51,6 +51,11 @@ from app.paywall import record_unlock as paywall_record_unlock
 from app.referral.service import ReferralService
 from app.services.telegram_messages.runtime import runtime_templates
 from app.utils.currency import format_stars_rub
+from app.services.sessions.service import SessionService
+from app.services.takes.service import TakeService
+from app.services.favorites.service import FavoriteService
+from app.services.hd_balance.service import HDBalanceService
+from app.models.pack import Pack
 
 configure_logging()
 logger = logging.getLogger("bot")
@@ -306,6 +311,10 @@ class BotStates(StatesGroup):
     waiting_for_self_photo_2 = State()     # Шаг 2b: второе фото (если выбрано 2)
     # Оплата переводом на карту
     bank_transfer_waiting_receipt = State()  # Ждём чек (скриншот/фото)
+    # Session-based flow (MVP)
+    session_active = State()
+    viewing_take_result = State()
+    viewing_favorites = State()
 
 
 # ===========================================
@@ -1973,16 +1982,17 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
         with get_db_session() as db:
             user_service = UserService(db)
             trend_service = TrendService(db)
-            job_service = JobService(db)
+            take_svc = TakeService(db)
+            session_svc = SessionService(db)
             audit = AuditService(db)
-            
+
             user = user_service.get_or_create_user(
                 telegram_id,
                 telegram_username=callback.from_user.username,
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
-            
+
             if trend_id != TREND_CUSTOM_ID:
                 trend = trend_service.get(trend_id)
                 if not trend or not trend.enabled:
@@ -1990,75 +2000,78 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
                     return
 
             is_copy_flow = bool(data.get("copy_prompt"))
-            used_free_quota = False
-            used_copy_quota = False
+            take_type = "COPY" if is_copy_flow else ("CUSTOM" if trend_id == TREND_CUSTOM_ID else "TREND")
+            copy_ref = data.get("reference_path") if is_copy_flow else None
 
-            if is_copy_flow:
-                # «Сделать такую же»: отдельная квота (1/аккаунт по умолчанию)
-                used_copy_quota = user_service.try_use_copy_generation(user)
-                db.refresh(user)
-            else:
-                # Основной поток: 3 бесплатных на аккаунт
-                used_free_quota = user_service.try_use_free_generation(user)
-                db.refresh(user)
+            # Determine session context
+            session = session_svc.get_active_session(user.id)
+            session_id = None
 
-            if not used_free_quota and not used_copy_quota:
-                if not user_service.can_reserve(user, settings.generation_cost_tokens):
-                    sec = SecuritySettingsService(db).get_or_create()
-                    if is_copy_flow:
-                        limit = getattr(sec, "copy_generations_per_user", 1)
-                        msg = f"Бесплатная генерация «Сделать такую же» ({limit}/аккаунт) исчерпана. Пополните баланс."
-                    else:
-                        limit = getattr(sec, "free_generations_per_user", 3)
-                        msg = f"Бесплатные генерации ({limit}/аккаунт) исчерпаны. Пополните баланс токенов."
-                    await callback.answer(msg, show_alert=True)
+            if getattr(user, "is_moderator", False):
+                free_session = session_svc.create_free_preview_session(user.id)
+                session_id = free_session.id
+            elif session and session.pack_id != "free_preview":
+                if not session_svc.can_take(session):
+                    await callback.answer("📸 Лимит снимков исчерпан. Купите новый пакет.", show_alert=True)
                     return
-
-                job_id = str(uuid4())
-                if not user_service.hold_tokens(user, job_id, settings.generation_cost_tokens):
-                    await callback.answer(t("errors.reserve_tokens_failed", "Не удалось зарезервировать токены."), show_alert=True)
+                session_id = session.id
+            elif (user.free_takes_used or 0) < 1:
+                # Free take -- atomic increment to prevent race conditions
+                from sqlalchemy import update as sa_update, func
+                res = db.execute(
+                    sa_update(User)
+                    .where(User.id == user.id, (User.free_takes_used == None) | (User.free_takes_used < 1))
+                    .values(free_takes_used=func.coalesce(User.free_takes_used, 0) + 1)
+                )
+                if res.rowcount == 0:
+                    await callback.answer("Бесплатный снимок исчерпан. Купите пакет.", show_alert=True)
                     return
+                db.flush()
+                free_session = session_svc.create_free_preview_session(user.id)
+                session_id = free_session.id
             else:
-                job_id = None
+                # No free takes left, no active session — show paywall
+                await callback.answer("Бесплатный снимок исчерпан. Купите пакет.", show_alert=True)
+                return
 
-            reserved_for_job = 0 if (used_free_quota or used_copy_quota) else settings.generation_cost_tokens
-            job = job_service.create_job(
+            take = take_svc.create_take(
                 user_id=user.id,
-                trend_id=trend_id,
-                input_file_ids=input_file_ids,
-                input_local_paths=input_local_paths,
-                reserved_tokens=reserved_for_job,
-                used_free_quota=used_free_quota,
-                used_copy_quota=used_copy_quota,
-                job_id=job_id,
+                trend_id=trend_id if trend_id != TREND_CUSTOM_ID else None,
+                take_type=take_type,
+                session_id=session_id,
                 custom_prompt=custom_prompt,
                 image_size=image_size,
+                input_file_ids=input_file_ids,
+                input_local_paths=input_local_paths,
+                copy_reference_path=copy_ref,
             )
-            created_job_id = job.job_id
+            created_take_id = take.id
+
             audit.log(
                 actor_type="user",
                 actor_id=telegram_id,
-                action="job_created",
-                entity_type="job",
-                entity_id=created_job_id,
+                action="take_started",
+                entity_type="take",
+                entity_id=created_take_id,
                 payload={
-            "trend_id": trend_id,
-            "image_size": image_size,
-            "custom": bool(custom_prompt),
-            "copy_flow": bool(data.get("copy_prompt")),
-        },
+                    "trend_id": trend_id,
+                    "image_size": image_size,
+                    "take_type": take_type,
+                    "session_id": session_id,
+                    "custom": bool(custom_prompt),
+                },
             )
 
         from app.core.celery_app import celery_app
 
         await _try_delete_messages(bot, callback.message.chat.id, data.get("last_bot_message_id"), callback.message.message_id)
         progress_msg = await callback.message.answer(
-            "⏳ Генерация начинается...",
+            "⏳ Генерация снимка (3 варианта)...",
         )
 
         celery_app.send_task(
-            "app.workers.tasks.generation_v2.generate_image",
-            args=[created_job_id],
+            "app.workers.tasks.generate_take.generate_take",
+            args=[created_take_id],
             kwargs={
                 "status_chat_id": str(callback.message.chat.id),
                 "status_message_id": progress_msg.message_id,
@@ -2066,8 +2079,8 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
         )
 
         await state.clear()
-        await callback.answer(t("errors.regenerate_launched", "Генерация запущена!"))
-        logger.info("job_created", extra={"user_id": telegram_id, "job_id": created_job_id})
+        await callback.answer("Генерация запущена!")
+        logger.info("take_created", extra={"user_id": telegram_id, "take_id": created_take_id})
     except Exception:
         logger.exception("Error in select_format_and_generate", extra={"user_id": telegram_id})
         await callback.answer(t("errors.try_again", "Ошибка. Попробуйте ещё раз."), show_alert=True)
@@ -2619,6 +2632,93 @@ async def handle_successful_payment(message: Message, bot: Bot):
     provider_charge_id = payment_info.provider_payment_charge_id
 
     try:
+        # Handle session-based payloads first
+        if payload.startswith("session:") or payload.startswith("upgrade:"):
+            with get_db_session() as db:
+                payment_service = PaymentService(db)
+                audit = AuditService(db)
+
+                if payload.startswith("session:"):
+                    pack_id = payload.split(":", 1)[1]
+                    payment_obj, session = payment_service.process_session_purchase(
+                        telegram_user_id=telegram_id,
+                        telegram_payment_charge_id=charge_id,
+                        provider_payment_charge_id=provider_charge_id,
+                        pack_id=pack_id,
+                        stars_amount=payment_info.total_amount,
+                        payload=payload,
+                    )
+                    if payment_obj and session:
+                        pack = payment_service.get_pack(pack_id)
+                        hd_svc = HDBalanceService(db)
+                        user = db.query(User).filter(User.telegram_id == telegram_id).one_or_none()
+                        balance = hd_svc.get_balance(user) if user else {"total": 0}
+
+                        audit.log(
+                            actor_type="user",
+                            actor_id=telegram_id,
+                            action="pay_success",
+                            entity_type="payment",
+                            entity_id=charge_id,
+                            payload={"pack_id": pack_id, "session_id": session.id, "stars": payment_info.total_amount},
+                        )
+
+                        remaining = session.takes_limit - session.takes_used
+                        await message.answer(
+                            f"✅ Пакет {pack.emoji} {pack.name} активирован!\n\n"
+                            f"Снимков: {remaining}\n"
+                            f"HD баланс: {balance['total']}\n\n"
+                            f"Отправьте фото для первого снимка!",
+                            reply_markup=main_menu_keyboard(),
+                        )
+                    elif payment_obj:
+                        await message.answer("✅ Платёж уже обработан.")
+                    else:
+                        await message.answer("⚠️ Ошибка обработки. Обратитесь в /paysupport.")
+
+                elif payload.startswith("upgrade:"):
+                    parts = payload.split(":")
+                    new_pack_id, old_session_id = parts[1], parts[2]
+                    payment_obj, new_session = payment_service.process_session_upgrade(
+                        telegram_user_id=telegram_id,
+                        telegram_payment_charge_id=charge_id,
+                        provider_payment_charge_id=provider_charge_id,
+                        new_pack_id=new_pack_id,
+                        old_session_id=old_session_id,
+                        stars_amount=payment_info.total_amount,
+                        payload=payload,
+                    )
+                    if payment_obj and new_session:
+                        pack = payment_service.get_pack(new_pack_id)
+                        user = db.query(User).filter(User.telegram_id == telegram_id).one_or_none()
+                        hd_svc = HDBalanceService(db)
+                        balance = hd_svc.get_balance(user) if user else {"total": 0}
+
+                        audit.log(
+                            actor_type="user",
+                            actor_id=telegram_id,
+                            action="trial_to_studio_upgrade_success",
+                            entity_type="payment",
+                            entity_id=charge_id,
+                            payload={"new_pack_id": new_pack_id, "old_session_id": old_session_id},
+                        )
+
+                        remaining = new_session.takes_limit - new_session.takes_used
+                        await message.answer(
+                            f"⬆️ Апгрейд до {pack.emoji} {pack.name}!\n\n"
+                            f"Снимков: {remaining}\n"
+                            f"HD баланс: {balance['total']}\n\n"
+                            f"Продолжайте съёмку!",
+                            reply_markup=main_menu_keyboard(),
+                        )
+                    elif payment_obj:
+                        await message.answer("✅ Платёж уже обработан.")
+                    else:
+                        await message.answer("⚠️ Ошибка обработки. Обратитесь в /paysupport.")
+
+            return
+
+        # Legacy token-based flow
         with get_db_session() as db:
             payment_service = PaymentService(db)
             full_payload = payment_service.resolve_payload(payload)
@@ -3528,6 +3628,637 @@ async def bank_receipt_wrong_input(message: Message):
 async def waiting_prompt_wrong_input(message: Message):
     """User sent non-text in waiting_for_prompt."""
     await message.answer(t("flow.prompt_placeholder", "Опишите свою идею текстом. Например: «Сделай в стиле аниме»"))
+
+
+# ===========================================
+# Session-based flow: Take A/B/C, Favorites, HD
+# ===========================================
+
+@router.callback_query(F.data.startswith("choose:"))
+async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """User chose best variant A/B/C — auto-add to favorites."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("❌ Ошибка формата", show_alert=True)
+        return
+    take_id, variant = parts[1], parts[2].upper()
+    if variant not in ("A", "B", "C"):
+        await callback.answer("❌ Неверный вариант", show_alert=True)
+        return
+
+    try:
+        with get_db_session() as db:
+            take_svc = TakeService(db)
+            fav_svc = FavoriteService(db)
+            audit = AuditService(db)
+            user_service = UserService(db)
+
+            take = take_svc.get_take(take_id)
+            if not take:
+                await callback.answer("❌ Снимок не найден", show_alert=True)
+                return
+
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+
+            preview_path, original_path = take_svc.get_variant_paths(take, variant)
+            if not preview_path or not original_path:
+                await callback.answer("❌ Вариант недоступен", show_alert=True)
+                return
+
+            fav = fav_svc.add_favorite(
+                user_id=user.id,
+                take_id=take_id,
+                variant=variant,
+                preview_path=preview_path,
+                original_path=original_path,
+                session_id=take.session_id,
+            )
+
+            audit.log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="choose_best_variant",
+                entity_type="take",
+                entity_id=take_id,
+                payload={"variant": variant, "session_id": take.session_id, "favorite_id": fav.id if fav else None},
+            )
+            audit.log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="favorites_auto_add",
+                entity_type="favorite",
+                entity_id=fav.id if fav else None,
+                payload={"take_id": take_id, "variant": variant},
+            )
+            session_id = take.session_id
+            user_is_moderator = getattr(user, "is_moderator", False)
+            fav_id = str(fav.id) if fav else None
+            hd_svc = HDBalanceService(db)
+            balance = hd_svc.get_balance(user)
+
+        await callback.answer(f"⭐ Вариант {variant} добавлен в избранное!")
+
+        is_free = False
+        if session_id:
+            with get_db_session() as db:
+                session_svc = SessionService(db)
+                session = session_svc.get_session(session_id)
+                if session and session.pack_id == "free_preview":
+                    is_free = True
+
+        if (is_free or not session_id) and not user_is_moderator:
+            await _show_paywall_after_free_take(callback.message, telegram_id, take_id, variant)
+        else:
+            await state.set_state(BotStates.viewing_take_result)
+            await state.update_data(current_take_id=take_id)
+            # Короткое меню: Забрать HD для этого / Ещё снимок / В избранное
+            short_menu_buttons = []
+            if fav_id and balance.get("total", 0) > 0:
+                short_menu_buttons.append([
+                    InlineKeyboardButton(text="🖼 Забрать HD для этого", callback_data=f"deliver_hd_one:{fav_id}"),
+                ])
+            short_menu_buttons.append([
+                InlineKeyboardButton(text="📸 Ещё снимок", callback_data="take_more"),
+                InlineKeyboardButton(text="📋 В избранное", callback_data="open_favorites"),
+            ])
+            await callback.message.answer(
+                f"Вариант {variant} в избранном. Забрать HD или сделать ещё снимок?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=short_menu_buttons),
+            )
+
+    except Exception:
+        logger.exception("choose_variant error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка. Попробуйте снова.", show_alert=True)
+
+
+async def _show_paywall_after_free_take(message: Message, telegram_id: str, take_id: str, variant: str):
+    """Show paywall after free take."""
+    try:
+        with get_db_session() as db:
+            audit = AuditService(db)
+            packs = (
+                db.query(Pack)
+                .filter(Pack.pack_type == "session", Pack.enabled == True)
+                .order_by(Pack.order_index)
+                .all()
+            )
+            packs_data = [{"id": p.id, "emoji": p.emoji, "name": p.name, "stars_price": p.stars_price, "hd_amount": p.hd_amount} for p in packs]
+            audit.log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="paywall_shown",
+                entity_type="take",
+                entity_id=take_id,
+                payload={"context": "trial_preview", "packs_offered": [p["id"] for p in packs_data]},
+            )
+        buttons = []
+        for pack in packs_data:
+            label = f"{pack['emoji']} {pack['name']} — {pack['stars_price']}⭐"
+            if pack.get("hd_amount"):
+                label += f" ({pack['hd_amount']} HD)"
+            buttons.append([InlineKeyboardButton(text=label, callback_data=f"paywall:{pack['id']}")])
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await message.answer(
+            "🎬 Получите HD версию без watermark!\n\n"
+            "Выберите пакет:",
+            reply_markup=keyboard,
+        )
+    except Exception:
+        logger.exception("_show_paywall_after_free_take error")
+
+
+@router.callback_query(F.data.startswith("add_var:"))
+async def add_variant_to_favorites(callback: CallbackQuery, state: FSMContext):
+    """Add another variant from the same Take to favorites."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    take_id, variant = parts[1], parts[2].upper()
+
+    try:
+        with get_db_session() as db:
+            take_svc = TakeService(db)
+            fav_svc = FavoriteService(db)
+            user_service = UserService(db)
+
+            take = take_svc.get_take(take_id)
+            if not take:
+                await callback.answer("❌ Снимок не найден", show_alert=True)
+                return
+
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+
+            preview_path, original_path = take_svc.get_variant_paths(take, variant)
+            if not preview_path or not original_path:
+                await callback.answer("❌ Вариант недоступен", show_alert=True)
+                return
+
+            fav = fav_svc.add_favorite(
+                user_id=user.id,
+                take_id=take_id,
+                variant=variant,
+                preview_path=preview_path,
+                original_path=original_path,
+                session_id=take.session_id,
+            )
+
+            audit = AuditService(db)
+            audit.log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="favorites_auto_add",
+                entity_type="favorite",
+                entity_id=fav.id if fav else None,
+                payload={"take_id": take_id, "variant": variant},
+            )
+
+        await callback.answer(f"⭐ Вариант {variant} добавлен!")
+    except Exception:
+        logger.exception("add_variant_to_favorites error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "take_more")
+async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Start another Take within the session."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_service = UserService(db)
+            session_svc = SessionService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            session = session_svc.get_active_session(user.id)
+
+            if not session or not session_svc.can_take(session):
+                if getattr(user, "is_moderator", False):
+                    session = session_svc.create_free_preview_session(user.id)
+                else:
+                    hd_svc = HDBalanceService(db)
+                    balance = hd_svc.get_balance(user)
+                    fav_svc = FavoriteService(db)
+
+                    if session:
+                        fav_count = fav_svc.count_favorites(session.id)
+                        text = (
+                            f"📸 Лимит снимков исчерпан ({session.takes_used}/{session.takes_limit}).\n\n"
+                            f"HD баланс: {balance['total']}\n"
+                            f"В избранном: {fav_count}\n\n"
+                        )
+                    else:
+                        text = "📸 Нет активной сессии.\n\n"
+
+                    buttons = []
+                    packs = (
+                        db.query(Pack)
+                        .filter(Pack.pack_type == "session", Pack.enabled == True)
+                        .order_by(Pack.order_index)
+                        .all()
+                    )
+                    for pack in packs:
+                        label = f"{pack.emoji} {pack.name} — {pack.stars_price}⭐"
+                        buttons.append([InlineKeyboardButton(text=label, callback_data=f"paywall:{pack.id}")])
+
+                    if session:
+                        buttons.append([InlineKeyboardButton(text="📋 Избранное", callback_data="open_favorites")])
+
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+                    await callback.message.answer(text + "Купите пакет для продолжения:", reply_markup=keyboard)
+                    await callback.answer()
+                    return
+
+        await state.set_state(BotStates.waiting_for_photo)
+        await callback.message.answer(
+            "📷 Отправьте фото для нового снимка.",
+            reply_markup=main_menu_keyboard(),
+        )
+        await callback.answer("📸 Загрузите фото")
+    except Exception:
+        logger.exception("take_more error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "open_favorites")
+async def open_favorites(callback: CallbackQuery, state: FSMContext):
+    """Show favorites list."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_service = UserService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            fav_svc = FavoriteService(db)
+            hd_svc = HDBalanceService(db)
+            session_svc = SessionService(db)
+
+            favorites = fav_svc.list_favorites_for_user(user.id)
+            balance = hd_svc.get_balance(user)
+            session = session_svc.get_active_session(user.id)
+            favorites_data = [{"id": f.id, "variant": f.variant, "hd_status": f.hd_status} for f in (favorites or [])]
+            has_session = session is not None
+
+            audit = AuditService(db)
+            audit.log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="favorites_opened",
+                entity_type="user",
+                entity_id=user.id,
+                payload={"count": len(favorites) if favorites else 0},
+            )
+
+        if not favorites_data:
+            await callback.answer("Избранное пусто", show_alert=True)
+            return
+
+        lines = [f"⭐ Избранное ({len(favorites_data)})\n"]
+        buttons = []
+        for i, fav in enumerate(favorites_data, 1):
+            status_icon = "✅" if fav["hd_status"] == "delivered" else "⏳" if fav["hd_status"] == "rendering" else ""
+            lines.append(f"{i}. Вариант {fav['variant']} {status_icon}")
+            if fav["hd_status"] == "none":
+                buttons.append([
+                    InlineKeyboardButton(text=f"❌ #{i}", callback_data=f"remove_fav:{fav['id']}"),
+                ])
+
+        lines.append(f"\nHD баланс: {balance['total']}")
+
+        action_buttons = []
+        pending_count = sum(1 for f in favorites_data if f["hd_status"] == "none")
+        if pending_count > 0 and balance["total"] > 0:
+            action_buttons.append(InlineKeyboardButton(text="🖼 Забрать HD", callback_data="deliver_hd"))
+        if has_session:
+            action_buttons.append(InlineKeyboardButton(text="📸 Назад к сессии", callback_data="session_status"))
+        if action_buttons:
+            buttons.append(action_buttons)
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+        await callback.message.answer("\n".join(lines), reply_markup=keyboard)
+        await state.set_state(BotStates.viewing_favorites)
+        await callback.answer()
+    except Exception:
+        logger.exception("open_favorites error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("remove_fav:"))
+async def remove_favorite(callback: CallbackQuery, state: FSMContext):
+    """Remove a favorite."""
+    telegram_id = str(callback.from_user.id)
+    fav_id = callback.data.split(":", 1)[1]
+    try:
+        with get_db_session() as db:
+            fav_svc = FavoriteService(db)
+            removed = fav_svc.remove_favorite(fav_id)
+        if removed:
+            await callback.answer("Удалено из избранного")
+        else:
+            await callback.answer("Не удалось удалить (возможно, уже HD)")
+    except Exception:
+        logger.exception("remove_favorite error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("deliver_hd_one:"))
+async def deliver_hd_one_callback(callback: CallbackQuery, state: FSMContext):
+    """Deliver HD for one favorite (short path after choosing variant)."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    fav_id = parts[1]
+    try:
+        with get_db_session() as db:
+            user_service = UserService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            fav_svc = FavoriteService(db)
+            hd_svc = HDBalanceService(db)
+            fav = fav_svc.get_favorite(fav_id)
+            if not fav or str(fav.user_id) != str(user.id):
+                await callback.answer("❌ Избранное не найдено", show_alert=True)
+                return
+            if fav.hd_status != "none":
+                await callback.answer("HD уже выдан или в обработке", show_alert=True)
+                return
+            balance = hd_svc.get_balance(user)
+            if balance.get("total", 0) < 1:
+                await callback.answer("❌ Недостаточно HD на балансе", show_alert=True)
+                return
+
+        from app.core.celery_app import celery_app as _celery
+
+        chat_id = str(callback.message.chat.id)
+        _celery.send_task(
+            "app.workers.tasks.deliver_hd.deliver_hd",
+            args=[fav_id],
+            kwargs={"status_chat_id": chat_id},
+        )
+        await callback.answer("🖼 Запущена выдача HD")
+        await callback.message.answer("⏳ Ожидайте файл в чате.")
+    except Exception:
+        logger.exception("deliver_hd_one_callback error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "deliver_hd")
+async def deliver_hd_callback(callback: CallbackQuery, state: FSMContext):
+    """Deliver HD for all pending favorites."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_service = UserService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            fav_svc = FavoriteService(db)
+            hd_svc = HDBalanceService(db)
+
+            favorites = fav_svc.list_favorites_for_user(user.id)
+            pending = [f for f in favorites if f.hd_status == "none"]
+
+            if not pending:
+                await callback.answer("Нет избранных для HD", show_alert=True)
+                return
+
+            balance = hd_svc.get_balance(user)
+            can_deliver = min(len(pending), balance["total"])
+
+            if can_deliver == 0:
+                await callback.answer("❌ Недостаточно HD на балансе", show_alert=True)
+                return
+
+            # Сохраняем id внутри сессии, чтобы не обращаться к fav после выхода
+            pending_ids = [f.id for f in pending[:can_deliver]]
+
+        from app.core.celery_app import celery_app as _celery
+
+        chat_id = str(callback.message.chat.id)
+        launched = 0
+        for fav_id in pending_ids:
+            _celery.send_task(
+                "app.workers.tasks.deliver_hd.deliver_hd",
+                args=[fav_id],
+                kwargs={"status_chat_id": chat_id},
+            )
+            launched += 1
+
+        await callback.answer(f"🖼 Запущена HD выдача ({launched} шт.)")
+        await callback.message.answer(f"⏳ HD выдача запущена для {launched} избранных. Ожидайте файлы...")
+    except Exception:
+        logger.exception("deliver_hd_callback error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "session_status")
+async def session_status(callback: CallbackQuery, state: FSMContext):
+    """Show session status screen."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_service = UserService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            session_svc = SessionService(db)
+            hd_svc = HDBalanceService(db)
+            fav_svc = FavoriteService(db)
+
+            session = session_svc.get_active_session(user.id)
+            balance = hd_svc.get_balance(user)
+
+            if not session:
+                await callback.message.answer(
+                    "📸 Нет активной фотосессии.\n"
+                    "Купите пакет, чтобы начать!",
+                    reply_markup=main_menu_keyboard(),
+                )
+                await callback.answer()
+                return
+
+            fav_count = fav_svc.count_favorites(session.id)
+            remaining = session.takes_limit - session.takes_used
+
+        buttons = []
+        if remaining > 0:
+            buttons.append([InlineKeyboardButton(text="📸 Сделать снимок", callback_data="take_more")])
+        buttons.append([InlineKeyboardButton(text="⭐ Открыть избранное", callback_data="open_favorites")])
+        if fav_count > 0 and balance["total"] > 0:
+            buttons.append([InlineKeyboardButton(text="🖼 Забрать HD", callback_data="deliver_hd")])
+
+        # Upgrade button for trial sessions
+        if session.pack_id == "trial":
+            buttons.append([InlineKeyboardButton(text="⬆️ Апгрейд", callback_data=f"upgrade:studio")])
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.answer(
+            f"📸 Ваша фотосессия\n\n"
+            f"Осталось снимков: {remaining} из {session.takes_limit}\n"
+            f"HD баланс: {balance['total']}\n"
+            f"В избранном: {fav_count}",
+            reply_markup=keyboard,
+        )
+        await state.set_state(BotStates.session_active)
+        await callback.answer()
+    except Exception:
+        logger.exception("session_status error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("paywall:"))
+async def paywall_buy(callback: CallbackQuery, bot: Bot):
+    """User tapped buy on paywall — send Stars invoice."""
+    telegram_id = str(callback.from_user.id)
+    pack_id = callback.data.split(":", 1)[1]
+    try:
+        with get_db_session() as db:
+            pack = db.query(Pack).filter(Pack.id == pack_id, Pack.enabled == True).one_or_none()
+            if not pack:
+                await callback.answer("❌ Пакет недоступен", show_alert=True)
+                return
+
+            user_service = UserService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+
+            if pack.is_trial and user.trial_purchased:
+                await callback.answer("Trial уже был использован", show_alert=True)
+                return
+
+            pack_name = pack.name
+            pack_stars_price = pack.stars_price
+            pack_emoji = pack.emoji
+            pack_description = pack.description
+            pack_takes_limit = getattr(pack, "takes_limit", None)
+            pack_hd_amount = getattr(pack, "hd_amount", None)
+
+        with get_db_session() as db:
+            audit = AuditService(db)
+            audit.log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="pay_click",
+                entity_type="pack",
+                entity_id=pack_id,
+                payload={"pack_name": pack_name, "stars_price": pack_stars_price, "flow": "paywall"},
+            )
+
+        payload = f"session:{pack_id}"
+        title = f"{pack_emoji} {pack_name}"
+        description = pack_description or f"{pack_takes_limit} снимков + {pack_hd_amount} HD"
+        prices = [LabeledPrice(label=title, amount=pack_stars_price)]
+
+        await bot.send_invoice(
+            chat_id=callback.message.chat.id,
+            title=title,
+            description=description,
+            payload=payload,
+            currency="XTR",
+            prices=prices,
+        )
+        await callback.answer()
+    except Exception:
+        logger.exception("paywall_buy error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("upgrade:"))
+async def upgrade_session(callback: CallbackQuery, bot: Bot):
+    """Upgrade current session to a better pack."""
+    telegram_id = str(callback.from_user.id)
+    new_pack_id = callback.data.split(":", 1)[1]
+    try:
+        with get_db_session() as db:
+            user_service = UserService(db)
+            session_svc = SessionService(db)
+
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            session = session_svc.get_active_session(user.id)
+            if not session:
+                await callback.answer("❌ Нет активной сессии", show_alert=True)
+                return
+
+            old_pack = db.query(Pack).filter(Pack.id == session.pack_id).one_or_none()
+            new_pack = db.query(Pack).filter(Pack.id == new_pack_id, Pack.enabled == True).one_or_none()
+            if not new_pack:
+                await callback.answer("❌ Пакет недоступен", show_alert=True)
+                return
+
+            old_price = old_pack.stars_price if old_pack else 0
+            upgrade_price = max(0, new_pack.stars_price - old_price)
+            new_pack_name = new_pack.name
+            session_id = session.id
+
+        with get_db_session() as db:
+            audit = AuditService(db)
+            audit.log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="pay_click",
+                entity_type="pack",
+                entity_id=new_pack_id,
+                payload={"pack_name": new_pack_name, "upgrade_price": upgrade_price, "flow": "upgrade", "old_session_id": session_id},
+            )
+
+        payload = f"upgrade:{new_pack_id}:{session_id}"
+        title = f"⬆️ Апгрейд до {new_pack_name}"
+        description = f"Доплата {upgrade_price}⭐ (зачтено {old_price}⭐)"
+        prices = [LabeledPrice(label=title, amount=upgrade_price)]
+
+        await bot.send_invoice(
+            chat_id=callback.message.chat.id,
+            title=title,
+            description=description,
+            payload=payload,
+            currency="XTR",
+            prices=prices,
+        )
+        await callback.answer()
+    except Exception:
+        logger.exception("upgrade_session error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
 
 
 @router.message()
