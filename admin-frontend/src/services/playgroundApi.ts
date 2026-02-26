@@ -41,6 +41,7 @@ const DEFAULT_CONFIG: PlaygroundPromptConfig = {
     { id: '1', label: 'Scene', content: '', enabled: true, order: 0 },
     { id: '2', label: 'Style', content: '', enabled: true, order: 1 },
     { id: '3', label: 'Avoid', content: '', enabled: true, order: 2 },
+    { id: '4', label: 'Composition', content: '', enabled: true, order: 3 },
   ],
   variables: {},
   seed: undefined,

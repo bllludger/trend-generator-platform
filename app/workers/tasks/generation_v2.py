@@ -26,6 +26,7 @@ from app.services.image_generation import (
 )
 from app.services.jobs.service import JobService
 from app.services.telegram.client import TelegramClient
+from app.services.telegram_messages.runtime import runtime_templates
 from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as transfer_get_effective
 from app.services.trends.service import TrendService
 
@@ -54,13 +55,23 @@ def _build_prompt_for_job(db: Session, job: Job, trend: Trend) -> tuple[str, str
     size = job.image_size or effective.get("default_size", "1024x1024")
     fmt = effective.get("default_format", "png")
 
-    # Если у тренда prompt_sections (Playground) — собираем только из секций, без блоков мастера
+    # Если у тренда prompt_sections (Playground) — собираем из секций с тегами [SCENE], [STYLE], [AVOID], [COMPOSITION]
     sections = trend.prompt_sections if isinstance(trend.prompt_sections, list) else []
     if sections:
+        label_to_tag = {"scene": "[SCENE]", "style": "[STYLE]", "avoid": "[AVOID]", "composition": "[COMPOSITION]"}
         parts = []
         for s in sorted(sections, key=lambda x: x.get("order", 0)):
-            if s.get("enabled") and s.get("content"):
-                parts.append(str(s["content"]).strip())
+            if not s.get("enabled") or not s.get("content"):
+                continue
+            content = str(s["content"]).strip()
+            if not content:
+                continue
+            label = (s.get("label") or "").strip().lower()
+            tag = label_to_tag.get(label)
+            if tag:
+                parts.append(f"{tag}\n{content}")
+            else:
+                parts.append(content)
         prompt_text = "\n\n".join(parts) if parts else (trend.scene_prompt or trend.system_prompt or "Generate image.")
         negative = trend.negative_prompt or None
         if trend.prompt_model:
@@ -85,7 +96,7 @@ def _build_prompt_for_job(db: Session, job: Job, trend: Trend) -> tuple[str, str
     if identity:
         blocks.append(f"[IDENTITY TRANSFER]\n{identity}")
 
-    composition = (transfer.get("composition_rules_text") or "").strip()
+    composition = (getattr(trend, "composition_prompt", None) or "").strip() or (transfer.get("composition_rules_text") or "").strip()
     if composition:
         blocks.append(f"[COMPOSITION]\n{composition}")
 
@@ -157,6 +168,13 @@ def generate_image(
                     telegram.send_message(status_chat_id, "❌ Тренд не найден.")
             return {"ok": False, "error": "trend_missing"}
 
+        if status_chat_id and status_message_id is not None:
+            step1 = runtime_templates.get("progress.regenerate_step1", "⏳ Генерация изображения…")
+            try:
+                telegram.edit_message(status_chat_id, status_message_id, step1)
+            except Exception as e:
+                logger.debug("generation_v2_progress_edit_skip", extra={"error": str(e)})
+
         prompt_text, negative_prompt, model, size = _build_prompt_for_job(db, job, trend)
         input_image_path: str | None = None
         if job.input_local_paths:
@@ -182,6 +200,13 @@ def generate_image(
             seed=seed,
             image_size_tier=image_size_tier,
         )
+
+        if status_chat_id and status_message_id is not None:
+            step2 = runtime_templates.get("progress.regenerate_step2", "⏳ Почти готово…")
+            try:
+                telegram.edit_message(status_chat_id, status_message_id, step2)
+            except Exception as e:
+                logger.debug("generation_v2_progress_edit_skip", extra={"error": str(e)})
 
         try:
             result = generate_with_retry(

@@ -16,6 +16,52 @@ import { Loader2, Save, FileText, UserCog, TrendingUp } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 
+const MASTER_BLOCK_MARKERS = ['[INPUT]', '[TASK]', '[IDENTITY TRANSFER]', '[SAFETY]'] as const
+
+function masterBlocksToFullText(s: Partial<MasterPromptSettings>): string {
+  const parts = [
+    '[INPUT]',
+    (s.prompt_input ?? '').trim(),
+    '[TASK]',
+    (s.prompt_task ?? '').trim(),
+    '[IDENTITY TRANSFER]',
+    (s.prompt_identity_transfer ?? '').trim(),
+    '[SAFETY]',
+    (s.safety_constraints ?? '').trim(),
+  ]
+  return parts.join('\n\n')
+}
+
+function parseMasterBlocksFullText(text: string): {
+  prompt_input: string
+  prompt_task: string
+  prompt_identity_transfer: string
+  safety_constraints: string
+} {
+  const result = {
+    prompt_input: '',
+    prompt_task: '',
+    prompt_identity_transfer: '',
+    safety_constraints: '',
+  }
+  const keys: (keyof typeof result)[] = ['prompt_input', 'prompt_task', 'prompt_identity_transfer', 'safety_constraints']
+  let currentKey: keyof typeof result | null = null
+  const lines = text.split(/\r?\n/)
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const marker = MASTER_BLOCK_MARKERS.find((m) => line.trim() === m)
+    if (marker) {
+      const idx = MASTER_BLOCK_MARKERS.indexOf(marker)
+      currentKey = keys[idx]
+      continue
+    }
+    if (currentKey) {
+      result[currentKey] = (result[currentKey] + (result[currentKey] ? '\n' : '') + line).trim()
+    }
+  }
+  return result
+}
+
 export function MasterPromptPage() {
   const queryClient = useQueryClient()
 
@@ -29,11 +75,15 @@ export function MasterPromptPage() {
   })
 
   const [masterForm, setMasterForm] = useState<Partial<MasterPromptSettings>>({})
+  const [masterBlocksText, setMasterBlocksText] = useState('')
   const [globalForm, setGlobalForm] = useState<Partial<TransferPolicySettings>>({})
   const [trendsForm, setTrendsForm] = useState<Partial<TransferPolicySettings>>({})
 
   useEffect(() => {
-    if (masterSettings) setMasterForm(masterSettings)
+    if (masterSettings) {
+      setMasterForm(masterSettings)
+      setMasterBlocksText(masterBlocksToFullText(masterSettings))
+    }
   }, [masterSettings])
   useEffect(() => {
     if (transferSettings?.global) setGlobalForm(transferSettings.global)
@@ -68,7 +118,16 @@ export function MasterPromptPage() {
 
   const handleMasterSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    masterMutation.mutate({ ...masterSettings, ...masterForm })
+    const parsed = parseMasterBlocksFullText(masterBlocksText)
+    masterMutation.mutate({
+      ...masterSettings,
+      ...masterForm,
+      ...parsed,
+      prompt_input_enabled: true,
+      prompt_task_enabled: true,
+      prompt_identity_transfer_enabled: true,
+      safety_constraints_enabled: true,
+    })
   }
   const handleGlobalSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -206,40 +265,29 @@ export function MasterPromptPage() {
                 <CardTitle className="text-base">Блоки и дефолты</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                {[
-                  { key: 'prompt_input', label: '[INPUT]', enabledKey: 'prompt_input_enabled', rows: 2 },
-                  { key: 'prompt_task', label: '[TASK]', enabledKey: 'prompt_task_enabled', rows: 2 },
-                  { key: 'prompt_identity_transfer', label: '[IDENTITY TRANSFER] (в мастере)', enabledKey: 'prompt_identity_transfer_enabled', rows: 2 },
-                  { key: 'safety_constraints', label: '[SAFETY]', enabledKey: 'safety_constraints_enabled', rows: 2 },
-                ].map(({ key, label, enabledKey, rows }) => (
-                  <div key={key} className="grid gap-2">
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="checkbox"
-                        id={enabledKey}
-                        checked={!!(masterCurrent as Record<string, unknown>)[enabledKey]}
-                        onChange={(e) =>
-                          setMasterForm((prev) => ({ ...prev, [enabledKey]: e.target.checked }))
-                        }
-                        className="rounded border-input"
-                      />
-                      <Label htmlFor={enabledKey}>{label}</Label>
-                    </div>
-                    <Textarea
-                      rows={rows}
-                      className="font-mono text-sm"
-                      value={String((masterCurrent as Record<string, unknown>)[key] ?? '')}
-                      onChange={(e) => setMasterForm((prev) => ({ ...prev, [key]: e.target.value }))}
-                    />
-                  </div>
-                ))}
+                <div className="grid gap-2">
+                  <Label htmlFor="master-blocks">Блоки [INPUT], [TASK], [IDENTITY TRANSFER], [SAFETY]</Label>
+                  <Textarea
+                    id="master-blocks"
+                    rows={16}
+                    className="font-mono text-sm"
+                    value={masterBlocksText}
+                    onChange={(e) => setMasterBlocksText(e.target.value)}
+                    placeholder={'[INPUT]\n\n[TASK]\n\n[IDENTITY TRANSFER]\n\n[SAFETY]'}
+                  />
+                </div>
                 <div className="grid grid-cols-2 gap-4 pt-2 border-t">
                   <div className="grid gap-2">
                     <Label>default_model</Label>
-                    <Input
-                      value={masterCurrent.default_model ?? ''}
+                    <select
+                      className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                      value={masterCurrent.default_model ?? 'gemini-2.5-flash-image'}
                       onChange={(e) => setMasterForm((prev) => ({ ...prev, default_model: e.target.value }))}
-                    />
+                    >
+                      <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
+                      <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
+                      <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview (Nano Banana 2)</option>
+                    </select>
                   </div>
                   <div className="grid gap-2">
                     <Label>default_size</Label>

@@ -41,9 +41,9 @@ from app.services.themes.service import ThemeService
 from app.services.trends.service import TrendService
 from app.services.users.service import UserService
 from app.services.security.settings_service import SecuritySettingsService
-from app.services.payments.service import PaymentService
 from app.services.bank_transfer.settings_service import BankTransferSettingsService
 from app.services.idempotency import IdempotencyStore
+from app.services.payments.service import PaymentService, PRODUCT_LADDER_IDS
 from app.models.user import User
 from app.models.job import Job
 from app.models.bank_transfer_receipt_log import BankTransferReceiptLog
@@ -51,11 +51,14 @@ from app.paywall import record_unlock as paywall_record_unlock
 from app.referral.service import ReferralService
 from app.services.telegram_messages.runtime import runtime_templates
 from app.utils.currency import format_stars_rub
+from app.services.balance_tariffs import build_balance_tariffs_message
 from app.services.sessions.service import SessionService
 from app.services.takes.service import TakeService
 from app.services.favorites.service import FavoriteService
 from app.services.hd_balance.service import HDBalanceService
+from app.services.compensations.service import CompensationService
 from app.models.pack import Pack
+from app.models.session import Session as SessionModel
 
 configure_logging()
 logger = logging.getLogger("bot")
@@ -328,7 +331,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text=t("menu.btn.copy_style", "🔄 Сделать такую же")),
             ],
             [
-                KeyboardButton(text=t("menu.btn.shop", "🛒 Купить генерации")),
+                KeyboardButton(text=t("menu.btn.shop", "🛒 Купить тариф")),
                 KeyboardButton(text=t("menu.btn.profile", "👤 Мой профиль")),
             ],
         ],
@@ -771,7 +774,7 @@ async def my_profile(message: Message):
             text += f"\n\n🎁 *HD credits:* {hd_credits}"
 
         buttons = [
-            [InlineKeyboardButton(text=t("profile.btn.top_up", "🛒 Пополнить баланс"), callback_data="shop:open")],
+            [InlineKeyboardButton(text=t("profile.btn.top_up", "🛒 Выбрать фотосессию"), callback_data="shop:open")],
         ]
         if show_referral:
             buttons.append([
@@ -1457,6 +1460,66 @@ def _document_image_ext(mime_type: str | None, file_name: str | None) -> str | N
     return None
 
 
+# --- Consent + Data Deletion ---
+
+@router.callback_query(F.data == "accept_consent")
+async def accept_consent(callback: CallbackQuery, state: FSMContext):
+    """User accepts privacy consent."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_svc = UserService(db)
+            user = user_svc.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            user.consent_accepted_at = datetime.now(timezone.utc)
+            db.add(user)
+
+        await callback.answer("✅ Согласие принято")
+        await callback.message.answer(
+            "👍 Отлично! Теперь отправьте фото.",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        logger.exception("accept_consent error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.message(Command("deletemydata"))
+async def cmd_delete_my_data(message: Message, state: FSMContext):
+    """User requests deletion of all their data."""
+    telegram_id = str(message.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_svc = UserService(db)
+            user = user_svc.get_or_create_user(
+                telegram_id,
+                telegram_username=message.from_user.username,
+                telegram_first_name=message.from_user.first_name,
+                telegram_last_name=message.from_user.last_name,
+            )
+            user.data_deletion_requested_at = datetime.now(timezone.utc)
+            db.add(user)
+            user_id = user.id
+
+        from app.core.celery_app import celery_app as _celery
+        _celery.send_task(
+            "app.workers.tasks.delete_user_data.delete_user_data",
+            args=[user_id],
+        )
+        await message.answer(
+            "🗑 Запрос на удаление данных принят.\n"
+            "Данные будут удалены в течение 72 часов.\n"
+            "Мы уведомим вас о завершении."
+        )
+    except Exception:
+        logger.exception("cmd_delete_my_data error", extra={"user_id": telegram_id})
+        await message.answer("❌ Ошибка при запросе удаления данных.")
+
+
 # --- Step 1: Receive photo, save and show trends ---
 @router.message(BotStates.waiting_for_photo, F.photo)
 async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
@@ -1464,6 +1527,29 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
     telegram_id = str(message.from_user.id)
     
     try:
+        # Consent check
+        with get_db_session() as db:
+            user_svc_consent = UserService(db)
+            u_consent = user_svc_consent.get_or_create_user(
+                telegram_id,
+                telegram_username=message.from_user.username,
+                telegram_first_name=message.from_user.first_name,
+                telegram_last_name=message.from_user.last_name,
+            )
+            if not u_consent.consent_accepted_at:
+                await message.answer(
+                    "📋 Перед загрузкой фото подтвердите согласие:\n\n"
+                    "• Используйте только свои фото или фото с согласием владельца\n"
+                    "• Входные данные хранятся 30 дней, результаты — 90 дней\n"
+                    "• Вы можете удалить данные командой /deletemydata\n\n"
+                    "Нажмите «Принимаю» чтобы продолжить.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Принимаю", callback_data="accept_consent")],
+                        [InlineKeyboardButton(text="ℹ️ Подробнее", url="https://nanobanana.ai/privacy")],
+                    ]),
+                )
+                return
+
         # Validate photo
         photo = message.photo[-1]
         _, ext = os.path.splitext(photo.file_id)
@@ -1508,6 +1594,54 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
             photo_file_id=photo.file_id,
             photo_local_path=local_path,
         )
+        data = await state.get_data()
+
+        # Collection: first photo for the whole session — save to session and start step 0
+        with get_db_session() as db:
+            user_svc = UserService(db)
+            session_svc = SessionService(db)
+            u = user_svc.get_or_create_user(
+                telegram_id,
+                telegram_username=message.from_user.username,
+                telegram_first_name=message.from_user.first_name,
+                telegram_last_name=message.from_user.last_name,
+            )
+            session = session_svc.get_active_session(u.id)
+            if session and session_svc.is_collection(session) and not session.input_photo_path:
+                session_svc.set_input_photo(session, local_path, photo.file_id)
+                trend_id = session_svc.get_next_trend_id(session)
+                if trend_id:
+                    trend_svc = TrendService(db)
+                    take_svc = TakeService(db)
+                    trend = trend_svc.get(trend_id)
+                    trend_name = trend.name if trend else trend_id
+                    take = take_svc.create_take(
+                        user_id=u.id,
+                        trend_id=trend_id,
+                        input_file_ids=[photo.file_id],
+                        input_local_paths=[local_path],
+                        image_size="1024x1024",
+                    )
+                    take.step_index = 0
+                    take.is_reroll = False
+                    db.add(take)
+                    session_svc.attach_take_to_session(take, session)
+                    session_svc.advance_step(session)
+                    take_id = take.id
+
+                    from app.core.celery_app import celery_app as _celery
+                    status_msg = await message.answer(f"⏳ Образ 1 из {len(session.playlist)} — {trend_name}...")
+                    _celery.send_task(
+                        "app.workers.tasks.generate_take.generate_take",
+                        args=[take_id],
+                        kwargs={
+                            "status_chat_id": str(message.chat.id),
+                            "status_message_id": status_msg.message_id,
+                        },
+                    )
+                    await state.set_state(BotStates.viewing_take_result)
+                    return
+
         data = await state.get_data()
         # Deep link: trend already selected — skip trend choice, go to format
         pre_selected_id = data.get("selected_trend_id")
@@ -2066,7 +2200,7 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
 
         await _try_delete_messages(bot, callback.message.chat.id, data.get("last_bot_message_id"), callback.message.message_id)
         progress_msg = await callback.message.answer(
-            "⏳ Генерация снимка (3 варианта)...",
+            t("progress.take_step_1", "⏳ Генерация снимка [🟩🟩⬜⬜⬜] 1/3"),
         )
 
         celery_app.send_task(
@@ -2257,7 +2391,7 @@ async def regenerate_same(callback: CallbackQuery, state: FSMContext, bot: Bot):
 # Магазин — покупка пакетов генераций за Stars
 # ===========================================
 
-@router.message(lambda m: (m.text or "").strip() == t("menu.btn.shop", "🛒 Купить генерации"))
+@router.message(lambda m: (m.text or "").strip() == t("menu.btn.shop", "🛒 Купить тариф"))
 async def shop_menu_text(message: Message):
     """Открыть магазин по нажатию кнопки в меню."""
     await _show_shop(message)
@@ -2271,65 +2405,29 @@ async def shop_menu_callback(callback: CallbackQuery):
 
 
 async def _show_shop(message: Message, edit: bool = False):
-    """Показать список пакетов для покупки."""
+    """Экран «Выбор фотосессии» — баланс + тарифы (Avatar → Dating → Creator → Trial). Outcome-first."""
     try:
+        telegram_id = str(message.from_user.id) if message.from_user else ""
         with get_db_session() as db:
             payment_service = PaymentService(db)
-            payment_service.seed_default_packs()  # создаст если пусто
+            payment_service.seed_default_packs()
             db.commit()
-            packs = payment_service.list_active_packs()
-            # Копируем данные в простые dict, чтобы не обращаться к ORM после закрытия сессии
-            packs_data = [
-                {
-                    "id": p.id,
-                    "name": p.name,
-                    "emoji": p.emoji,
-                    "tokens": p.tokens,
-                    "stars_price": p.stars_price,
-                    "description": p.description or "",
-                }
-                for p in packs
-            ]
+            text, kb_dict = build_balance_tariffs_message(db, telegram_id)
 
-        if not packs_data:
-            await message.answer(t("shop.unavailable", "Магазин временно недоступен."), reply_markup=main_menu_keyboard())
+        if kb_dict is None:
+            await message.answer(t("shop.unavailable", "Тарифы временно недоступны."), reply_markup=main_menu_keyboard())
             return
 
-        # Вычисляем базовую цену за генерацию (по самому маленькому пакету) для динамических скидок
-        base_price_per_gen = None
-        for pack in packs_data:
-            if pack["tokens"] > 0:
-                ppu = pack["stars_price"] / pack["tokens"]
-                if base_price_per_gen is None or ppu > base_price_per_gen:
-                    base_price_per_gen = ppu
-
-        rate = getattr(settings, "star_to_rub", 1.3)
-        text = t("shop.header", "🛒 *Магазин генераций*\n\nКупите пакет — получайте фото в полном качестве, без watermark!\n\n")
-        buttons = []
-        for pack in packs_data:
-            label = f"{pack['emoji']} {pack['name']}: {pack['tokens']} фото — {format_stars_rub(pack['stars_price'], rate)}"
-            # Динамический расчёт скидки относительно базовой цены за генерацию
-            discount_text = ""
-            if base_price_per_gen and pack["tokens"] > 0:
-                ppu = pack["stars_price"] / pack["tokens"]
-                discount_pct = round((1 - ppu / base_price_per_gen) * 100)
-                if discount_pct > 0:
-                    discount_text = f" (скидка {discount_pct}%)"
-            desc = f"{pack['tokens']} фото без watermark{discount_text}"
-            text += f"{pack['emoji']} *{pack['name']}* — {pack['tokens']} фото за {format_stars_rub(pack['stars_price'], rate)}\n_{desc}_\n\n"
-            buttons.append([InlineKeyboardButton(text=label, callback_data=f"buy:{pack['id']}")])
-
-        # Кнопка «Не знаю как купить Stars» — всегда показываем переход; при выключенном способе по нажатию скажем «недоступно»
-        buttons.append([InlineKeyboardButton(
-            text=t("bank_transfer.btn.start", "💳 Не знаю как купить Stars"),
-            callback_data="bank_transfer:start",
-        )])
-        buttons.append([InlineKeyboardButton(text=t("nav.btn.menu", "📋 В меню"), callback_data="nav:menu")])
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+        rows = kb_dict.get("inline_keyboard", [])
+        keyboard = [
+            [InlineKeyboardButton(text=btn["text"], callback_data=btn["callback_data"]) for btn in row]
+            for row in rows
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        await message.answer(text, reply_markup=kb)
     except Exception:
         logger.exception("Error in shop_menu")
-        await message.answer(t("shop.load_error", "Ошибка загрузки магазина."), reply_markup=main_menu_keyboard())
+        await message.answer(t("shop.load_error", "Ошибка загрузки."), reply_markup=main_menu_keyboard())
 
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -2623,7 +2721,7 @@ async def handle_pre_checkout(pre_checkout: PreCheckoutQuery, bot: Bot):
 
 
 @router.message(F.successful_payment)
-async def handle_successful_payment(message: Message, bot: Bot):
+async def handle_successful_payment(message: Message, state: FSMContext, bot: Bot):
     """Обработка успешного платежа — начисление токенов."""
     payment_info = message.successful_payment
     telegram_id = str(message.from_user.id)
@@ -2653,6 +2751,7 @@ async def handle_successful_payment(message: Message, bot: Bot):
                         hd_svc = HDBalanceService(db)
                         user = db.query(User).filter(User.telegram_id == telegram_id).one_or_none()
                         balance = hd_svc.get_balance(user) if user else {"total": 0}
+                        is_collection = getattr(pack, "pack_subtype", "standalone") == "collection" and pack.playlist
 
                         audit.log(
                             actor_type="user",
@@ -2664,13 +2763,21 @@ async def handle_successful_payment(message: Message, bot: Bot):
                         )
 
                         remaining = session.takes_limit - session.takes_used
-                        await message.answer(
-                            f"✅ Пакет {pack.emoji} {pack.name} активирован!\n\n"
-                            f"Снимков: {remaining}\n"
-                            f"HD баланс: {balance['total']}\n\n"
-                            f"Отправьте фото для первого снимка!",
-                            reply_markup=main_menu_keyboard(),
-                        )
+                        if is_collection:
+                            await state.set_state(BotStates.waiting_for_photo)
+                            await message.answer(
+                                f"✅ Коллекция {pack.emoji} {pack.name} активирована!\n\n"
+                                f"Отправьте одно фото — по нему будут созданы все образы коллекции.",
+                                reply_markup=main_menu_keyboard(),
+                            )
+                        else:
+                            await message.answer(
+                                f"✅ Пакет {pack.emoji} {pack.name} активирован!\n\n"
+                                f"Снимков: {remaining}\n"
+                                f"HD баланс: {balance['total']}\n\n"
+                                f"Отправьте фото для первого снимка!",
+                                reply_markup=main_menu_keyboard(),
+                            )
                     elif payment_obj:
                         await message.answer("✅ Платёж уже обработан.")
                     else:
@@ -3093,10 +3200,10 @@ async def bank_transfer_start(callback: CallbackQuery, state: FSMContext):
                 await callback.answer("Оплата переводом временно недоступна.", show_alert=True)
                 return
             payment_service = PaymentService(db)
-            packs = payment_service.list_active_packs()
+            packs = payment_service.list_product_ladder_packs()
             packs_data = [
-                {"id": p.id, "name": p.name, "emoji": p.emoji, "tokens": p.tokens, "stars_price": p.stars_price}
-                for p in packs[:3]  # первые 3 по order_index
+                {"id": p.id, "name": p.name, "emoji": p.emoji, "tokens": getattr(p, "tokens", 0), "stars_price": p.stars_price}
+                for p in packs
             ]
             step1_text = effective["step1_description"]
 
@@ -3109,7 +3216,7 @@ async def bank_transfer_start(callback: CallbackQuery, state: FSMContext):
         buttons = []
         for pack in packs_data:
             rub = round(pack["stars_price"] * rate)
-            label = f"{pack['emoji']} {pack['name']}: {pack['tokens']} фото — {rub} ₽"
+            label = f"{pack['emoji']} {pack['name']} — {pack['stars_price']}⭐ ({rub} ₽)"
             buttons.append([InlineKeyboardButton(text=label, callback_data=f"bank_pack:{pack['id']}")])
         buttons.append([InlineKeyboardButton(text=t("nav.btn.menu", "📋 В меню"), callback_data="nav:menu")])
 
@@ -3135,7 +3242,9 @@ def _generate_receipt_code() -> str:
 async def bank_pack_selected(callback: CallbackQuery, state: FSMContext):
     """Шаг 2: пользователь выбрал тариф — показываем реквизиты и ждём чек (из БД)."""
     pack_id = callback.data.split(":", 1)[1]
-
+    if pack_id not in PRODUCT_LADDER_IDS:
+        await callback.answer("Пакет недоступен.", show_alert=True)
+        return
     try:
         with get_db_session() as db:
             payment_service = PaymentService(db)
@@ -3715,20 +3824,42 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
         if (is_free or not session_id) and not user_is_moderator:
             await _show_paywall_after_free_take(callback.message, telegram_id, take_id, variant)
         else:
+            is_collection = False
+            collection_info = ""
+            if session_id:
+                with get_db_session() as db:
+                    session_svc = SessionService(db)
+                    session = session_svc.get_session(session_id)
+                    if session and session_svc.is_collection(session):
+                        is_collection = True
+                        fav_svc_c = FavoriteService(db)
+                        fav_count_c = fav_svc_c.count_favorites(session.id)
+                        selected_c = fav_svc_c.count_selected_for_hd(session.id)
+                        hd_rem_c = session_svc.hd_remaining(session)
+                        collection_info = (
+                            f"\n\nВсего превью: {session.takes_used * 3}/{session.takes_limit * 3}\n"
+                            f"HD осталось: {hd_rem_c} | В избранном: {fav_count_c} (для HD: {selected_c})"
+                        )
+
             await state.set_state(BotStates.viewing_take_result)
             await state.update_data(current_take_id=take_id)
-            # Короткое меню: Забрать HD для этого / Ещё снимок / В избранное
             short_menu_buttons = []
-            if fav_id and balance.get("total", 0) > 0:
+            if fav_id and balance.get("total", 0) > 0 and not is_collection:
                 short_menu_buttons.append([
                     InlineKeyboardButton(text="🖼 Забрать HD для этого", callback_data=f"deliver_hd_one:{fav_id}"),
                 ])
-            short_menu_buttons.append([
-                InlineKeyboardButton(text="📸 Ещё снимок", callback_data="take_more"),
-                InlineKeyboardButton(text="📋 В избранное", callback_data="open_favorites"),
-            ])
+            if is_collection:
+                short_menu_buttons.append([
+                    InlineKeyboardButton(text="📸 Следующий образ", callback_data="take_more"),
+                    InlineKeyboardButton(text="📋 Избранное", callback_data="open_favorites"),
+                ])
+            else:
+                short_menu_buttons.append([
+                    InlineKeyboardButton(text="📸 Ещё снимок", callback_data="take_more"),
+                    InlineKeyboardButton(text="📋 В избранное", callback_data="open_favorites"),
+                ])
             await callback.message.answer(
-                f"Вариант {variant} в избранном. Забрать HD или сделать ещё снимок?",
+                f"Вариант {variant} в избранном.{collection_info}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=short_menu_buttons),
             )
 
@@ -3738,36 +3869,85 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 async def _show_paywall_after_free_take(message: Message, telegram_id: str, take_id: str, variant: str):
-    """Show paywall after free take."""
+    """Show contextual paywall after free take — only ladder packs (trial / avatar_pack / dating_pack / creator)."""
     try:
         with get_db_session() as db:
             audit = AuditService(db)
-            packs = (
-                db.query(Pack)
-                .filter(Pack.pack_type == "session", Pack.enabled == True)
-                .order_by(Pack.order_index)
-                .all()
-            )
-            packs_data = [{"id": p.id, "emoji": p.emoji, "name": p.name, "stars_price": p.stars_price, "hd_amount": p.hd_amount} for p in packs]
+            user_svc = UserService(db)
+            user = user_svc.get_by_telegram_id(telegram_id)
+            is_trial_eligible = user and not getattr(user, "trial_purchased", True)
+
+            payment_service = PaymentService(db)
+            all_packs = payment_service.list_product_ladder_packs()
+
+            trial_pack = None
+            collection_pack = None
+            creator_pack = None
+            for p in all_packs:
+                if getattr(p, "pack_subtype", "standalone") == "collection" and not getattr(p, "playlist", None):
+                    continue
+                if p.is_trial and is_trial_eligible and not trial_pack:
+                    trial_pack = p
+                elif getattr(p, "pack_subtype", "standalone") == "collection" and not collection_pack:
+                    collection_pack = p
+                elif p.stars_price and p.stars_price >= 500 and not creator_pack:
+                    creator_pack = p
+
+            buttons_data = []
+            if trial_pack:
+                buttons_data.append({
+                    "id": trial_pack.id, "emoji": trial_pack.emoji,
+                    "name": trial_pack.name, "stars_price": trial_pack.stars_price,
+                    "hd_amount": getattr(trial_pack, "hd_amount", None), "position": 1,
+                })
+            if collection_pack:
+                label_extra = " ⭐ Популярное" if getattr(collection_pack, "collection_label", None) else ""
+                buttons_data.append({
+                    "id": collection_pack.id, "emoji": collection_pack.emoji,
+                    "name": (getattr(collection_pack, "collection_label", None) or collection_pack.name) + label_extra,
+                    "stars_price": collection_pack.stars_price,
+                    "hd_amount": getattr(collection_pack, "hd_amount", None), "position": 2,
+                })
+            if creator_pack:
+                buttons_data.append({
+                    "id": creator_pack.id, "emoji": creator_pack.emoji,
+                    "name": creator_pack.name, "stars_price": creator_pack.stars_price,
+                    "hd_amount": getattr(creator_pack, "hd_amount", None), "position": 3,
+                })
+
+            if not buttons_data:
+                for p in all_packs[:3]:
+                    if getattr(p, "pack_subtype", "standalone") == "collection" and not getattr(p, "playlist", None):
+                        continue
+                    buttons_data.append({
+                        "id": p.id, "emoji": p.emoji,
+                        "name": p.name, "stars_price": p.stars_price,
+                        "hd_amount": getattr(p, "hd_amount", None), "position": len(buttons_data) + 1,
+                    })
+
             audit.log(
                 actor_type="user",
                 actor_id=telegram_id,
-                action="paywall_shown",
+                action="paywall_variant_shown",
                 entity_type="take",
                 entity_id=take_id,
-                payload={"context": "trial_preview", "packs_offered": [p["id"] for p in packs_data]},
+                payload={
+                    "context": "free_preview",
+                    "buttons": [{"pack_id": b["id"], "stars_price": b["stars_price"], "position": b["position"]} for b in buttons_data],
+                },
             )
+
         buttons = []
-        for pack in packs_data:
-            label = f"{pack['emoji']} {pack['name']} — {pack['stars_price']}⭐"
-            if pack.get("hd_amount"):
-                label += f" ({pack['hd_amount']} HD)"
-            buttons.append([InlineKeyboardButton(text=label, callback_data=f"paywall:{pack['id']}")])
+        for bd in buttons_data:
+            label = f"{bd['emoji']} {bd['name']} — {bd['stars_price']}⭐"
+            if bd.get("hd_amount"):
+                label += f" ({bd['hd_amount']} HD)"
+            buttons.append([InlineKeyboardButton(text=label, callback_data=f"paywall:{bd['id']}")])
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         await message.answer(
-            "🎬 Получите HD версию без watermark!\n\n"
-            "Выберите пакет:",
+            "👀 Смотри бесплатно, плати только если нравится!\n\n"
+            "🎬 Получи HD версию без watermark:",
             reply_markup=keyboard,
         )
     except Exception:
@@ -3834,7 +4014,7 @@ async def add_variant_to_favorites(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "take_more")
 async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    """Start another Take within the session."""
+    """Start another Take within the session. Collection mode: auto-advance with same photo."""
     telegram_id = str(callback.from_user.id)
     try:
         with get_db_session() as db:
@@ -3852,38 +4032,102 @@ async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 if getattr(user, "is_moderator", False):
                     session = session_svc.create_free_preview_session(user.id)
                 else:
-                    hd_svc = HDBalanceService(db)
-                    balance = hd_svc.get_balance(user)
-                    fav_svc = FavoriteService(db)
-
-                    if session:
-                        fav_count = fav_svc.count_favorites(session.id)
-                        text = (
-                            f"📸 Лимит снимков исчерпан ({session.takes_used}/{session.takes_limit}).\n\n"
-                            f"HD баланс: {balance['total']}\n"
-                            f"В избранном: {fav_count}\n\n"
-                        )
-                    else:
-                        text = "📸 Нет активной сессии.\n\n"
-
-                    buttons = []
-                    packs = (
-                        db.query(Pack)
-                        .filter(Pack.pack_type == "session", Pack.enabled == True)
-                        .order_by(Pack.order_index)
-                        .all()
-                    )
-                    for pack in packs:
-                        label = f"{pack.emoji} {pack.name} — {pack.stars_price}⭐"
-                        buttons.append([InlineKeyboardButton(text=label, callback_data=f"paywall:{pack.id}")])
-
+                    telegram_id = str(callback.from_user.id)
+                    text, kb_dict = build_balance_tariffs_message(db, telegram_id)
+                    if kb_dict is None:
+                        await callback.message.answer("Тарифы временно недоступны.", reply_markup=main_menu_keyboard())
+                        await callback.answer()
+                        return
+                    rows = kb_dict.get("inline_keyboard", [])
+                    buttons = [
+                        [InlineKeyboardButton(text=btn["text"], callback_data=btn["callback_data"]) for btn in row]
+                        for row in rows
+                    ]
                     if session:
                         buttons.append([InlineKeyboardButton(text="📋 Избранное", callback_data="open_favorites")])
-
                     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-                    await callback.message.answer(text + "Купите пакет для продолжения:", reply_markup=keyboard)
+                    await callback.message.answer(text, reply_markup=keyboard)
                     await callback.answer()
                     return
+
+            # Collection mode: auto-advance with the same photo
+            if session_svc.is_collection(session):
+                trend_id = session_svc.get_next_trend_id(session)
+                if not trend_id:
+                    fav_svc = FavoriteService(db)
+                    fav_count = fav_svc.count_favorites(session.id)
+                    selected_count = fav_svc.count_selected_for_hd(session.id)
+                    session_svc.complete_session(session)
+
+                    audit = AuditService(db)
+                    audit.log(
+                        actor_type="system",
+                        actor_id="bot",
+                        action="collection_complete",
+                        entity_type="session",
+                        entity_id=session.id,
+                        payload={
+                            "collection_run_id": session.collection_run_id,
+                            "total_steps": len(session.playlist),
+                        },
+                    )
+
+                    await callback.message.answer(
+                        f"🎉 Коллекция завершена!\n\n"
+                        f"Всего превью: {session.takes_used * 3}\n"
+                        f"В избранном: {fav_count} (отмечено для HD: {selected_count})\n"
+                        f"HD осталось: {session_svc.hd_remaining(session)}\n\n"
+                        f"Отметьте лучшие и нажмите «Забрать HD альбомом».",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="⭐ Открыть избранное", callback_data="open_favorites")],
+                            [InlineKeyboardButton(text="🖼 Забрать HD альбомом", callback_data="deliver_hd_album")],
+                        ]),
+                    )
+                    await callback.answer()
+                    return
+
+                if not session.input_photo_path or not os.path.isfile(session.input_photo_path):
+                    await callback.message.answer("❌ Фото для коллекции не найдено. Начните заново.")
+                    await callback.answer()
+                    return
+
+                trend_svc = TrendService(db)
+                trend = trend_svc.get(trend_id)
+                trend_name = trend.name if trend else trend_id
+                step_num = (session.current_step or 0) + 1
+                total_steps = len(session.playlist)
+
+                take_svc = TakeService(db)
+                take = take_svc.create_take(
+                    user_id=user.id,
+                    trend_id=trend_id,
+                    input_file_ids=[session.input_file_id] if session.input_file_id else [],
+                    input_local_paths=[session.input_photo_path],
+                    image_size="1024x1024",
+                )
+                take.step_index = session.current_step
+                take.is_reroll = False
+                db.add(take)
+                session_svc.attach_take_to_session(take, session)
+                session_svc.advance_step(session)
+                take_id = take.id
+
+                from app.core.celery_app import celery_app as _celery
+                chat_id = str(callback.message.chat.id)
+
+                status_msg = await callback.message.answer(
+                    f"⏳ Образ {step_num} из {total_steps} — {trend_name}...",
+                )
+                _celery.send_task(
+                    "app.workers.tasks.generate_take.generate_take",
+                    args=[take_id],
+                    kwargs={
+                        "status_chat_id": chat_id,
+                        "status_message_id": status_msg.message_id,
+                    },
+                )
+                await callback.answer()
+                return
 
         await state.set_state(BotStates.waiting_for_photo)
         await callback.message.answer(
@@ -3898,7 +4142,7 @@ async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data == "open_favorites")
 async def open_favorites(callback: CallbackQuery, state: FSMContext):
-    """Show favorites list."""
+    """Show favorites list with HD selection controls."""
     telegram_id = str(callback.from_user.id)
     try:
         with get_db_session() as db:
@@ -3916,7 +4160,26 @@ async def open_favorites(callback: CallbackQuery, state: FSMContext):
             favorites = fav_svc.list_favorites_for_user(user.id)
             balance = hd_svc.get_balance(user)
             session = session_svc.get_active_session(user.id)
-            favorites_data = [{"id": f.id, "variant": f.variant, "hd_status": f.hd_status} for f in (favorites or [])]
+            is_collection = session and session_svc.is_collection(session)
+            hd_rem = session_svc.hd_remaining(session) if session else 0
+            selected_count = fav_svc.count_selected_for_hd(session.id) if session else 0
+
+            favorites_data = []
+            now = datetime.now(timezone.utc)
+            for f in (favorites or []):
+                rendering_too_long = False
+                if f.hd_status == "rendering" and f.updated_at:
+                    elapsed_min = (now - f.updated_at).total_seconds() / 60.0
+                    if elapsed_min > 5:
+                        rendering_too_long = True
+                favorites_data.append({
+                    "id": f.id,
+                    "variant": f.variant,
+                    "hd_status": f.hd_status,
+                    "selected_for_hd": getattr(f, "selected_for_hd", False),
+                    "rendering_too_long": rendering_too_long,
+                })
+
             has_session = session is not None
 
             audit = AuditService(db)
@@ -3936,18 +4199,55 @@ async def open_favorites(callback: CallbackQuery, state: FSMContext):
         lines = [f"⭐ Избранное ({len(favorites_data)})\n"]
         buttons = []
         for i, fav in enumerate(favorites_data, 1):
-            status_icon = "✅" if fav["hd_status"] == "delivered" else "⏳" if fav["hd_status"] == "rendering" else ""
+            if fav["hd_status"] == "delivered":
+                status_icon = "✅"
+            elif fav["hd_status"] == "rendering":
+                status_icon = "⏳"
+            elif fav["selected_for_hd"]:
+                status_icon = "🟢 HD"
+            else:
+                status_icon = ""
             lines.append(f"{i}. Вариант {fav['variant']} {status_icon}")
-            if fav["hd_status"] == "none":
-                buttons.append([
-                    InlineKeyboardButton(text=f"❌ #{i}", callback_data=f"remove_fav:{fav['id']}"),
-                ])
 
-        lines.append(f"\nHD баланс: {balance['total']}")
+            row = []
+            if fav["hd_status"] == "none":
+                if fav["selected_for_hd"]:
+                    row.append(InlineKeyboardButton(
+                        text=f"↩️ Убрать HD #{i}",
+                        callback_data=f"deselect_hd:{fav['id']}",
+                    ))
+                else:
+                    row.append(InlineKeyboardButton(
+                        text=f"🟢 Выбрать HD #{i}",
+                        callback_data=f"select_hd:{fav['id']}",
+                    ))
+                row.append(InlineKeyboardButton(
+                    text=f"❌ #{i}",
+                    callback_data=f"remove_fav:{fav['id']}",
+                ))
+            if fav["rendering_too_long"]:
+                row.append(InlineKeyboardButton(
+                    text=f"⚠️ Проблема #{i}",
+                    callback_data=f"hd_problem:{fav['id']}",
+                ))
+            if row:
+                buttons.append(row)
+
+        if is_collection and session:
+            lines.append(
+                f"\nHD осталось: {hd_rem} | Отмечено для HD: {selected_count}"
+            )
+        else:
+            lines.append(f"\nHD баланс: {balance['total']}")
 
         action_buttons = []
         pending_count = sum(1 for f in favorites_data if f["hd_status"] == "none")
-        if pending_count > 0 and balance["total"] > 0:
+        if is_collection and selected_count > 0:
+            action_buttons.append(InlineKeyboardButton(
+                text=f"🖼 Забрать HD альбомом ({selected_count})",
+                callback_data="deliver_hd_album",
+            ))
+        elif pending_count > 0 and balance["total"] > 0:
             action_buttons.append(InlineKeyboardButton(text="🖼 Забрать HD", callback_data="deliver_hd"))
         if has_session:
             action_buttons.append(InlineKeyboardButton(text="📸 Назад к сессии", callback_data="session_status"))
@@ -3978,6 +4278,159 @@ async def remove_favorite(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Не удалось удалить (возможно, уже HD)")
     except Exception:
         logger.exception("remove_favorite error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("select_hd:"))
+async def select_hd_callback(callback: CallbackQuery, state: FSMContext):
+    """Mark favorite as selected for HD delivery."""
+    telegram_id = str(callback.from_user.id)
+    fav_id = callback.data.split(":", 1)[1]
+    try:
+        with get_db_session() as db:
+            user_svc = UserService(db)
+            user = user_svc.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            fav_svc = FavoriteService(db)
+            session_svc = SessionService(db)
+            fav = fav_svc.get_favorite(fav_id)
+            if not fav or str(fav.user_id) != str(user.id):
+                await callback.answer("❌ Не найдено", show_alert=True)
+                return
+            session_id = fav.session_id
+            if not session_id:
+                await callback.answer("❌ Нет сессии", show_alert=True)
+                return
+            ok = fav_svc.select_for_hd(fav_id, session_id)
+        if ok:
+            await callback.answer("🟢 Отмечено для HD")
+        else:
+            await callback.answer("❌ Лимит HD достигнут", show_alert=True)
+    except Exception:
+        logger.exception("select_hd error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("deselect_hd:"))
+async def deselect_hd_callback(callback: CallbackQuery, state: FSMContext):
+    """Unmark favorite from HD selection."""
+    telegram_id = str(callback.from_user.id)
+    fav_id = callback.data.split(":", 1)[1]
+    try:
+        with get_db_session() as db:
+            user_svc = UserService(db)
+            user = user_svc.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            fav_svc = FavoriteService(db)
+            fav = fav_svc.get_favorite(fav_id)
+            if not fav or str(fav.user_id) != str(user.id):
+                await callback.answer("❌ Не найдено", show_alert=True)
+                return
+            fav_svc.deselect_for_hd(fav_id)
+        await callback.answer("↩️ HD отменено")
+    except Exception:
+        logger.exception("deselect_hd error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("hd_problem:"))
+async def hd_problem_callback(callback: CallbackQuery, state: FSMContext):
+    """Report a problem with HD rendering."""
+    telegram_id = str(callback.from_user.id)
+    fav_id = callback.data.split(":", 1)[1]
+    try:
+        with get_db_session() as db:
+            user_svc = UserService(db)
+            user = user_svc.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            fav_svc = FavoriteService(db)
+            fav = fav_svc.get_favorite(fav_id)
+            if not fav:
+                await callback.answer("❌ Не найдено", show_alert=True)
+                return
+            session = db.query(SessionModel).filter(SessionModel.id == fav.session_id).one_or_none() if fav.session_id else None
+            correlation_id = session.collection_run_id if session else None
+
+            comp_svc = CompensationService(db)
+            comp_svc.report_hd_problem(user.id, fav_id, correlation_id)
+
+        await callback.answer("📩 Проблема зафиксирована. Мы разберёмся.", show_alert=True)
+    except Exception:
+        logger.exception("hd_problem error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "deliver_hd_album")
+async def deliver_hd_album_callback(callback: CallbackQuery, state: FSMContext):
+    """Deliver HD for all favorites marked as selected_for_hd."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_svc = UserService(db)
+            user = user_svc.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            fav_svc = FavoriteService(db)
+            session_svc = SessionService(db)
+            session = session_svc.get_active_session(user.id)
+            if not session:
+                sessions = (
+                    db.query(SessionModel)
+                    .filter(SessionModel.user_id == user.id)
+                    .order_by(SessionModel.created_at.desc())
+                    .first()
+                )
+                session = sessions
+
+            if not session:
+                await callback.answer("❌ Нет сессии", show_alert=True)
+                return
+
+            selected = fav_svc.list_selected_for_hd(session.id)
+            if not selected:
+                await callback.answer("❌ Не выбрано ни одного HD", show_alert=True)
+                return
+
+            hd_svc = HDBalanceService(db)
+            balance = hd_svc.get_balance(user)
+            can_deliver = min(len(selected), balance["total"])
+            if can_deliver == 0:
+                await callback.answer("❌ Недостаточно HD на балансе", show_alert=True)
+                return
+
+            selected_ids = [f.id for f in selected[:can_deliver]]
+
+        await callback.message.answer(
+            f"🖼 Запущена HD выдача для {len(selected_ids)} избранных.\n"
+            f"Ожидайте файлы в чате..."
+        )
+
+        from app.core.celery_app import celery_app as _celery
+        chat_id = str(callback.message.chat.id)
+        for fav_id in selected_ids:
+            _celery.send_task(
+                "app.workers.tasks.deliver_hd.deliver_hd",
+                args=[fav_id],
+                kwargs={"status_chat_id": chat_id},
+            )
+        await callback.answer(f"🖼 Запущено {len(selected_ids)} HD")
+    except Exception:
+        logger.exception("deliver_hd_album error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
@@ -4111,24 +4564,45 @@ async def session_status(callback: CallbackQuery, state: FSMContext):
 
             fav_count = fav_svc.count_favorites(session.id)
             remaining = session.takes_limit - session.takes_used
+            is_collection = session_svc.is_collection(session)
+            hd_rem = session_svc.hd_remaining(session)
+            selected_count = fav_svc.count_selected_for_hd(session.id)
 
         buttons = []
         if remaining > 0:
             buttons.append([InlineKeyboardButton(text="📸 Сделать снимок", callback_data="take_more")])
         buttons.append([InlineKeyboardButton(text="⭐ Открыть избранное", callback_data="open_favorites")])
-        if fav_count > 0 and balance["total"] > 0:
+
+        if is_collection and selected_count > 0:
+            buttons.append([InlineKeyboardButton(
+                text=f"🖼 Забрать HD альбомом ({selected_count})",
+                callback_data="deliver_hd_album",
+            )])
+        elif fav_count > 0 and balance["total"] > 0:
             buttons.append([InlineKeyboardButton(text="🖼 Забрать HD", callback_data="deliver_hd")])
 
-        # Upgrade button for trial sessions
         if session.pack_id == "trial":
-            buttons.append([InlineKeyboardButton(text="⬆️ Апгрейд", callback_data=f"upgrade:studio")])
+            buttons.append([InlineKeyboardButton(text="⬆️ Avatar — доплата 250⭐", callback_data="upgrade:avatar_pack")])
+            buttons.append([InlineKeyboardButton(text="⬆️ Dating — доплата 400⭐", callback_data="upgrade:dating_pack")])
+
+        if is_collection:
+            status_text = (
+                f"📸 Ваша коллекция\n\n"
+                f"Всего превью: {session.takes_used * 3}/{session.takes_limit * 3}\n"
+                f"Выбери до {session.hd_limit} HD — осталось: {hd_rem}\n"
+                f"В избранном: {fav_count} (отмечено для HD: {selected_count})"
+            )
+        else:
+            status_text = (
+                f"📸 Ваша фотосессия\n\n"
+                f"Осталось снимков: {remaining} из {session.takes_limit}\n"
+                f"HD баланс: {balance['total']}\n"
+                f"В избранном: {fav_count}"
+            )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         await callback.message.answer(
-            f"📸 Ваша фотосессия\n\n"
-            f"Осталось снимков: {remaining} из {session.takes_limit}\n"
-            f"HD баланс: {balance['total']}\n"
-            f"В избранном: {fav_count}",
+            status_text,
             reply_markup=keyboard,
         )
         await state.set_state(BotStates.session_active)
@@ -4143,6 +4617,9 @@ async def paywall_buy(callback: CallbackQuery, bot: Bot):
     """User tapped buy on paywall — send Stars invoice."""
     telegram_id = str(callback.from_user.id)
     pack_id = callback.data.split(":", 1)[1]
+    if pack_id not in PRODUCT_LADDER_IDS:
+        await callback.answer("❌ Пакет недоступен", show_alert=True)
+        return
     try:
         with get_db_session() as db:
             pack = db.query(Pack).filter(Pack.id == pack_id, Pack.enabled == True).one_or_none()

@@ -245,6 +245,13 @@ export interface Pack {
   is_trial?: boolean
   pack_type?: string
   upgrade_target_pack_ids?: string[] | null
+  description?: string
+  pack_subtype?: string
+  playlist?: string[] | null
+  favorites_cap?: number | null
+  collection_label?: string | null
+  upsell_pack_ids?: string[] | null
+  hd_sla_minutes?: number
   [key: string]: unknown
 }
 
@@ -327,10 +334,6 @@ export const trendsService = {
     const r = await api.get(`/admin/trends/${id}/example`, { responseType: 'blob' })
     return URL.createObjectURL(r.data as Blob)
   },
-  getStyleReferenceBlobUrl: async (id: string): Promise<string> => {
-    const r = await api.get(`/admin/trends/${id}/style-reference`, { responseType: 'blob' })
-    return URL.createObjectURL(r.data as Blob)
-  },
   uploadExample: (id: string, file: File, onProgress?: (p: number) => void) => {
     const form = new FormData()
     form.append('file', file)
@@ -341,18 +344,7 @@ export const trendsService = {
       })
       .then((r) => r.data)
   },
-  uploadStyleReference: (id: string, file: File, onProgress?: (p: number) => void) => {
-    const form = new FormData()
-    form.append('file', file)
-    return api
-      .post<Trend>(`/admin/trends/${id}/style-reference`, form, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        onUploadProgress: onProgress ? (e) => onProgress(e.total ? Math.round((e.loaded / e.total) * 100) : 0) : undefined,
-      })
-      .then((r) => r.data)
-  },
   deleteExample: (id: string) => api.delete<Trend>(`/admin/trends/${id}/example`).then((r) => r.data),
-  deleteStyleReference: (id: string) => api.delete<Trend>(`/admin/trends/${id}/style-reference`).then((r) => r.data),
   getPromptPreview: (id: string) =>
     api.get<{ prompt: string; model?: string; size?: string; format?: string }>(`/admin/trends/${id}/prompt-preview`).then((r) => r.data),
   moveOrder: (id: string, direction: 'up' | 'down') =>

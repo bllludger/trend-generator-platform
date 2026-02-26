@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import Column, DateTime, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.db.base import Base
 
@@ -17,6 +18,15 @@ class Session(Base):
     status = Column(String, nullable=False, default="active")
     upgraded_from_session_id = Column(String, nullable=True)
     upgrade_credit_stars = Column(Integer, nullable=False, default=0)
+
+    # Outcome Collections
+    playlist = Column(JSONB, nullable=True)
+    current_step = Column(Integer, nullable=False, default=0)
+    hd_limit = Column(Integer, nullable=False, default=0)
+    hd_used = Column(Integer, nullable=False, default=0)
+    collection_run_id = Column(String, nullable=True)
+    input_photo_path = Column(String, nullable=True)
+    input_file_id = Column(String, nullable=True)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

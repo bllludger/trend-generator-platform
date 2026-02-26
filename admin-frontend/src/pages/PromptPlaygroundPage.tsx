@@ -12,6 +12,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Progress } from '@/components/ui/progress'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -25,16 +26,13 @@ import {
   Image as ImageIcon,
   Settings,
   Loader2,
-  ArrowUp,
-  ArrowDown,
-  Eye,
-  EyeOff,
   Save,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useQuery } from '@tanstack/react-query'
 import { playgroundApi, type PlaygroundPromptConfig, type LogEntry, type PlaygroundSection } from '@/services/playgroundApi'
 import { trendsService, masterPromptService } from '@/services/api'
+import { parseFullTrendPrompt } from '@/utils/trendPromptParse'
 
 const APPLY_TO_ALL_TRENDS_LIMIT = 50
 const BATCH_TEST_TRENDS_LIMIT = 200
@@ -75,7 +73,7 @@ export default function PromptPlaygroundPage() {
   const [batchSortKey, setBatchSortKey] = useState<'trend' | 'status' | 'duration'>('trend')
   const [batchSortDir, setBatchSortDir] = useState<'asc' | 'desc'>('asc')
   const [batchFilterStatus, setBatchFilterStatus] = useState<'all' | 'success' | 'error'>('all')
-  const [bulkSectionsText, setBulkSectionsText] = useState('')
+  const [fullPromptText, setFullPromptText] = useState('')
   const batchTestStopRef = useRef(false)
   
   const logsEndRef = useRef<HTMLDivElement>(null)
@@ -112,11 +110,29 @@ export default function PromptPlaygroundPage() {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [logs])
 
+  function sectionsToFullText(sections: PlaygroundSection[]): string {
+    const ordered = [...(sections || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    const labelToTag: Record<string, string> = {
+      scene: '[SCENE]',
+      style: '[STYLE]',
+      avoid: '[AVOID]',
+      composition: '[COMPOSITION]',
+    }
+    const parts: string[] = []
+    for (const s of ordered) {
+      const label = (s.label || '').trim().toLowerCase()
+      const tag = labelToTag[label] || `[${(s.label || '').toUpperCase()}]`
+      parts.push(tag, (s.content || '').trim())
+    }
+    return parts.join('\n').replace(/\n\n+/g, '\n\n').trim()
+  }
+
   const loadDefaultConfig = async () => {
     try {
       setIsLoading(true)
       const defaultConfig = await playgroundApi.getDefaultConfig()
       setConfig(defaultConfig)
+      setFullPromptText(sectionsToFullText(defaultConfig.sections || []))
     } catch (error) {
       console.error('Failed to load default config:', error)
       toast.error('Failed to load default configuration')
@@ -139,6 +155,7 @@ export default function PromptPlaygroundPage() {
       setIsLoading(true)
       const trendConfig = await playgroundApi.loadTrend(trendId)
       setConfig(trendConfig)
+      setFullPromptText(sectionsToFullText(trendConfig.sections || []))
       toast.success(`Loaded trend: ${trendId}`)
     } catch (error) {
       console.error('Failed to load trend:', error)
@@ -155,7 +172,8 @@ export default function PromptPlaygroundPage() {
     }
     try {
       setIsSavingToTrend(true)
-      await playgroundApi.saveToTrend(selectedTrendId, config)
+      const configToSave: PlaygroundPromptConfig = { ...config, sections: fullPromptTextToSections(fullPromptText) }
+      await playgroundApi.saveToTrend(selectedTrendId, configToSave)
       toast.success('Конфиг сохранён в тренд')
     } catch (error) {
       console.error('Failed to save to trend:', error)
@@ -195,9 +213,10 @@ export default function PromptPlaygroundPage() {
     setApplyAllProgress({ current: 0, total })
     let applied = 0
     let failed = 0
-    for (let i = 0; i < list.length; i++) {
+      const configToApply: PlaygroundPromptConfig = { ...config, sections: fullPromptTextToSections(fullPromptText) }
+      for (let i = 0; i < list.length; i++) {
       try {
-        await playgroundApi.saveToTrend(list[i].id, config)
+        await playgroundApi.saveToTrend(list[i].id, configToApply)
         applied++
       } catch {
         failed++
@@ -333,8 +352,8 @@ export default function PromptPlaygroundPage() {
       setIsTesting(true)
       setResult(null)
       setLogs([])
-      
-      const response = await playgroundApi.testPrompt(config, image1 ?? undefined)
+      const configToSend: PlaygroundPromptConfig = { ...config, sections: fullPromptTextToSections(fullPromptText) }
+      const response = await playgroundApi.testPrompt(configToSend, image1 ?? undefined)
       const mapped: PlaygroundTestResult = {
         success: !!response.imageUrl,
         imageUrl: response.imageUrl,
@@ -367,88 +386,15 @@ export default function PromptPlaygroundPage() {
     }
   }
 
-  const toggleSection = (sectionId: string) => {
-    if (!config) return
-    setConfig({
-      ...config,
-      sections: config.sections.map((s: PlaygroundSection) =>
-        s.id === sectionId ? { ...s, enabled: !s.enabled } : s
-      ),
-    })
-  }
-
-  const updateSectionContent = (sectionId: string, content: string) => {
-    if (!config) return
-    setConfig({
-      ...config,
-      sections: config.sections.map((s: PlaygroundSection) =>
-        s.id === sectionId ? { ...s, content } : s
-      ),
-    })
-  }
-
-  const moveSectionUp = (index: number) => {
-    if (!config || index === 0) return
-    const newSections = [...config.sections]
-    ;[newSections[index - 1], newSections[index]] = [newSections[index], newSections[index - 1]]
-    newSections.forEach((s, i) => (s.order = i))
-    setConfig({ ...config, sections: newSections })
-  }
-
-  const moveSectionDown = (index: number) => {
-    if (!config || index === config.sections.length - 1) return
-    const newSections = [...config.sections]
-    ;[newSections[index], newSections[index + 1]] = [newSections[index + 1], newSections[index]]
-    newSections.forEach((s, i) => (s.order = i))
-    setConfig({ ...config, sections: newSections })
-  }
-
-  const addThreeDefaultSections = () => {
-    if (!config) return
+  function fullPromptTextToSections(text: string): PlaygroundSection[] {
+    const parsed = parseFullTrendPrompt(text)
     const ts = Date.now()
-    setConfig({
-      ...config,
-      sections: [
-        { id: `section_${ts}_0`, label: 'Scene', content: '', enabled: true, order: 0 },
-        { id: `section_${ts}_1`, label: 'Style', content: '', enabled: true, order: 1 },
-        { id: `section_${ts}_2`, label: 'Avoid', content: '', enabled: true, order: 2 },
-      ],
-    })
-  }
-
-  function parseBulkSectionsText(text: string): { scene: string; style: string; avoid: string } {
-    const marker = /^\s*\[?(Scene|Style|Avoid)\]?\s*:?\s*$/im
-    const lines = text.split(/\r?\n/)
-    let current: 'scene' | 'style' | 'avoid' = 'scene'
-    const acc = { scene: [] as string[], style: [] as string[], avoid: [] as string[] }
-    for (const line of lines) {
-      const m = line.match(marker)
-      if (m) {
-        const key = m[1].toLowerCase() as 'scene' | 'style' | 'avoid'
-        current = key
-        continue
-      }
-      acc[current].push(line)
-    }
-    return {
-      scene: acc.scene.join('\n').trim(),
-      style: acc.style.join('\n').trim(),
-      avoid: acc.avoid.join('\n').trim(),
-    }
-  }
-
-  const applyBulkSections = () => {
-    if (!config) return
-    const { scene, style, avoid } = parseBulkSectionsText(bulkSectionsText)
-    const ts = Date.now()
-    setConfig({
-      ...config,
-      sections: [
-        { id: `section_${ts}_0`, label: 'Scene', content: scene, enabled: true, order: 0 },
-        { id: `section_${ts}_1`, label: 'Style', content: style, enabled: true, order: 1 },
-        { id: `section_${ts}_2`, label: 'Avoid', content: avoid, enabled: true, order: 2 },
-      ],
-    })
+    return [
+      { id: `section_${ts}_0`, label: 'Scene', content: parsed.scene, enabled: true, order: 0 },
+      { id: `section_${ts}_1`, label: 'Style', content: parsed.style, enabled: true, order: 1 },
+      { id: `section_${ts}_2`, label: 'Avoid', content: parsed.avoid, enabled: true, order: 2 },
+      { id: `section_${ts}_3`, label: 'Composition', content: parsed.composition, enabled: true, order: 3 },
+    ]
   }
 
   const sizeToAspectRatio = (size: string): string => {
@@ -476,23 +422,23 @@ export default function PromptPlaygroundPage() {
     if (masterSettings?.prompt_identity_transfer_enabled !== false && masterSettings?.prompt_identity_transfer?.trim()) {
       textBlocks.push('[IDENTITY TRANSFER]\n' + masterSettings.prompt_identity_transfer.trim())
     }
-    const enabledSections = config.sections
-      .filter((s: PlaygroundSection) => s.enabled)
-      .sort((a: PlaygroundSection, b: PlaygroundSection) => a.order - b.order)
-    const sectionsText = enabledSections
-      .map((s: PlaygroundSection) => {
-        let content = s.content
-        for (const [key, value] of Object.entries(config.variables || {})) {
-          content = content.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
-        }
-        const label = (s.label || '').trim().toLowerCase()
-        if (label === 'scene') return '[SCENE]\n' + content.trim()
-        if (label === 'style') return '[STYLE]\n' + content.trim()
-        if (label === 'avoid') return '[AVOID]\n' + content.trim()
-        return content.trim()
-      })
-      .filter(Boolean)
-      .join('\n\n')
+    const parsed = parseFullTrendPrompt(fullPromptText)
+    let scene = (parsed.scene || '').trim()
+    let style = (parsed.style || '').trim()
+    let avoid = (parsed.avoid || '').trim()
+    let composition = (parsed.composition || '').trim()
+    for (const [key, value] of Object.entries(config.variables || {})) {
+      scene = scene.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
+      style = style.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
+      avoid = avoid.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
+      composition = composition.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
+    }
+    const sectionsParts: string[] = []
+    if (scene) sectionsParts.push('[SCENE]\n' + scene)
+    if (style) sectionsParts.push('[STYLE]\n' + style)
+    if (avoid) sectionsParts.push('[AVOID]\n' + avoid)
+    if (composition) sectionsParts.push('[COMPOSITION]\n' + composition)
+    const sectionsText = sectionsParts.join('\n\n')
     if (sectionsText) textBlocks.push(sectionsText)
     const safetyText = (masterSettings?.safety_constraints || '').trim() || 'no text generation, no chat.'
     if (masterSettings?.safety_constraints_enabled !== false && safetyText) {
@@ -512,15 +458,18 @@ export default function PromptPlaygroundPage() {
     }
     
     const aspectRatio = (config as any)?.aspect_ratio || (config.size ? sizeToAspectRatio(config.size) : '1:1')
+    // imageSize поддерживают gemini-3-pro-image-preview и gemini-3.1-flash-image-preview; для gemini-2.5 не отправляем
+    const modelSupportsImageSize = (config.model || '').toLowerCase().includes('gemini-3')
     const imageSizeTier = config.image_size_tier ?? '2K'
+    const imageConfig: Record<string, unknown> = { aspectRatio }
+    if (modelSupportsImageSize && imageSizeTier) {
+      imageConfig.imageSize = imageSizeTier
+    }
     const generationConfig: Record<string, unknown> = {
       responseModalities: ['IMAGE'],
       temperature: config.temperature,
       seed: config.seed != null ? Number(config.seed) : 42,
-      imageConfig: {
-        aspectRatio,
-        imageSize: imageSizeTier,
-      },
+      imageConfig,
     }
     return {
       model: config.model,
@@ -586,6 +535,17 @@ export default function PromptPlaygroundPage() {
             )}
             Сохранить в тренд
           </Button>
+          {applyAllProgress !== null && (
+            <div className="flex flex-col gap-1 w-full max-w-xs">
+              <div className="flex justify-between text-xs text-muted-foreground">
+                <span>Применение конфига</span>
+                <span>{applyAllProgress.current} из {applyAllProgress.total}</span>
+              </div>
+              <Progress
+                value={applyAllProgress.total ? Math.round((applyAllProgress.current / applyAllProgress.total) * 100) : 0}
+              />
+            </div>
+          )}
           <Button
             variant="outline"
             onClick={applyToAllTrends}
@@ -673,97 +633,26 @@ export default function PromptPlaygroundPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Left Column - Prompt Builder */}
         <div className="space-y-6">
-          {/* Prompt Sections */}
+          {/* Полный промпт — один способ ввода */}
           <Card>
             <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle className="flex items-center gap-2">
-                  <FileJson className="w-5 h-5" />
-                  Prompt Sections
-                </CardTitle>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={addThreeDefaultSections}
-                >
-                  Добавить 3 блока
-                </Button>
-              </div>
+              <CardTitle className="flex items-center gap-2">
+                <FileJson className="w-5 h-5" />
+                Полный промпт
+              </CardTitle>
+              <p className="text-xs text-muted-foreground">
+                На отдельных строках укажите [SCENE], [STYLE], [AVOID], [COMPOSITION], далее текст до следующего маркера.
+              </p>
             </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Ввод 3 блоков за раз */}
-              <div className="rounded-lg border bg-muted/30 p-4 space-y-2">
-                <h4 className="font-medium text-sm">Ввод 3 блоков за раз</h4>
-                <p className="text-xs text-muted-foreground">
-                  Используйте метки Scene:, Style:, Avoid: (каждая с новой строки) для разделения блоков. Подойдут также [Scene], [Style], [Avoid].
-                </p>
-                <textarea
-                  value={bulkSectionsText}
-                  onChange={(e) => setBulkSectionsText(e.target.value)}
-                  placeholder={'Scene:\nописание сцены\n\nStyle:\nстиль\n\nAvoid:\nчего избегать'}
-                  className="w-full p-2 border rounded text-sm font-mono min-h-[120px]"
-                  rows={6}
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={applyBulkSections}
-                  disabled={!config}
-                >
-                  Применить к секциям
-                </Button>
-              </div>
-
-              {config?.sections.map((section: PlaygroundSection, index: number) => (
-                <div
-                  key={section.id}
-                  className={`border rounded-lg p-4 ${
-                    section.enabled ? 'bg-white' : 'bg-gray-50 opacity-60'
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => toggleSection(section.id)}
-                      >
-                        {section.enabled ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-                      </Button>
-                      <span className="font-mono font-semibold text-sm">{section.label}</span>
-                    </div>
-                    
-                    <div className="flex items-center gap-1">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => moveSectionUp(index)}
-                        disabled={index === 0}
-                      >
-                        <ArrowUp className="w-4 h-4" />
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => moveSectionDown(index)}
-                        disabled={index === config.sections.length - 1}
-                      >
-                        <ArrowDown className="w-4 h-4" />
-                      </Button>
-                    </div>
-                  </div>
-                  
-                  <textarea
-                    value={section.content}
-                    onChange={(e) => updateSectionContent(section.id, e.target.value)}
-                    className="w-full p-2 border rounded text-sm font-mono"
-                    rows={4}
-                    disabled={!section.enabled}
-                  />
-                </div>
-              ))}
+            <CardContent>
+              <textarea
+                value={fullPromptText}
+                onChange={(e) => setFullPromptText(e.target.value)}
+                placeholder={'[SCENE]\nописание сцены...\n\n[STYLE]\n{"style": "cinematic"}\n\n[AVOID]\nчего избегать\n\n[COMPOSITION]\nправила композиции (необязательно)'}
+                className="w-full p-3 border rounded-md text-sm font-mono min-h-[280px]"
+                rows={14}
+                aria-label="Полный промпт: блоки [SCENE], [STYLE], [AVOID], [COMPOSITION]"
+              />
             </CardContent>
           </Card>
 
@@ -785,6 +674,7 @@ export default function PromptPlaygroundPage() {
                 >
                   <option value="gemini-2.5-flash-image">Стандарт (gemini-2.5-flash-image)</option>
                   <option value="gemini-3-pro-image-preview">Gemini 3 Pro (gemini-3-pro-image-preview)</option>
+                  <option value="gemini-3.1-flash-image-preview">Nano Banana 2 (gemini-3.1-flash-image-preview)</option>
                 </select>
               </div>
               <div>
@@ -1066,6 +956,17 @@ export default function PromptPlaygroundPage() {
                         <span>{t.emoji} {t.name}</span>
                       </label>
                     ))}
+                </div>
+              )}
+              {batchTestProgress !== null && (
+                <div className="flex flex-col gap-1 w-full max-w-xs">
+                  <div className="flex justify-between text-xs text-muted-foreground">
+                    <span>Тест по трендам</span>
+                    <span>{batchTestProgress.current} из {batchTestProgress.total}</span>
+                  </div>
+                  <Progress
+                    value={batchTestProgress.total ? Math.round((batchTestProgress.current / batchTestProgress.total) * 100) : 0}
+                  />
                 </div>
               )}
               <div className="flex items-center gap-2">

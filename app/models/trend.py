@@ -21,6 +21,7 @@ class Trend(Base):
     subject_prompt = Column(Text, nullable=True)  # legacy, не используется в новом PromptBuilder
     negative_prompt = Column(Text, nullable=False, default="")  # legacy, в новом builder — negative_scene
     negative_scene = Column(Text, nullable=True)  # что избегать в сцене (только визуальный стиль)
+    composition_prompt = Column(Text, nullable=True)  # опционально: правила композиции; если пусто — из Transfer Policy
     subject_mode = Column(String(32), nullable=True, default="face")  # face | head_torso | full_body
     framing_hint = Column(String(32), nullable=True, default="portrait")  # close_up | portrait | half_body | full_body
     style_preset = Column(JSONB, nullable=False, default=dict)

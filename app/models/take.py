@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import Column, DateTime, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.db.base import Base
@@ -35,6 +35,10 @@ class Take(Base):
 
     error_code = Column(String, nullable=True)
     error_variants = Column(JSONB, nullable=True)
+
+    # Outcome Collections
+    step_index = Column(Integer, nullable=True)
+    is_reroll = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(
         DateTime(timezone=True),

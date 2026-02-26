@@ -34,11 +34,7 @@ def build_unlock_markup(
                 "callback_data": f"unlock_tokens:{job_id}",
             }
         ])
-    if options.show_stars:
-        rows.append([
-            {
-                "text": "Разблокировать за Stars",
-                "callback_data": f"unlock:{job_id}",
-            }
-        ])
+    # Unlock за Stars убран из UX (только тарифы лестницы). Кнопка не показывается.
+    # if options.show_stars:
+    #     rows.append([{"text": "Разблокировать за Stars", "callback_data": f"unlock:{job_id}"}])
     return {"inline_keyboard": rows}

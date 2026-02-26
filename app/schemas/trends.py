@@ -22,6 +22,7 @@ class TrendAdminIn(BaseModel):
     scene_prompt: str = ""
     style_preset: dict | str | None = None  # JSON-объект или строка; null от фронта → в коде приводим к {}
     negative_scene: str = ""
+    composition_prompt: str | None = None  # опционально: [COMPOSITION]; если пусто — из Transfer Policy
     subject_mode: str = "face"  # face | head_torso | full_body
     framing_hint: str = "portrait"  # close_up | portrait | half_body | full_body
     max_images: int = 1
@@ -90,7 +91,6 @@ def require_prompt(payload: TrendAdminIn) -> None:
 class TrendAdminOut(TrendAdminIn):
     id: str
     has_example: bool = False  # пример результата (показ в боте)
-    has_style_reference: bool = False  # референс стиля для Gemini (IMAGE_2)
     deeplink: str | None = None  # ссылка «Попробовать этот тренд» (если задан telegram_bot_username)
 
 

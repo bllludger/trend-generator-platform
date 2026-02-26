@@ -13,6 +13,33 @@ class FavoriteService:
     def __init__(self, db: DBSession):
         self.db = db
 
+    def _check_favorites_cap(self, session_id: str) -> bool:
+        """Enforce favorites cap based on session limits, not global user balance."""
+        from app.models.session import Session as SessionModel
+        from app.models.pack import Pack
+
+        session = (
+            self.db.query(SessionModel)
+            .filter(SessionModel.id == session_id)
+            .one_or_none()
+        )
+        if not session:
+            return True
+
+        pack = (
+            self.db.query(Pack)
+            .filter(Pack.id == session.pack_id)
+            .one_or_none()
+        )
+
+        if pack and pack.favorites_cap:
+            cap = pack.favorites_cap
+        else:
+            cap = min((session.hd_limit or 0) * 2, 30) if (session.hd_limit or 0) > 0 else 30
+
+        current = self.count_favorites(session_id)
+        return current < cap
+
     def add_favorite(
         self,
         user_id: str,
@@ -34,6 +61,13 @@ class FavoriteService:
         )
         if existing:
             return existing
+
+        if session_id and not self._check_favorites_cap(session_id):
+            logger.info(
+                "favorites_cap_reached",
+                extra={"session_id": session_id, "user_id": user_id},
+            )
+            return None
 
         fav = Favorite(
             id=str(uuid4()),
@@ -134,3 +168,72 @@ class FavoriteService:
             fav.hd_job_id = job_id
             self.db.add(fav)
             self.db.flush()
+
+    # ── HD selection (Outcome Collections) ──────────────────────────
+
+    def select_for_hd(self, favorite_id: str, session_id: str) -> bool:
+        """Mark favorite as selected for HD delivery. Checks session.hd_limit."""
+        from app.models.session import Session as SessionModel
+
+        fav = self.get_favorite(favorite_id)
+        if not fav:
+            return False
+        if fav.selected_for_hd:
+            return True
+
+        session = (
+            self.db.query(SessionModel)
+            .filter(SessionModel.id == session_id)
+            .one_or_none()
+        )
+        if not session:
+            return False
+
+        selected_count = (
+            self.db.query(Favorite)
+            .filter(
+                Favorite.session_id == session_id,
+                Favorite.selected_for_hd.is_(True),
+            )
+            .count()
+        )
+        if selected_count >= (session.hd_limit or 0):
+            return False
+
+        fav.selected_for_hd = True
+        self.db.add(fav)
+        self.db.flush()
+        return True
+
+    def deselect_for_hd(self, favorite_id: str) -> bool:
+        """Unmark HD selection (only if not yet delivered)."""
+        fav = self.get_favorite(favorite_id)
+        if not fav or fav.hd_status == "delivered":
+            return False
+        fav.selected_for_hd = False
+        self.db.add(fav)
+        self.db.flush()
+        return True
+
+    def list_selected_for_hd(self, session_id: str) -> list[Favorite]:
+        """Return favorites marked for HD that haven't been delivered yet."""
+        return (
+            self.db.query(Favorite)
+            .filter(
+                Favorite.session_id == session_id,
+                Favorite.selected_for_hd.is_(True),
+                Favorite.hd_status == "none",
+            )
+            .order_by(Favorite.created_at)
+            .all()
+        )
+
+    def count_selected_for_hd(self, session_id: str) -> int:
+        return (
+            self.db.query(Favorite)
+            .filter(
+                Favorite.session_id == session_id,
+                Favorite.selected_for_hd.is_(True),
+            )
+            .count()
+        )

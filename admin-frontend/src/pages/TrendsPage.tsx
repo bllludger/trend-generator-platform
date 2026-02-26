@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Progress } from '@/components/ui/progress'
 import {
   Dialog,
   DialogContent,
@@ -16,7 +17,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Plus, Power, PowerOff, Pencil, ImagePlus, Trash2, ChevronUp, ChevronDown, ChevronRight, FolderPlus, GripVertical } from 'lucide-react'
+import { Plus, Power, PowerOff, Pencil, ImagePlus, Trash2, ChevronUp, ChevronDown, FolderPlus, GripVertical, ClipboardPaste } from 'lucide-react'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   DndContext,
@@ -38,6 +39,32 @@ import { cn } from '@/lib/utils'
 import type { Theme, Trend } from '@/types'
 
 const DROPPABLE_ID_NONE = 'no-theme'
+
+const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp']
+
+/** Извлекает первый эмодзи из строки (для поля emoji в API при сохранении). */
+function extractFirstEmoji(s: string): string {
+  const match = s.trim().match(/\p{Emoji_Presentation}|\p{Extended_Pictographic}/u)
+  return match ? match[0] : ''
+}
+
+async function getImageFileFromClipboard(): Promise<File | null> {
+  try {
+    const items = await navigator.clipboard.read()
+    for (const item of items) {
+      for (const type of item.types) {
+        if (ALLOWED_IMAGE_TYPES.includes(type)) {
+          const blob = await item.getType(type)
+          const ext = type === 'image/png' ? 'png' : type === 'image/webp' ? 'webp' : 'jpg'
+          return new File([blob], `pasted.${ext}`, { type })
+        }
+      }
+    }
+  } catch {
+    // Permission denied or no image in clipboard
+  }
+  return null
+}
 
 type ApiErrorShape = { response?: { data?: { detail?: string } }; message?: string }
 type ValidationErrorShape = { response?: { data?: { detail?: string | Array<{ msg?: string }> } } }
@@ -86,44 +113,6 @@ function TrendExampleThumb({
     <img
       src={blobUrl}
       alt="Пример результата"
-      className="w-full h-full object-cover border-0 rounded-none"
-    />
-  )
-}
-
-function TrendStyleRefThumb({
-  trendId,
-  hasStyleRef,
-  refreshKey = 0,
-}: {
-  trendId: string
-  hasStyleRef?: boolean
-  refreshKey?: number
-}) {
-  const [blobUrl, setBlobUrl] = useState<string | null>(null)
-  const urlRef = useRef<string | null>(null)
-  useEffect(() => {
-    if (!hasStyleRef) return
-    trendsService
-      .getStyleReferenceBlobUrl(trendId)
-      .then((url) => {
-        if (urlRef.current) URL.revokeObjectURL(urlRef.current)
-        urlRef.current = url
-        setBlobUrl(url)
-      })
-      .catch(() => {})
-    return () => {
-      if (urlRef.current) {
-        URL.revokeObjectURL(urlRef.current)
-        urlRef.current = null
-      }
-    }
-  }, [trendId, hasStyleRef, refreshKey])
-  if (!hasStyleRef || !blobUrl) return null
-  return (
-    <img
-      src={blobUrl}
-      alt="Референс стиля"
       className="w-full h-full object-cover border-0 rounded-none"
     />
   )
@@ -205,6 +194,7 @@ export function TrendsPage() {
     theme_id: string | null
     scene_prompt: string
     negative_scene: string
+    composition_prompt: string
     subject_mode: string
     framing_hint: string
     style_preset_str: string
@@ -222,6 +212,7 @@ export function TrendsPage() {
     theme_id: null,
     scene_prompt: '',
     negative_scene: '',
+    composition_prompt: '',
     subject_mode: 'face',
     framing_hint: 'portrait',
     style_preset_str: '{}',
@@ -233,9 +224,7 @@ export function TrendsPage() {
     negative_prompt: '',
   })
   const exampleFileInputRef = useRef<HTMLInputElement>(null)
-  const styleRefFileInputRef = useRef<HTMLInputElement>(null)
   const [uploadProgress, setUploadProgress] = useState<number | null>(null)
-  const [uploadStyleRefProgress, setUploadStyleRefProgress] = useState<number | null>(null)
   const editButtonRef = useRef<HTMLButtonElement | null>(null)
   const dialogContentRef = useRef<HTMLDivElement>(null)
 
@@ -244,7 +233,6 @@ export function TrendsPage() {
   const [themeFormData, setThemeFormData] = useState({ name: '', emoji: '' })
   const [trendFormTab, setTrendFormTab] = useState('basic')
   const [fullPromptText, setFullPromptText] = useState('')
-  const [fullPromptDetailsOpen, setFullPromptDetailsOpen] = useState(false)
   const [showSceneError, setShowSceneError] = useState(false)
 
   const { data: themes = [], isLoading: themesLoading } = useQuery({
@@ -372,6 +360,18 @@ export function TrendsPage() {
     },
   })
 
+  const patchFramingMutation = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: { subject_mode?: string; framing_hint?: string } }) =>
+      trendsService.update(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['trends'] })
+      toast.success('Параметры кадра обновлены')
+    },
+    onError: () => {
+      toast.error('Ошибка при обновлении параметров кадра')
+    },
+  })
+
   const moveToThemeMutation = useMutation({
     mutationFn: ({ id, theme_id, order_index }: { id: string; theme_id: string | null; order_index: number }) =>
       trendsService.update(id, { theme_id, order_index }),
@@ -420,44 +420,6 @@ export function TrendsPage() {
     },
     onError: () => {
       toast.error('Ошибка удаления примера')
-    },
-  })
-
-  const uploadStyleRefMutation = useMutation({
-    mutationFn: ({
-      id,
-      file,
-      onProgress,
-    }: {
-      id: string
-      file: File
-      onProgress?: (percent: number) => void
-    }) => trendsService.uploadStyleReference(id, file, onProgress),
-    onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: ['trends'] })
-      toast.success('Референс стиля загружен')
-      if (editingTrend && editingTrend.id === variables.id) {
-        setEditingTrend({ ...editingTrend, has_style_reference: true })
-        setMediaRefreshKey((k) => k + 1)
-      }
-    },
-    onError: (err: unknown) => {
-      toast.error(getErrorMessage(err, 'Ошибка загрузки референса'))
-    },
-    onSettled: () => {
-      setUploadStyleRefProgress(null)
-    },
-  })
-
-  const deleteStyleRefMutation = useMutation({
-    mutationFn: (id: string) => trendsService.deleteStyleReference(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['trends'] })
-      toast.success('Референс стиля удалён')
-      if (editingTrend) setEditingTrend({ ...editingTrend, has_style_reference: false })
-    },
-    onError: () => {
-      toast.error('Ошибка удаления референса')
     },
   })
 
@@ -522,6 +484,7 @@ export function TrendsPage() {
       theme_id: null,
       scene_prompt: '',
       negative_scene: '',
+      composition_prompt: '',
       subject_mode: 'face',
       framing_hint: 'portrait',
       style_preset_str: '{}',
@@ -532,8 +495,8 @@ export function TrendsPage() {
       subject_prompt: '',
       negative_prompt: '',
     })
+    setFullPromptText('')
     setShowSceneError(false)
-    setFullPromptDetailsOpen(false)
   }, [trends?.length])
 
   const handleCreate = (themeId?: string | null) => {
@@ -554,7 +517,6 @@ export function TrendsPage() {
     trendsService.get(trend.id).then((full) => {
       setEditingTrend(full)
       setShowSceneError(false)
-      setFullPromptDetailsOpen(false)
       const raw = full.style_preset
     let style_preset_mode: 'json' | 'string' = 'json'
     let style_preset_str: string
@@ -575,6 +537,7 @@ export function TrendsPage() {
       theme_id: full.theme_id ?? null,
       scene_prompt: (full.scene_prompt as string) || '',
       negative_scene: full.negative_scene || '',
+      composition_prompt: (full as Trend).composition_prompt ?? '',
       subject_mode: full.subject_mode || 'face',
       framing_hint: full.framing_hint || 'portrait',
       style_preset_str,
@@ -585,6 +548,12 @@ export function TrendsPage() {
       subject_prompt: full.subject_prompt || '',
       negative_prompt: full.negative_prompt || '',
     })
+    setFullPromptText(buildFullTrendPrompt(
+      (full.scene_prompt as string) || '',
+      style_preset_str,
+      full.negative_scene || '',
+      (full as Trend).composition_prompt ?? ''
+    ))
     setPromptPreview(null)
     setPreviewError(null)
     loadPromptPreview(full.id)
@@ -614,57 +583,44 @@ export function TrendsPage() {
       setTrendFormTab('basic')
       return
     }
-    if (!formData.emoji.trim()) {
-      toast.error('Выберите эмодзи')
-      setTrendFormTab('basic')
-      return
-    }
-    const hasScene = !!formData.scene_prompt.trim()
+    const parsed = parseFullTrendPrompt(fullPromptText)
+    const hasScene = !!parsed.scene.trim()
     const hasLegacy = !!formData.system_prompt.trim()
     if (!hasScene && !hasLegacy) {
       setShowSceneError(true)
       setTrendFormTab('prompts')
-      toast.error(
-        'Заполните блок [SCENE] на вкладке «Промпты».'
-      )
+      toast.error('Заполните блок [SCENE] на вкладке «Промпты».')
       return
     }
 
     let style_preset: Record<string, unknown> | string
-    if (formData.style_preset_mode === 'string') {
-      style_preset = formData.style_preset_str
-    } else {
+    const styleStr = (parsed.style || '').trim()
+    if (!styleStr) {
       style_preset = {}
+    } else {
       try {
-        const trimmed = formData.style_preset_str.trim()
-        if (trimmed) {
-          const parsed = JSON.parse(formData.style_preset_str)
-          if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-            style_preset = parsed
-          } else if (typeof parsed === 'string') {
-            try {
-              const inner = JSON.parse(parsed)
-              style_preset =
-                typeof inner === 'object' && inner !== null && !Array.isArray(inner) ? inner : {}
-            } catch {
-              style_preset = {}
-            }
-          }
+        const parsedStyle = JSON.parse(styleStr)
+        if (typeof parsedStyle === 'object' && parsedStyle !== null && !Array.isArray(parsedStyle)) {
+          style_preset = parsedStyle
+        } else if (typeof parsedStyle === 'string') {
+          style_preset = parsedStyle
+        } else {
+          style_preset = styleStr
         }
       } catch {
-        toast.error('Ошибка в JSON style_preset')
-        return
+        style_preset = styleStr
       }
     }
 
     const payload = {
-      name: formData.name,
-      emoji: formData.emoji,
+      name: formData.name.trim(),
+      emoji: extractFirstEmoji(formData.name) || formData.emoji || '',
       description: formData.description,
       order_index: formData.order_index,
       theme_id: formData.theme_id ?? null,
-      scene_prompt: formData.scene_prompt,
-      negative_scene: formData.negative_scene,
+      scene_prompt: parsed.scene.trim(),
+      negative_scene: (parsed.avoid || '').trim(),
+      composition_prompt: (parsed.composition || '').trim() || null,
       subject_mode: formData.subject_mode,
       framing_hint: formData.framing_hint,
       style_preset,
@@ -851,7 +807,6 @@ export function TrendsPage() {
                                       <p className="text-xs text-muted-foreground mt-1">
                                         Порядок: {trend.order_index}
                                         {trend.has_example && ' · Есть пример'}
-                                        {trend.has_style_reference && ' · Референс'}
                                       </p>
                                     </div>
                                   </div>
@@ -866,6 +821,47 @@ export function TrendsPage() {
                               <p className="text-sm text-muted-foreground line-clamp-2 mb-4">
                                 {trend.description}
                               </p>
+                              <div className="grid grid-cols-2 gap-2 mb-4">
+                                <div className="space-y-1">
+                                  <Label className="text-xs">Область объекта</Label>
+                                  <Select
+                                    value={trend.subject_mode ?? 'face'}
+                                    onValueChange={(v) =>
+                                      patchFramingMutation.mutate({ id: trend.id, data: { subject_mode: v } })
+                                    }
+                                    disabled={patchFramingMutation.isPending}
+                                  >
+                                    <SelectTrigger className="h-8 text-xs" aria-label="Область объекта">
+                                      <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="face">Лицо</SelectItem>
+                                      <SelectItem value="head_torso">Голова и торс</SelectItem>
+                                      <SelectItem value="full_body">В полный рост</SelectItem>
+                                    </SelectContent>
+                                  </Select>
+                                </div>
+                                <div className="space-y-1">
+                                  <Label className="text-xs">Кадрирование</Label>
+                                  <Select
+                                    value={trend.framing_hint ?? 'portrait'}
+                                    onValueChange={(v) =>
+                                      patchFramingMutation.mutate({ id: trend.id, data: { framing_hint: v } })
+                                    }
+                                    disabled={patchFramingMutation.isPending}
+                                  >
+                                    <SelectTrigger className="h-8 text-xs" aria-label="Кадрирование">
+                                      <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="close_up">Крупный план</SelectItem>
+                                      <SelectItem value="portrait">Портрет</SelectItem>
+                                      <SelectItem value="half_body">По пояс</SelectItem>
+                                      <SelectItem value="full_body">В полный рост</SelectItem>
+                                    </SelectContent>
+                                  </Select>
+                                </div>
+                              </div>
                               <div className="flex flex-wrap items-center gap-2">
                                 <div className="flex items-center rounded-md border border-input">
                                   <Button
@@ -994,22 +990,11 @@ export function TrendsPage() {
                     id="name"
                     value={formData.name}
                     onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                    placeholder="Любовный взгляд"
+                    placeholder="💕 Любовный взгляд"
                     aria-required
                   />
                 </div>
-                <div className="grid grid-cols-3 gap-4">
-                  <div className="grid gap-2">
-                    <Label htmlFor="emoji">Эмодзи *</Label>
-                    <Input
-                      id="emoji"
-                      value={formData.emoji}
-                      onChange={(e) => setFormData({ ...formData, emoji: e.target.value })}
-                      placeholder="❤️"
-                      className="text-2xl"
-                      aria-required
-                    />
-                  </div>
+                <div className="grid grid-cols-2 gap-4">
                   <div className="grid gap-2">
                     <Label htmlFor="order">Порядок</Label>
                     <Input
@@ -1049,43 +1034,6 @@ export function TrendsPage() {
               </fieldset>
 
               <fieldset className="space-y-4 rounded-lg border p-4">
-                <legend className="text-sm font-medium px-1">Параметры кадра</legend>
-                <div className="grid gap-2">
-                  <Label htmlFor="subject_mode">Область объекта</Label>
-                  <Select
-                    value={formData.subject_mode}
-                    onValueChange={(v) => setFormData({ ...formData, subject_mode: v })}
-                  >
-                    <SelectTrigger id="subject_mode" aria-label="Область объекта">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="face">Лицо</SelectItem>
-                      <SelectItem value="head_torso">Голова и торс</SelectItem>
-                      <SelectItem value="full_body">В полный рост</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="framing_hint">Кадрирование</Label>
-                  <Select
-                    value={formData.framing_hint}
-                    onValueChange={(v) => setFormData({ ...formData, framing_hint: v })}
-                  >
-                    <SelectTrigger id="framing_hint" aria-label="Кадрирование">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="close_up">Крупный план</SelectItem>
-                      <SelectItem value="portrait">Портрет</SelectItem>
-                      <SelectItem value="half_body">По пояс</SelectItem>
-                      <SelectItem value="full_body">В полный рост</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </fieldset>
-
-              <fieldset className="space-y-4 rounded-lg border p-4">
                 <legend className="text-sm font-medium px-1">Публикация</legend>
                 <div className="flex items-center gap-2">
                   <input
@@ -1104,177 +1052,33 @@ export function TrendsPage() {
             </TabsContent>
 
             <TabsContent value="prompts" className="mt-4 space-y-6">
-              <div className="rounded-lg border bg-muted/30">
-                <button
-                  type="button"
-                  onClick={() => setFullPromptDetailsOpen((o) => !o)}
-                  className="flex w-full cursor-pointer items-center gap-2 px-4 py-2 text-left font-medium"
-                  aria-expanded={fullPromptDetailsOpen}
-                >
-                  {fullPromptDetailsOpen ? (
-                    <ChevronDown className="h-4 w-4 shrink-0" aria-hidden />
-                  ) : (
-                    <ChevronRight className="h-4 w-4 shrink-0" aria-hidden />
-                  )}
-                  Вставить полным текстом
-                </button>
-                {fullPromptDetailsOpen && (
-                  <div className="border-t p-4 space-y-3">
-                    <p className="text-xs text-muted-foreground">
-                      Формат: на отдельных строках [SCENE], [STYLE], [AVOID], далее текст до следующего блока. Порядок блоков любой.
-                    </p>
-                    <Textarea
-                      value={fullPromptText}
-                      onChange={(e) => setFullPromptText(e.target.value)}
-                      rows={8}
-                      placeholder={'[SCENE]\nсцена...\n[STYLE]\n{}\n[AVOID]\nнегатив'}
-                      className="font-mono text-sm"
-                      aria-label="Полный промпт тренда: блоки [SCENE], [STYLE], [AVOID]"
-                    />
-                    <div className="flex gap-2">
-                      <Button
-                        type="button"
-                        variant="secondary"
-                        size="sm"
-                        onClick={() => {
-                          const parsed = parseFullTrendPrompt(fullPromptText)
-                          setFormData((prev) => ({
-                            ...prev,
-                            scene_prompt: parsed.scene,
-                            negative_scene: parsed.avoid,
-                            style_preset_str: parsed.style,
-                            style_preset_mode: parsed.styleParsedAsJson ? 'json' : 'string',
-                          }))
-                          toast.success('Поля Сцена, Стиль и Негатив заполнены')
-                          if (!parsed.styleParsedAsJson && parsed.style.trim()) {
-                            toast.info('Стиль сохранён как текст (JSON не распознан)')
-                          }
-                        }}
-                        aria-label="Разобрать полный промпт в блоки Сцена, Стиль, Негатив"
-                      >
-                        Разобрать в блоки
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        onClick={() => {
-                          const built = buildFullTrendPrompt(
-                            formData.scene_prompt,
-                            formData.style_preset_str,
-                            formData.negative_scene
-                          )
-                          setFullPromptText(built)
-                        }}
-                        aria-label="Собрать из блоков Сцена, Стиль, Негатив в один текст"
-                      >
-                        Собрать из блоков
-                      </Button>
-                    </div>
-                  </div>
-                )}
-              </div>
-
               <p className="rounded-md border border-border/50 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                Тренд состоит из трёх блоков. Глобальные блоки (
-                [IDENTITY TRANSFER], [COMPOSITION]) — в{' '}
+                Один способ ввода — полный промпт с маркерами. На отдельных строках укажите [SCENE], [STYLE], [AVOID], [COMPOSITION], далее текст до следующего маркера. Глобальные блоки [IDENTITY TRANSFER] и дефолт [COMPOSITION] — в{' '}
                 <Link to="/master-prompt" className="underline text-primary">
                   Мастер промпт
                 </Link>
                 .
               </p>
-
-              <div className="space-y-4 rounded-lg border border-border/50 bg-muted/30 p-4">
-                <h3 className="text-sm font-medium">
-                  <span className="font-mono text-muted-foreground">[SCENE]</span> Сцена *
-                </h3>
-                <div className="grid gap-2">
-                  <Label htmlFor="scene_prompt" className="sr-only">Сцена</Label>
-                  <Textarea
-                    id="scene_prompt"
-                    value={formData.scene_prompt}
-                    onChange={(e) => {
-                      setFormData({ ...formData, scene_prompt: e.target.value })
-                      if (e.target.value.trim()) setShowSceneError(false)
-                    }}
-                    rows={4}
-                    placeholder="Опиши окружение, свет, атмосферу..."
-                    className={cn(
-                      'font-mono text-sm',
-                      showSceneError && 'border-destructive focus-visible:ring-destructive'
-                    )}
-                    aria-required
-                    aria-invalid={showSceneError}
-                    aria-describedby={showSceneError ? 'scene_prompt_error' : undefined}
-                  />
-                  {showSceneError && (
-                    <p id="scene_prompt_error" className="text-xs text-destructive">
-                      Поле не должно быть пустым.
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="space-y-4 rounded-lg border border-border/50 bg-muted/30 p-4">
-                <h3 className="text-sm font-medium">
-                  <span className="font-mono text-muted-foreground">[STYLE]</span> Стиль
-                </h3>
-                <div className="grid gap-2">
-                  <div className="flex items-center gap-4 text-sm">
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="radio"
-                        name="style_preset_mode"
-                        checked={formData.style_preset_mode === 'json'}
-                        onChange={() => setFormData({ ...formData, style_preset_mode: 'json' })}
-                        className="rounded border-input"
-                        aria-label="JSON объект"
-                      />
-                      <span>JSON</span>
-                    </label>
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="radio"
-                        name="style_preset_mode"
-                        checked={formData.style_preset_mode === 'string'}
-                        onChange={() => setFormData({ ...formData, style_preset_mode: 'string' })}
-                        className="rounded border-input"
-                        aria-label="Текст"
-                      />
-                      <span>Текст</span>
-                    </label>
-                  </div>
-                  <Textarea
-                    id="style_preset"
-                    value={formData.style_preset_str}
-                    onChange={(e) => setFormData({ ...formData, style_preset_str: e.target.value })}
-                    rows={3}
-                    placeholder={
-                      formData.style_preset_mode === 'json'
-                        ? '{"style": "cinematic", "quality": "high"}'
-                        : 'Произвольный текст стиля...'
-                    }
-                    className="font-mono text-sm"
-                    aria-label="[STYLE] Стиль"
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-4 rounded-lg border border-border/50 bg-muted/30 p-4">
-                <h3 className="text-sm font-medium">
-                  <span className="font-mono text-muted-foreground">[AVOID]</span> Негатив сцены
-                </h3>
-                <div className="grid gap-2">
-                  <Label htmlFor="negative_scene" className="sr-only">Негатив сцены</Label>
-                  <Textarea
-                    id="negative_scene"
-                    value={formData.negative_scene}
-                    onChange={(e) => setFormData({ ...formData, negative_scene: e.target.value })}
-                    rows={2}
-                    placeholder="Что исключить из сцены..."
-                    aria-label="[AVOID] Негатив сцены"
-                  />
-                </div>
+              <div className="grid gap-2">
+                <Label htmlFor="full_prompt">Полный промпт</Label>
+                <Textarea
+                  id="full_prompt"
+                  value={fullPromptText}
+                  onChange={(e) => {
+                    setFullPromptText(e.target.value)
+                    if (e.target.value.trim()) setShowSceneError(false)
+                  }}
+                  rows={14}
+                  placeholder={'[SCENE]\nописание сцены, свет, атмосфера...\n\n[STYLE]\n{"style": "cinematic"}\n\n[AVOID]\nчего избегать\n\n[COMPOSITION]\nправила композиции (необязательно)'}
+                  className={cn('font-mono text-sm', showSceneError && 'border-destructive focus-visible:ring-destructive')}
+                  aria-invalid={showSceneError}
+                  aria-describedby={showSceneError ? 'full_prompt_error' : undefined}
+                />
+                {showSceneError && (
+                  <p id="full_prompt_error" className="text-xs text-destructive">
+                    Заполните блок [SCENE].
+                  </p>
+                )}
               </div>
             </TabsContent>
 
@@ -1314,15 +1118,10 @@ export function TrendsPage() {
                           <span>Загрузка...</span>
                           <span>{uploadProgress}%</span>
                         </div>
-                        <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
-                          <div
-                            className="h-full bg-primary transition-[width] duration-200"
-                            style={{ width: `${uploadProgress}%` }}
-                          />
-                        </div>
+                        <Progress value={uploadProgress} />
                       </div>
                     )}
-                    <div className="flex gap-2">
+                    <div className="flex flex-wrap gap-2">
                       <input
                         ref={exampleFileInputRef}
                         type="file"
@@ -1353,81 +1152,29 @@ export function TrendsPage() {
                         <ImagePlus className="h-4 w-4 mr-1" />
                         {editingTrend.has_example ? 'Заменить пример' : 'Загрузить пример'}
                       </Button>
-                    </div>
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>Референс стиля (для Gemini)</Label>
-                    <p className="text-xs text-muted-foreground">
-                      Отправляется в Gemini как IMAGE_2: освещение, композиция, настроение.
-                    </p>
-                    {editingTrend.has_style_reference && (
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 min-h-[80px] rounded border bg-muted flex items-center justify-center overflow-hidden">
-                          <TrendStyleRefThumb
-                            trendId={editingTrend.id}
-                            hasStyleRef={editingTrend.has_style_reference}
-                            refreshKey={mediaRefreshKey}
-                          />
-                        </div>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => deleteStyleRefMutation.mutate(editingTrend.id)}
-                          disabled={deleteStyleRefMutation.isPending}
-                          aria-label="Удалить референс стиля"
-                        >
-                          <Trash2 className="h-4 w-4 mr-1" />
-                          Удалить
-                        </Button>
-                      </div>
-                    )}
-                    {uploadStyleRefProgress !== null && (
-                      <div className="space-y-1">
-                        <div className="flex justify-between text-xs text-muted-foreground">
-                          <span>Загрузка референса...</span>
-                          <span>{uploadStyleRefProgress}%</span>
-                        </div>
-                        <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
-                          <div
-                            className="h-full bg-primary transition-[width] duration-200"
-                            style={{ width: `${uploadStyleRefProgress}%` }}
-                          />
-                        </div>
-                      </div>
-                    )}
-                    <div className="flex gap-2">
-                      <input
-                        ref={styleRefFileInputRef}
-                        type="file"
-                        accept="image/jpeg,image/png,image/webp"
-                        className="hidden"
-                        aria-hidden
-                        onChange={(e) => {
-                          const file = e.target.files?.[0]
-                          if (file && editingTrend) {
-                            setUploadStyleRefProgress(0)
-                            uploadStyleRefMutation.mutate({
-                              id: editingTrend.id,
-                              file,
-                              onProgress: setUploadStyleRefProgress,
-                            })
-                            e.target.value = ''
-                          }
-                        }}
-                      />
                       <Button
                         type="button"
                         variant="outline"
                         size="sm"
-                        onClick={() => styleRefFileInputRef.current?.click()}
-                        disabled={uploadStyleRefMutation.isPending}
-                        aria-label={
-                          editingTrend.has_style_reference ? 'Заменить референс' : 'Загрузить референс'
-                        }
+                        onClick={async () => {
+                          if (!editingTrend) return
+                          const file = await getImageFileFromClipboard()
+                          if (file) {
+                            setUploadProgress(0)
+                            uploadExampleMutation.mutate({
+                              id: editingTrend.id,
+                              file,
+                              onProgress: setUploadProgress,
+                            })
+                          } else {
+                            toast.error('В буфере нет изображения (JPG, PNG, WebP). Скопируйте картинку и попробуйте снова.')
+                          }
+                        }}
+                        disabled={uploadExampleMutation.isPending}
+                        aria-label="Вставить пример из буфера обмена"
                       >
-                        <ImagePlus className="h-4 w-4 mr-1" />
-                        {editingTrend.has_style_reference ? 'Заменить референс' : 'Загрузить референс'}
+                        <ClipboardPaste className="h-4 w-4 mr-1" />
+                        Вставить из буфера
                       </Button>
                     </div>
                   </div>
@@ -1435,7 +1182,7 @@ export function TrendsPage() {
               )}
               {!editingTrend && (
                 <p className="text-sm text-muted-foreground">
-                  Сохраните тренд, затем откройте редактирование, чтобы загрузить пример и референс стиля.
+                  Сохраните тренд, затем откройте редактирование, чтобы загрузить пример.
                 </p>
               )}
             </TabsContent>

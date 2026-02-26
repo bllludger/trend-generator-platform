@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import Column, DateTime, String, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, String, UniqueConstraint
 
 from app.db.base import Base
 
@@ -22,6 +22,10 @@ class Favorite(Base):
     hd_status = Column(String, nullable=False, default="none")
     hd_path = Column(String, nullable=True)
     hd_job_id = Column(String, nullable=True)
+
+    # Outcome Collections: explicit HD selection + compensation idempotency
+    selected_for_hd = Column(Boolean, nullable=False, default=False)
+    compensated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

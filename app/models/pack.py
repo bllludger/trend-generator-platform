@@ -30,6 +30,14 @@ class Pack(Base):
     pack_type = Column(String, nullable=False, default="legacy")
     upgrade_target_pack_ids = Column(JSONB, nullable=True)
 
+    # Outcome Collections
+    pack_subtype = Column(String, nullable=False, default="standalone")
+    playlist = Column(JSONB, nullable=True)
+    favorites_cap = Column(Integer, nullable=True)
+    collection_label = Column(String, nullable=True)
+    upsell_pack_ids = Column(JSONB, nullable=True)
+    hd_sla_minutes = Column(Integer, nullable=False, default=10)
+
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

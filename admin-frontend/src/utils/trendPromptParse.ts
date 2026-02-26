@@ -1,15 +1,16 @@
 /**
- * Парсинг и сборка полного промпта тренда из трёх блоков [SCENE], [STYLE], [AVOID].
+ * Парсинг и сборка полного промпта тренда из четырёх блоков [SCENE], [STYLE], [AVOID], [COMPOSITION].
  * Маркеры должны быть в начале строки (после trim). Порядок блоков произвольный.
  */
 
-const MARKERS = ['[SCENE]', '[STYLE]', '[AVOID]'] as const
+const MARKERS = ['[SCENE]', '[STYLE]', '[AVOID]', '[COMPOSITION]'] as const
 type Marker = (typeof MARKERS)[number]
 
 export interface ParsedFullTrendPrompt {
   scene: string
   style: string
   avoid: string
+  composition: string
   styleParsedAsJson: boolean
 }
 
@@ -41,7 +42,7 @@ function isStyleValidJson(style: string): boolean {
 }
 
 /**
- * Разбирает текст с маркерами [SCENE], [STYLE], [AVOID] на три блока.
+ * Разбирает текст с маркерами [SCENE], [STYLE], [AVOID], [COMPOSITION] на четыре блока.
  * Маркеры только в начале строки. При отсутствии блока возвращается пустая строка.
  */
 export function parseFullTrendPrompt(text: string): ParsedFullTrendPrompt {
@@ -49,17 +50,19 @@ export function parseFullTrendPrompt(text: string): ParsedFullTrendPrompt {
   const scene = extractBlock(lines, '[SCENE]')
   const style = extractBlock(lines, '[STYLE]')
   const avoid = extractBlock(lines, '[AVOID]')
+  const composition = extractBlock(lines, '[COMPOSITION]')
   const styleParsedAsJson = style.length > 0 && isStyleValidJson(style)
-  return { scene, style, avoid, styleParsedAsJson }
+  return { scene, style, avoid, composition, styleParsedAsJson }
 }
 
 /**
- * Собирает три блока в один текст с заголовками секций для копирования или повторного разбора.
+ * Собирает четыре блока в один текст с заголовками секций для копирования или повторного разбора.
  */
-export function buildFullTrendPrompt(scene: string, style: string, avoid: string): string {
+export function buildFullTrendPrompt(scene: string, style: string, avoid: string, composition: string): string {
   const parts: string[] = []
   parts.push('[SCENE]', (scene || '').trim(), '')
   parts.push('[STYLE]', (style || '').trim(), '')
-  parts.push('[AVOID]', (avoid || '').trim())
+  parts.push('[AVOID]', (avoid || '').trim(), '')
+  parts.push('[COMPOSITION]', (composition || '').trim())
   return parts.join('\n')
 }

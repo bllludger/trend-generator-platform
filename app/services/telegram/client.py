@@ -58,13 +58,21 @@ class TelegramClient:
             raise Exception(f"{error_code}: {error_desc}")
         return result
 
-    def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> dict:
+    def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        reply_markup: dict | None = None,
+        parse_mode: str | None = None,
+    ) -> dict:
         """Send text message to chat."""
         start = time.time()
         try:
             data = {"chat_id": int(chat_id), "text": runtime_templates.resolve_literal(text)}
             if reply_markup:
                 data["reply_markup"] = reply_markup
+            if parse_mode:
+                data["parse_mode"] = parse_mode
             result = self._api_call("sendMessage", data)
             self._record_request("sendMessage", "success", time.time() - start)
             return result

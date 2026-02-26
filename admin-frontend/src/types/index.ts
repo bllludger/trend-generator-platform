@@ -42,14 +42,13 @@ export interface Trend {
   /** JSON-объект или произвольная строка — в форме переключатель «Строка» / «JSON» */
   style_preset: Record<string, any> | string
   negative_scene?: string
+  composition_prompt?: string | null
   subject_mode?: string // face | head_torso | full_body
   framing_hint?: string // close_up | portrait | half_body | full_body
   max_images: number
   enabled: boolean
   order_index: number
   has_example?: boolean
-  /** Референс стиля для Gemini (IMAGE_2): освещение, композиция, настроение */
-  has_style_reference?: boolean
   /** @deprecated legacy, только если scene_prompt пуст */
   system_prompt?: string
   /** @deprecated перенос личности только через TransferPolicy */

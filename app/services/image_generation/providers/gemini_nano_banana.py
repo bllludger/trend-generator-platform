@@ -29,9 +29,10 @@ MAX_PRODUCTION_TEMPERATURE = 0.5  # ТЗ: temperature не выше 0.5 для i
 MODEL_MAX_IMAGE_TIER: dict[str, str] = {
     "gemini-2.5-flash-image": "4K",
     "gemini-3-pro-image-preview": "4K",
+    "gemini-3.1-flash-image-preview": "4K",  # Nano Banana 2
 }
 # ТЗ: imageSize только если модель поддерживает; gemini-2.5-flash-image может не поддерживать 2K — не отправляем imageSize.
-MODELS_SUPPORTING_IMAGE_SIZE: frozenset[str] = frozenset({"gemini-3-pro-image-preview"})
+MODELS_SUPPORTING_IMAGE_SIZE: frozenset[str] = frozenset({"gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"})
 
 
 def _parse_safety_settings(value: Any) -> list[dict[str, Any]]:
@@ -93,6 +94,7 @@ class GeminiNanaBananaProvider(ImageGenerationProvider):
         return [
             "gemini-2.5-flash-image",
             "gemini-3-pro-image-preview",
+            "gemini-3.1-flash-image-preview",  # Nano Banana 2 (Preview)
         ]
 
     def supports_image_editing(self) -> bool:

@@ -100,6 +100,8 @@ def _build_prompt_from_config(config: PlaygroundPromptConfig) -> str:
                 parts.append("[STYLE]\n" + style_text)
         elif label == "avoid":
             parts.append("[AVOID]\n" + text)
+        elif label == "composition":
+            parts.append("[COMPOSITION]\n" + text)
         else:
             parts.append(text)
     return "\n\n".join(parts) if parts else "Generate an image."
@@ -171,10 +173,12 @@ def trend_to_playground_config(
     else:
         style_content = str(style_preset).strip() if style_preset else ""
     avoid_content = (trend.negative_scene or "").strip()
+    composition_content = (getattr(trend, "composition_prompt", None) or "").strip()
     sections = [
         PlaygroundSection(id="1", label="Scene", content=scene_content, enabled=True, order=0),
         PlaygroundSection(id="2", label="Style", content=style_content, enabled=True, order=1),
         PlaygroundSection(id="3", label="Avoid", content=avoid_content, enabled=True, order=2),
+        PlaygroundSection(id="4", label="Composition", content=composition_content, enabled=True, order=3),
     ]
     return PlaygroundPromptConfig(
         model=trend.prompt_model or default_model,
@@ -201,6 +205,7 @@ async def get_playground_config(
         PlaygroundSection(id="1", label="Scene", content="", enabled=True, order=0),
         PlaygroundSection(id="2", label="Style", content="", enabled=True, order=1),
         PlaygroundSection(id="3", label="Avoid", content="", enabled=True, order=2),
+        PlaygroundSection(id="4", label="Composition", content="", enabled=True, order=3),
     ]
     return PlaygroundPromptConfig(
         model=effective.get("default_model", "gemini-2.5-flash-image"),

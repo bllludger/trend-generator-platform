@@ -626,11 +626,44 @@ def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = 
     )
     stickiness_pct = round((dau / mau * 100) if mau else 0)
 
+    funnel_actions = [
+        "collection_start", "take_previews_ready", "pay_success",
+        "collection_complete", "hd_delivered",
+    ]
+    since_window = now - timedelta(days=window_days)
+    funnel_rows = (
+        db.query(AuditLog.action, func.count(AuditLog.id))
+        .filter(AuditLog.action.in_(funnel_actions), AuditLog.created_at >= since_window)
+        .group_by(AuditLog.action)
+        .all()
+    )
+    funnel_counts = {action: 0 for action in funnel_actions}
+    for action, cnt in funnel_rows:
+        funnel_counts[action] = cnt
+
+    # AOV и доля Trial: по pay_success из audit (payload: pack_id, stars)
+    pay_success_rows = (
+        db.query(AuditLog.payload)
+        .filter(AuditLog.action == "pay_success", AuditLog.created_at >= since_window)
+        .all()
+    )
+    pay_success_list = [r[0] for r in pay_success_rows if isinstance(r[0], dict)]
+    total_pay_success = len(pay_success_list)
+    trial_purchases = sum(1 for p in pay_success_list if p.get("pack_id") == "trial")
+    share_trial_purchases = round((trial_purchases / total_pay_success * 100), 1) if total_pay_success else 0.0
+    stars_sum = sum(int(p.get("stars", 0)) for p in pay_success_list)
+    avg_stars_per_pay_success = round(stars_sum / total_pay_success, 1) if total_pay_success else 0.0
+
     metrics = {
         "dau": dau,
         "wau": wau,
         "mau": mau,
         "stickiness_pct": stickiness_pct,
+        "funnel_counts": funnel_counts,
+        "share_trial_purchases": share_trial_purchases,
+        "avg_stars_per_pay_success": avg_stars_per_pay_success,
+        "trial_purchases_count": trial_purchases,
+        "total_pay_success_count": total_pay_success,
     }
     return {"window_days": window_days, "metrics": metrics}
 
@@ -639,7 +672,11 @@ def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = 
 @router.get("/bank-transfer/settings")
 def bank_transfer_settings_get(db: Session = Depends(get_db)):
     svc = BankTransferSettingsService(db)
-    return svc.as_dict(mask_card=True)
+    out = svc.as_dict(mask_card=True)
+    payment_svc = PaymentService(db)
+    ladder = payment_svc.list_product_ladder_packs()
+    out["packs_for_buttons"] = [{"id": p.id, "name": p.name, "emoji": p.emoji, "stars_price": p.stars_price} for p in ladder]
+    return out
 
 
 @router.put("/bank-transfer/settings")
@@ -797,6 +834,12 @@ def packs_list(db: Session = Depends(get_db)):
             "is_trial": p.is_trial,
             "pack_type": p.pack_type,
             "upgrade_target_pack_ids": p.upgrade_target_pack_ids,
+            "pack_subtype": getattr(p, "pack_subtype", "standalone"),
+            "playlist": getattr(p, "playlist", None),
+            "favorites_cap": getattr(p, "favorites_cap", None),
+            "collection_label": getattr(p, "collection_label", None),
+            "upsell_pack_ids": getattr(p, "upsell_pack_ids", None),
+            "hd_sla_minutes": getattr(p, "hd_sla_minutes", 10),
         }
         for p in packs
     ]
@@ -811,36 +854,73 @@ def packs_update(pack_id: str, payload: dict, db: Session = Depends(get_db)):
         "name", "emoji", "tokens", "stars_price", "enabled", "order_index",
         "description", "takes_limit", "hd_amount", "is_trial", "pack_type",
         "upgrade_target_pack_ids",
+        "pack_subtype", "playlist", "favorites_cap", "collection_label",
+        "upsell_pack_ids", "hd_sla_minutes",
     )
     for key in allowed_keys:
-        if key in payload and payload[key] is not None:
+        if key in payload:
             setattr(pack, key, payload[key])
+
+    effective_subtype = getattr(pack, "pack_subtype", "standalone")
+    if effective_subtype == "collection" and pack.enabled:
+        pl = getattr(pack, "playlist", None)
+        if not pl or not isinstance(pl, list) or len(pl) == 0:
+            raise HTTPException(400, "Collection pack must have a non-empty playlist before enabling")
+
     db.add(pack)
     db.commit()
     db.refresh(pack)
-    return {"id": pack.id, "name": pack.name, "emoji": pack.emoji, "tokens": pack.tokens, "stars_price": pack.stars_price, "enabled": pack.enabled, "order_index": getattr(pack, "order_index", 0)}
+    return {
+        "id": pack.id, "name": pack.name, "emoji": pack.emoji,
+        "tokens": pack.tokens, "stars_price": pack.stars_price,
+        "enabled": pack.enabled, "order_index": getattr(pack, "order_index", 0),
+        "pack_subtype": getattr(pack, "pack_subtype", "standalone"),
+        "playlist": getattr(pack, "playlist", None),
+        "favorites_cap": getattr(pack, "favorites_cap", None),
+        "collection_label": getattr(pack, "collection_label", None),
+        "upsell_pack_ids": getattr(pack, "upsell_pack_ids", None),
+        "hd_sla_minutes": getattr(pack, "hd_sla_minutes", 10),
+    }
 
 
 @router.post("/packs")
 def packs_create(payload: dict, db: Session = Depends(get_db)):
+    subtype = payload.get("pack_subtype", "standalone")
+    playlist = payload.get("playlist")
+    is_enabled = bool(payload.get("enabled", True))
+
+    if subtype == "collection" and is_enabled:
+        if not playlist or not isinstance(playlist, list) or len(playlist) == 0:
+            raise HTTPException(400, "Collection pack must have a non-empty playlist before enabling")
+
     pack = Pack(
         id=payload.get("id") or payload.get("name", "").lower().replace(" ", "_"),
         name=payload.get("name", "New Pack"),
         emoji=payload.get("emoji", "📦"),
         tokens=int(payload.get("tokens", 0)),
         stars_price=int(payload.get("stars_price", 0)),
-        enabled=bool(payload.get("enabled", True)),
+        enabled=is_enabled,
         order_index=int(payload.get("order_index", 0)),
         takes_limit=payload.get("takes_limit"),
         hd_amount=payload.get("hd_amount"),
         is_trial=bool(payload.get("is_trial", False)),
         pack_type=payload.get("pack_type", "session"),
         upgrade_target_pack_ids=payload.get("upgrade_target_pack_ids"),
+        pack_subtype=subtype,
+        playlist=playlist,
+        favorites_cap=payload.get("favorites_cap"),
+        collection_label=payload.get("collection_label"),
+        upsell_pack_ids=payload.get("upsell_pack_ids"),
+        hd_sla_minutes=int(payload.get("hd_sla_minutes", 10)),
     )
     db.add(pack)
     db.commit()
     db.refresh(pack)
-    return {"id": pack.id, "name": pack.name, "emoji": pack.emoji, "tokens": pack.tokens, "stars_price": pack.stars_price, "enabled": pack.enabled}
+    return {
+        "id": pack.id, "name": pack.name, "emoji": pack.emoji,
+        "tokens": pack.tokens, "stars_price": pack.stars_price,
+        "enabled": pack.enabled, "pack_subtype": pack.pack_subtype,
+    }
 
 
 @router.delete("/packs/{pack_id}")
@@ -851,6 +931,73 @@ def packs_delete(pack_id: str, db: Session = Depends(get_db)):
     db.delete(pack)
     db.commit()
     return {"ok": True}
+
+
+# ---------- Compensations ----------
+from app.models.compensation import CompensationLog
+
+
+@router.get("/compensations")
+def compensations_list(
+    db: Session = Depends(get_db),
+    user_id: str | None = Query(None),
+    reason: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    q = db.query(CompensationLog)
+    if user_id:
+        q = q.filter(CompensationLog.user_id == user_id)
+    if reason:
+        q = q.filter(CompensationLog.reason == reason)
+    total = q.count()
+    items = (
+        q.order_by(CompensationLog.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return {
+        "total": total,
+        "page": page,
+        "items": [
+            {
+                "id": c.id,
+                "user_id": c.user_id,
+                "favorite_id": c.favorite_id,
+                "session_id": c.session_id,
+                "reason": c.reason,
+                "comp_type": c.comp_type,
+                "amount": c.amount,
+                "correlation_id": c.correlation_id,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in items
+        ],
+    }
+
+
+@router.get("/compensations/stats")
+def compensations_stats(db: Session = Depends(get_db)):
+    total = db.query(func.count(CompensationLog.id)).scalar() or 0
+    by_reason = dict(
+        db.query(CompensationLog.reason, func.count(CompensationLog.id))
+        .group_by(CompensationLog.reason)
+        .all()
+    )
+    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    by_day_rows = (
+        db.query(
+            func.date(CompensationLog.created_at).label("day"),
+            func.count(CompensationLog.id),
+        )
+        .filter(CompensationLog.created_at >= seven_days_ago)
+        .group_by("day")
+        .order_by("day")
+        .all()
+    )
+    by_day = {str(row[0]): row[1] for row in by_day_rows}
+    return {"total": total, "by_reason": by_reason, "by_day": by_day}
 
 
 # ---------- Sessions ----------
@@ -979,7 +1126,7 @@ def admin_themes_delete(theme_id: str, db: Session = Depends(get_db)):
 # Allowed fields for trend create/update (subset of Trend model)
 TREND_EDIT_FIELDS = {
     "name", "emoji", "description", "system_prompt", "scene_prompt", "subject_prompt",
-    "negative_prompt", "negative_scene", "subject_mode", "framing_hint", "style_preset",
+    "negative_prompt", "negative_scene", "composition_prompt", "subject_mode", "framing_hint", "style_preset",
     "max_images", "enabled", "order_index", "theme_id", "prompt_sections", "prompt_model", "prompt_size",
     "prompt_format", "prompt_temperature", "prompt_seed", "prompt_image_size_tier",
 }
@@ -999,8 +1146,9 @@ def _trend_to_item(t: Trend) -> dict:
         "enabled": t.enabled,
         "order_index": t.order_index,
         "has_example": bool(t.example_image_path),
-        "has_style_reference": bool(t.style_reference_image_path),
         "prompt_config_source": "playground" if has_playground else "scene",
+        "subject_mode": t.subject_mode or "face",
+        "framing_hint": t.framing_hint or "portrait",
     }
 
 
@@ -1016,6 +1164,7 @@ def _trend_to_detail(t: Trend) -> dict:
         "subject_prompt": t.subject_prompt,
         "negative_prompt": t.negative_prompt or "",
         "negative_scene": t.negative_scene,
+        "composition_prompt": getattr(t, "composition_prompt", None),
         "subject_mode": t.subject_mode,
         "framing_hint": t.framing_hint,
         "style_preset": t.style_preset,
@@ -1125,18 +1274,6 @@ def admin_trends_get_example(trend_id: str, db: Session = Depends(get_db)):
     return _serve_trend_file(path, trend_id, "Example")
 
 
-@router.get("/trends/{trend_id}/style-reference")
-def admin_trends_get_style_reference(trend_id: str, db: Session = Depends(get_db)):
-    svc = TrendService(db)
-    trend = svc.get(trend_id)
-    if not trend:
-        raise HTTPException(404, "Trend not found")
-    path = _resolve_trend_media_path(trend.style_reference_image_path, trend_id, "_style_ref")
-    if not path:
-        raise HTTPException(404, "Style reference not found")
-    return _serve_trend_file(path, trend_id, "Style reference")
-
-
 def _save_trend_file(trend_id: str, file: UploadFile, suffix: str) -> str:
     if file.content_type and file.content_type.lower() not in ALLOWED_TREND_IMAGE_TYPES:
         raise HTTPException(400, "Недопустимый тип файла. Разрешены: JPEG, PNG, WebP")
@@ -1168,17 +1305,6 @@ def admin_trends_post_example(trend_id: str, file: UploadFile = File(...), db: S
     return _trend_to_detail(trend)
 
 
-@router.post("/trends/{trend_id}/style-reference")
-def admin_trends_post_style_reference(trend_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    svc = TrendService(db)
-    trend = svc.get(trend_id)
-    if not trend:
-        raise HTTPException(404, "Trend not found")
-    path = _save_trend_file(trend_id, file, "_style_ref")
-    svc.update(trend, {"style_reference_image_path": path})
-    return _trend_to_detail(trend)
-
-
 @router.delete("/trends/{trend_id}/example")
 def admin_trends_delete_example(trend_id: str, db: Session = Depends(get_db)):
     svc = TrendService(db)
@@ -1192,22 +1318,6 @@ def admin_trends_delete_example(trend_id: str, db: Session = Depends(get_db)):
         except OSError:
             pass
     svc.update(trend, {"example_image_path": None})
-    return _trend_to_detail(trend)
-
-
-@router.delete("/trends/{trend_id}/style-reference")
-def admin_trends_delete_style_reference(trend_id: str, db: Session = Depends(get_db)):
-    svc = TrendService(db)
-    trend = svc.get(trend_id)
-    if not trend:
-        raise HTTPException(404, "Trend not found")
-    path = trend.style_reference_image_path
-    if path and os.path.isfile(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    svc.update(trend, {"style_reference_image_path": None})
     return _trend_to_detail(trend)
 
 

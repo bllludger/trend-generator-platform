@@ -17,6 +17,7 @@ celery_app = Celery(
         "app.workers.tasks.generate_take",
         "app.workers.tasks.deliver_hd",
         "app.workers.tasks.watchdog_rendering",
+        "app.workers.tasks.delete_user_data",
         "app.referral.tasks",
     ],
 )
@@ -38,6 +39,10 @@ celery_app.conf.update(
         "reset-stuck-rendering": {
             "task": "app.workers.tasks.watchdog_rendering.reset_stuck_rendering",
             "schedule": crontab(minute="*/5"),
+        },
+        "detect-collection-drops": {
+            "task": "app.workers.tasks.watchdog_rendering.detect_collection_drops",
+            "schedule": crontab(hour="*/6"),
         },
     },
 )

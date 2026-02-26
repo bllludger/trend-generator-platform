@@ -89,6 +89,12 @@ export function PacksPage() {
       hd_amount: pack.hd_amount ?? undefined,
       is_trial: pack.is_trial ?? false,
       pack_type: pack.pack_type ?? 'legacy',
+      pack_subtype: pack.pack_subtype ?? 'standalone',
+      playlist: pack.playlist ?? undefined,
+      favorites_cap: pack.favorites_cap ?? undefined,
+      collection_label: pack.collection_label != null ? String(pack.collection_label) : undefined,
+      upsell_pack_ids: pack.upsell_pack_ids ?? undefined,
+      hd_sla_minutes: pack.hd_sla_minutes ?? 10,
     })
   }
 
@@ -108,6 +114,12 @@ export function PacksPage() {
         hd_amount: form.hd_amount,
         is_trial: form.is_trial,
         pack_type: form.pack_type,
+        pack_subtype: form.pack_subtype,
+        playlist: form.playlist,
+        favorites_cap: form.favorites_cap,
+        collection_label: form.collection_label,
+        upsell_pack_ids: form.upsell_pack_ids,
+        hd_sla_minutes: form.hd_sla_minutes,
       },
     })
   }
@@ -125,7 +137,17 @@ export function PacksPage() {
       description: typeof form.description === 'string' ? form.description : '',
       enabled: form.enabled ?? true,
       order_index: form.order_index ?? (packs?.length ?? 0),
-    })
+      ...(form.pack_subtype && { pack_subtype: form.pack_subtype }),
+      ...(form.playlist && { playlist: form.playlist }),
+      ...(form.favorites_cap != null && { favorites_cap: form.favorites_cap }),
+      ...(form.collection_label && { collection_label: form.collection_label }),
+      ...(form.upsell_pack_ids && { upsell_pack_ids: form.upsell_pack_ids }),
+      ...(form.hd_sla_minutes != null && { hd_sla_minutes: form.hd_sla_minutes }),
+      ...(form.takes_limit != null && { takes_limit: form.takes_limit }),
+      ...(form.hd_amount != null && { hd_amount: form.hd_amount }),
+      ...(form.pack_type && { pack_type: form.pack_type }),
+      ...(form.is_trial != null && { is_trial: form.is_trial }),
+    } as any)
   }
 
   return (
@@ -172,11 +194,11 @@ export function PacksPage() {
           ) : (
             <Table>
               <TableHeader>
-                <TableRow>
+                  <TableRow>
                   <TableHead>Порядок</TableHead>
                   <TableHead>ID</TableHead>
                   <TableHead>Название</TableHead>
-                  <TableHead>Тип</TableHead>
+                  <TableHead>Тип / Подтип</TableHead>
                   <TableHead>Снимки</TableHead>
                   <TableHead>HD</TableHead>
                   <TableHead>Цена (Stars)</TableHead>
@@ -194,6 +216,9 @@ export function PacksPage() {
                       <Badge variant={p.pack_type === 'session' ? 'default' : 'secondary'}>
                         {p.pack_type || 'legacy'}{p.is_trial ? ' (trial)' : ''}
                       </Badge>
+                      {p.pack_subtype === 'collection' && (
+                        <Badge variant="outline" className="ml-1">collection</Badge>
+                      )}
                     </TableCell>
                     <TableCell>{p.takes_limit ?? p.tokens}</TableCell>
                     <TableCell>{p.hd_amount ?? '—'}</TableCell>
@@ -322,17 +347,90 @@ export function PacksPage() {
                   <option value="session">session</option>
                 </select>
               </div>
-              <div className="flex items-center gap-2 pt-8">
-                <input
-                  type="checkbox"
-                  id="is_trial"
-                  checked={!!form.is_trial}
-                  onChange={(e) => setForm((f) => ({ ...f, is_trial: e.target.checked }))}
-                  className="h-4 w-4 rounded"
-                />
-                <Label htmlFor="is_trial">Trial (1 раз на аккаунт)</Label>
+              <div>
+                <Label>Подтип (subtype)</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={String(form.pack_subtype ?? 'standalone')}
+                  onChange={(e) => setForm((f) => ({ ...f, pack_subtype: e.target.value }))}
+                >
+                  <option value="standalone">standalone</option>
+                  <option value="collection">collection</option>
+                </select>
               </div>
             </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="is_trial"
+                checked={!!form.is_trial}
+                onChange={(e) => setForm((f) => ({ ...f, is_trial: e.target.checked }))}
+                className="h-4 w-4 rounded"
+              />
+              <Label htmlFor="is_trial">Trial (1 раз на аккаунт)</Label>
+            </div>
+
+            {form.pack_subtype === 'collection' && (
+              <>
+                <div className="border rounded-md p-3 space-y-3 bg-muted/30">
+                  <p className="text-sm font-medium">Настройки коллекции</p>
+                  <div>
+                    <Label>Playlist (trend_id через запятую)</Label>
+                    <Input
+                      value={Array.isArray(form.playlist) ? form.playlist.join(', ') : ''}
+                      onChange={(e) => {
+                        const val = e.target.value
+                        const ids = val.split(',').map(s => s.trim()).filter(Boolean)
+                        setForm((f) => ({ ...f, playlist: ids.length > 0 ? ids : undefined }))
+                      }}
+                      placeholder="trend_1, trend_2, trend_3"
+                    />
+                  </div>
+                  <div>
+                    <Label>Метка коллекции (collection_label)</Label>
+                    <Input
+                      value={String(form.collection_label ?? '')}
+                      onChange={(e) => setForm((f) => ({ ...f, collection_label: e.target.value || undefined }))}
+                      placeholder="Dating Pack — 6 образов"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <Label>Favorites cap</Label>
+                      <Input
+                        type="number"
+                        min={0}
+                        value={form.favorites_cap != null ? Number(form.favorites_cap) : ''}
+                        onChange={(e) => setForm((f) => ({ ...f, favorites_cap: e.target.value ? parseInt(e.target.value) : undefined }))}
+                        placeholder="Авто = hd_limit * 2"
+                      />
+                    </div>
+                    <div>
+                      <Label>HD SLA (мин)</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={Number(form.hd_sla_minutes ?? 10)}
+                        onChange={(e) => setForm((f) => ({ ...f, hd_sla_minutes: parseInt(e.target.value) || 10 }))}
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <Label>Upsell pack IDs (через запятую)</Label>
+                    <Input
+                      value={Array.isArray(form.upsell_pack_ids) ? form.upsell_pack_ids.join(', ') : ''}
+                      onChange={(e) => {
+                        const val = e.target.value
+                        const ids = val.split(',').map(s => s.trim()).filter(Boolean)
+                        setForm((f) => ({ ...f, upsell_pack_ids: ids.length > 0 ? ids : undefined }))
+                      }}
+                      placeholder="dating_pack_2, avatar_pack_2"
+                    />
+                  </div>
+                </div>
+              </>
+            )}
+
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <Label>Порядок (order_index)</Label>
@@ -418,6 +516,108 @@ export function PacksPage() {
                 placeholder="5 фото без watermark"
               />
             </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label>Тип пакета</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={String(form.pack_type ?? 'session')}
+                  onChange={(e) => setForm((f) => ({ ...f, pack_type: e.target.value }))}
+                >
+                  <option value="legacy">legacy</option>
+                  <option value="session">session</option>
+                </select>
+              </div>
+              <div>
+                <Label>Подтип</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={String(form.pack_subtype ?? 'standalone')}
+                  onChange={(e) => setForm((f) => ({ ...f, pack_subtype: e.target.value }))}
+                >
+                  <option value="standalone">standalone</option>
+                  <option value="collection">collection</option>
+                </select>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label>Снимков (takes_limit)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={form.takes_limit != null ? Number(form.takes_limit) : ''}
+                  onChange={(e) => setForm((f) => ({ ...f, takes_limit: e.target.value ? parseInt(e.target.value) : undefined }))}
+                  placeholder="Кол-во снимков"
+                />
+              </div>
+              <div>
+                <Label>HD при покупке</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={form.hd_amount != null ? Number(form.hd_amount) : ''}
+                  onChange={(e) => setForm((f) => ({ ...f, hd_amount: e.target.value ? parseInt(e.target.value) : undefined }))}
+                  placeholder="0"
+                />
+              </div>
+            </div>
+            {form.pack_subtype === 'collection' && (
+              <div className="border rounded-md p-3 space-y-3 bg-muted/30">
+                <p className="text-sm font-medium">Настройки коллекции</p>
+                <div>
+                  <Label>Playlist (trend_id через запятую)</Label>
+                  <Input
+                    value={Array.isArray(form.playlist) ? form.playlist.join(', ') : ''}
+                    onChange={(e) => {
+                      const ids = e.target.value.split(',').map(s => s.trim()).filter(Boolean)
+                      setForm((f) => ({ ...f, playlist: ids.length > 0 ? ids : undefined }))
+                    }}
+                    placeholder="trend_1, trend_2, trend_3"
+                  />
+                </div>
+                <div>
+                  <Label>Метка коллекции</Label>
+                  <Input
+                    value={String(form.collection_label ?? '')}
+                    onChange={(e) => setForm((f) => ({ ...f, collection_label: e.target.value || undefined }))}
+                    placeholder="Dating Pack — 6 образов"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <Label>Favorites cap</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      value={form.favorites_cap != null ? Number(form.favorites_cap) : ''}
+                      onChange={(e) => setForm((f) => ({ ...f, favorites_cap: e.target.value ? parseInt(e.target.value) : undefined }))}
+                      placeholder="Авто"
+                    />
+                  </div>
+                  <div>
+                    <Label>HD SLA (мин)</Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      value={Number(form.hd_sla_minutes ?? 10)}
+                      onChange={(e) => setForm((f) => ({ ...f, hd_sla_minutes: parseInt(e.target.value) || 10 }))}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <Label>Upsell pack IDs (через запятую)</Label>
+                  <Input
+                    value={Array.isArray(form.upsell_pack_ids) ? form.upsell_pack_ids.join(', ') : ''}
+                    onChange={(e) => {
+                      const ids = e.target.value.split(',').map(s => s.trim()).filter(Boolean)
+                      setForm((f) => ({ ...f, upsell_pack_ids: ids.length > 0 ? ids : undefined }))
+                    }}
+                    placeholder="dating_pack_2"
+                  />
+                </div>
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <Label>Порядок</Label>

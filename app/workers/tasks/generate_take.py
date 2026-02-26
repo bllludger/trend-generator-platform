@@ -17,6 +17,8 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models.take import Take
 from app.models.trend import Trend
+from app.models.user import User
+from app.services.balance_tariffs import build_balance_tariffs_message
 from app.services.app_settings.settings_service import AppSettingsService
 from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
 from app.services.image_generation import (
@@ -29,6 +31,7 @@ from app.services.audit.service import AuditService
 from app.services.sessions.service import SessionService
 from app.services.takes.service import TakeService
 from app.services.telegram.client import TelegramClient
+from app.services.telegram_messages.runtime import runtime_templates
 from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as transfer_get_effective
 from app.services.trends.service import TrendService
 from app.paywall.watermark import apply_watermark
@@ -44,7 +47,7 @@ VARIANT_RETRY_DELAY = 2.0
 MAIN_MENU_REPLY = {
     "keyboard": [
         [{"text": "🔥 Создать фото"}, {"text": "🔄 Сделать такую же"}],
-        [{"text": "🛒 Купить генерации"}, {"text": "👤 Мой профиль"}],
+        [{"text": "🛒 Купить тариф"}, {"text": "👤 Мой профиль"}],
     ],
     "resize_keyboard": True,
 }
@@ -70,10 +73,20 @@ def _build_prompt_for_take(db: Session, take: Take, trend: Trend) -> tuple[str, 
 
     sections = trend.prompt_sections if isinstance(trend.prompt_sections, list) else []
     if sections:
+        label_to_tag = {"scene": "[SCENE]", "style": "[STYLE]", "avoid": "[AVOID]", "composition": "[COMPOSITION]"}
         parts = []
         for s in sorted(sections, key=lambda x: x.get("order", 0)):
-            if s.get("enabled") and s.get("content"):
-                parts.append(str(s["content"]).strip())
+            if not s.get("enabled") or not s.get("content"):
+                continue
+            content = str(s["content"]).strip()
+            if not content:
+                continue
+            label = (s.get("label") or "").strip().lower()
+            tag = label_to_tag.get(label)
+            if tag:
+                parts.append(f"{tag}\n{content}")
+            else:
+                parts.append(content)
         prompt_text = "\n\n".join(parts) if parts else (trend.scene_prompt or trend.system_prompt or "Generate image.")
         negative = trend.negative_prompt or None
         if trend.prompt_model:
@@ -94,7 +107,7 @@ def _build_prompt_for_take(db: Session, take: Take, trend: Trend) -> tuple[str, 
     identity = (transfer.get("identity_rules_text") or "").strip()
     if identity:
         blocks.append(f"[IDENTITY TRANSFER]\n{identity}")
-    composition = (transfer.get("composition_rules_text") or "").strip()
+    composition = (getattr(trend, "composition_prompt", None) or "").strip() or (transfer.get("composition_rules_text") or "").strip()
     if composition:
         blocks.append(f"[COMPOSITION]\n{composition}")
     scene = (trend.scene_prompt or trend.system_prompt or "").strip()
@@ -192,8 +205,24 @@ def generate_take(
                 telegram.edit_message(status_chat_id, status_message_id, "❌ Тренд не найден.")
             return {"ok": False, "error": "trend_missing"}
 
+        if take.step_index is not None or take.is_reroll:
+            logger.info(
+                "generate_take_collection_step",
+                extra={
+                    "take_id": take_id,
+                    "step_index": take.step_index,
+                    "is_reroll": take.is_reroll,
+                    "session_id": take.session_id,
+                },
+            )
+
         input_image_path = None
-        if take.input_local_paths:
+        if take.session_id:
+            from app.models.session import Session as SessionModel
+            sess = db.query(SessionModel).filter(SessionModel.id == take.session_id).one_or_none()
+            if sess and sess.input_photo_path and os.path.isfile(sess.input_photo_path):
+                input_image_path = sess.input_photo_path
+        if not input_image_path and take.input_local_paths:
             candidate = take.input_local_paths[0] if isinstance(take.input_local_paths[0], str) else None
             if candidate and os.path.isfile(candidate):
                 input_image_path = candidate
@@ -213,9 +242,23 @@ def generate_take(
         seeds = {}
         failed_variants = []
 
+        PROGRESS_KEYS = ("progress.take_step_1", "progress.take_step_2", "progress.take_step_3")
+        PROGRESS_DEFAULTS = (
+            "⏳ Генерация снимка [🟩🟩⬜⬜⬜] 1/3",
+            "⏳ Генерация снимка [🟩🟩🟩🟩⬜] 2/3",
+            "⏳ Генерация снимка [🟩🟩🟩🟩🟩] 3/3",
+        )
+
         for i, variant in enumerate(VARIANTS):
             if i > 0:
                 time.sleep(RATE_LIMIT_DELAY)
+
+            if status_chat_id and status_message_id is not None:
+                progress_text = runtime_templates.get(PROGRESS_KEYS[i], PROGRESS_DEFAULTS[i])
+                try:
+                    telegram.edit_message(status_chat_id, status_message_id, progress_text)
+                except Exception as e:
+                    logger.debug("generate_take_progress_edit_skip", extra={"step": i + 1, "error": str(e)})
 
             seed = random.randint(0, 2**31 - 1)
             seeds[variant] = seed
@@ -322,6 +365,8 @@ def generate_take(
                 "variants_count": len(results),
                 "status": status,
                 "failed_variants": failed_variants,
+                "step_index": take.step_index,
+                "is_reroll": take.is_reroll,
             },
         )
 
@@ -376,6 +421,20 @@ def generate_take(
                 "👇 Меню ниже",
                 reply_markup=MAIN_MENU_REPLY,
             )
+            # Шаблон «баланс + тарифы» после каждой генерации (п. 10 плана SKU ladder)
+            try:
+                user = db.query(User).filter(User.id == take.user_id).first()
+                if user and getattr(user, "telegram_id", None):
+                    star_to_rub = getattr(settings, "star_to_rub", 1.3)
+                    text, kb = build_balance_tariffs_message(db, user.telegram_id, star_to_rub=star_to_rub)
+                    telegram.send_message(
+                        status_chat_id,
+                        text,
+                        reply_markup=kb,
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                logger.warning("balance_tariffs_after_generation_failed", extra={"take_id": take_id, "error": str(e)})
 
         return {"ok": True, "take_id": take_id, "status": status, "variants": list(results.keys())}
     except Exception:

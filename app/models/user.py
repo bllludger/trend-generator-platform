@@ -56,6 +56,10 @@ class User(Base):
     hd_promo_balance = Column(Integer, nullable=False, default=0)
     free_takes_used = Column(Integer, nullable=False, default=0)
     trial_purchased = Column(Boolean, nullable=False, default=False)
+
+    # Consent & data deletion
+    consent_accepted_at = Column(DateTime(timezone=True), nullable=True)
+    data_deletion_requested_at = Column(DateTime(timezone=True), nullable=True)
     
     def is_access_blocked(self) -> bool:
         """Check if user access is blocked (banned or suspended)."""

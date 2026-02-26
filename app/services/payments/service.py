@@ -22,6 +22,7 @@ from app.models.payment import Payment
 from app.models.session import Session as SessionModel
 from app.models.take import Take
 from app.models.user import User
+from app.services.audit.service import AuditService
 from app.services.sessions.service import SessionService
 from app.services.hd_balance.service import HDBalanceService
 
@@ -29,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 PURCHASE_RATE_LIMIT = 3  # макс покупок за окно
 PURCHASE_RATE_WINDOW = 60  # секунд
+
+# Единственные SKU в продаже (product ladder). Остальные пакеты не показывать и не принимать в paywall/bank.
+PRODUCT_LADDER_IDS = ("trial", "avatar_pack", "dating_pack", "creator")
 
 
 class PaymentService:
@@ -45,6 +49,15 @@ class PaymentService:
         return (
             self.db.query(Pack)
             .filter(Pack.enabled.is_(True))
+            .order_by(Pack.order_index)
+            .all()
+        )
+
+    def list_product_ladder_packs(self) -> list[Pack]:
+        """Пакеты продуктовой лестницы для отображения в боте (магазин, paywall, bank transfer)."""
+        return (
+            self.db.query(Pack)
+            .filter(Pack.id.in_(PRODUCT_LADDER_IDS), Pack.enabled.is_(True))
             .order_by(Pack.order_index)
             .all()
         )
@@ -528,7 +541,24 @@ class PaymentService:
             session_svc = SessionService(self.db)
             hd_svc = HDBalanceService(self.db)
 
-            session = session_svc.create_session(user.id, pack_id)
+            if getattr(pack, "pack_subtype", "standalone") == "collection":
+                if not pack.playlist or not isinstance(pack.playlist, list) or len(pack.playlist) == 0:
+                    raise ValueError(f"Collection pack {pack_id} has no playlist — cannot sell")
+                session = session_svc.create_collection_session(user.id, pack)
+                audit = AuditService(self.db)
+                audit.log(
+                    actor_type="system",
+                    actor_id="payment",
+                    action="collection_start",
+                    entity_type="session",
+                    entity_id=session.id,
+                    payload={
+                        "pack_id": pack_id,
+                        "collection_run_id": session.collection_run_id,
+                    },
+                )
+            else:
+                session = session_svc.create_session(user.id, pack_id)
             hd_svc.credit_paid(user, pack.hd_amount or 0)
 
             if pack.is_trial:
