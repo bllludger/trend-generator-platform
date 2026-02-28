@@ -8,6 +8,11 @@ from app.models.job import Job
 
 
 class CleanupService:
+    """
+    Очистка только временных входных файлов старых Job (input_local_paths).
+    Результаты генераций (outputs/), примеры трендов, чеки (receipts/) и промпты не удаляются.
+    """
+
     def __init__(self, db: Session) -> None:
         self.db = db
 
@@ -28,6 +33,7 @@ class CleanupService:
         }
 
     def cleanup_temp_files(self, older_than_hours: int) -> dict[str, Any]:
+        """Удаляет только временные входные файлы старых Job (input_local_paths). Outputs, тренды, чеки не трогает."""
         threshold = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
         jobs = (
             self.db.query(Job)

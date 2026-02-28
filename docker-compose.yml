@@ -20,6 +20,7 @@ services:
       - ./migrations:/app/migrations
       - ./prompts:/app/prompts
       - ./data/generated_images:/data/generated_images
+      - ./data/trend_examples:/app/data/trend_examples
     depends_on:
       db:
         condition: service_healthy
@@ -72,6 +73,7 @@ services:
       - ./migrations:/app/migrations
       - ./prompts:/app/prompts
       - ./data/generated_images:/data/generated_images
+      - ./data/trend_examples:/app/data/trend_examples
     depends_on:
       db:
         condition: service_healthy
@@ -121,9 +123,12 @@ services:
 
   redis:
     image: redis:7
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    # AOF (append-only file) — данные переживут перезапуск и сбой процесса
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
     ports:
       - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 5s
@@ -132,3 +137,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:

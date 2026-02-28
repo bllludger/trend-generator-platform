@@ -1137,6 +1137,8 @@ ALLOWED_TREND_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 def _trend_to_item(t: Trend) -> dict:
     sections = t.prompt_sections if isinstance(t.prompt_sections, list) else []
     has_playground = len(sections) > 0
+    # has_example — по наличию файла на диске, а не только по пути в БД
+    example_path = _resolve_trend_media_path(t.example_image_path, t.id, "_example")
     return {
         "id": t.id,
         "theme_id": t.theme_id,
@@ -1145,7 +1147,7 @@ def _trend_to_item(t: Trend) -> dict:
         "description": t.description,
         "enabled": t.enabled,
         "order_index": t.order_index,
-        "has_example": bool(t.example_image_path),
+        "has_example": example_path is not None,
         "prompt_config_source": "playground" if has_playground else "scene",
         "subject_mode": t.subject_mode or "face",
         "framing_hint": t.framing_hint or "portrait",

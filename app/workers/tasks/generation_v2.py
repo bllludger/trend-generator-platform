@@ -1,7 +1,7 @@
 """
 Celery task: generate image for a job (trend + user photo), save result, send to Telegram.
 Bot calls: send_task("app.workers.tasks.generation_v2.generate_image", args=[job_id], kwargs={status_chat_id, status_message_id}).
-Единый билдер: [INPUT], [TASK], [IDENTITY TRANSFER], [COMPOSITION], [SCENE], [STYLE], [AVOID], [SAFETY], [OUTPUT].
+Единый билдер: [INPUT], [TASK], [IDENTITY TRANSFER], [COMPOSITION], [], [STYLE], [AVOID], [SAFETY], [OUTPUT].
 """
 import logging
 import os
@@ -55,10 +55,10 @@ def _build_prompt_for_job(db: Session, job: Job, trend: Trend) -> tuple[str, str
     size = job.image_size or effective.get("default_size", "1024x1024")
     fmt = effective.get("default_format", "png")
 
-    # Если у тренда prompt_sections (Playground) — собираем из секций с тегами [SCENE], [STYLE], [AVOID], [COMPOSITION]
+    # Если у тренда prompt_sections (Playground) — собираем из секций с тегами [], [STYLE], [AVOID], [COMPOSITION]
     sections = trend.prompt_sections if isinstance(trend.prompt_sections, list) else []
     if sections:
-        label_to_tag = {"scene": "[SCENE]", "style": "[STYLE]", "avoid": "[AVOID]", "composition": "[COMPOSITION]"}
+        label_to_tag = {"scene": "[]", "style": "[STYLE]", "avoid": "[AVOID]", "composition": "[COMPOSITION]"}
         parts = []
         for s in sorted(sections, key=lambda x: x.get("order", 0)):
             if not s.get("enabled") or not s.get("content"):
@@ -102,7 +102,7 @@ def _build_prompt_for_job(db: Session, job: Job, trend: Trend) -> tuple[str, str
 
     scene = (trend.scene_prompt or trend.system_prompt or "").strip()
     if scene:
-        blocks.append(f"[SCENE]\n{scene}")
+        blocks.append(f"[]\n{scene}")
 
     style_text = _style_preset_to_text(trend.style_preset)
     if style_text:

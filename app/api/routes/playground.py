@@ -6,7 +6,9 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import tempfile
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -83,7 +85,7 @@ def _style_preset_content_to_text(content: str) -> str:
 
 
 def _build_prompt_from_config(config: PlaygroundPromptConfig) -> str:
-    """Build single prompt string from enabled sections; add [SCENE]/[STYLE]/[AVOID] to match worker."""
+    """Build single prompt string from enabled sections; add []/[STYLE]/[AVOID] to match worker."""
     parts = []
     for s in sorted(config.sections, key=lambda x: x.order):
         if not s.enabled or not s.content.strip():
@@ -93,7 +95,7 @@ def _build_prompt_from_config(config: PlaygroundPromptConfig) -> str:
             text = text.replace("{{" + k + "}}", str(v))
         label = (s.label or "").strip().lower()
         if label == "scene":
-            parts.append("[SCENE]\n" + text)
+            parts.append("[]\n" + text)
         elif label == "style":
             style_text = _style_preset_content_to_text(text)
             if style_text:
@@ -128,6 +130,94 @@ def _build_full_prompt_for_playground(db: Session, config: PlaygroundPromptConfi
     if safety:
         blocks.append("[SAFETY]\n" + safety)
     return "\n\n".join(blocks)
+
+
+# ---------- Helpers for sent_request (mirror Gemini provider payload) ----------
+def _playground_size_to_aspect_ratio(size: str | None) -> str:
+    """Convert size like '1024x1024' to aspect ratio like '1:1'."""
+    if not size or "x" not in size:
+        return "1:1"
+    try:
+        w, h = size.split("x")
+        width, height = int(w), int(h)
+    except (ValueError, TypeError):
+        return "1:1"
+    if width == height:
+        return "1:1"
+    if width * 9 == height * 16:
+        return "9:16"
+    if width * 16 == height * 9:
+        return "16:9"
+    if width * 3 == height * 4:
+        return "3:4"
+    if width * 4 == height * 3:
+        return "4:3"
+    from math import gcd
+    d = gcd(width, height)
+    return f"{width // d}:{height // d}"
+
+
+_MODELS_SUPPORTING_IMAGE_SIZE = frozenset({"gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"})
+_MODEL_MAX_IMAGE_TIER = {
+    "gemini-2.5-flash-image": "4K",
+    "gemini-3-pro-image-preview": "4K",
+    "gemini-3.1-flash-image-preview": "4K",
+}
+
+
+def _effective_image_size_tier(model: str, requested_tier: str | None) -> str:
+    """Return imageSize tier for display (match provider logic)."""
+    tier_order = ("256", "512", "1K", "2K", "4K")
+    max_tier = _MODEL_MAX_IMAGE_TIER.get(model, "2K")
+    max_idx = tier_order.index(max_tier) if max_tier in tier_order else 3
+    min_idx = 3 if max_idx >= 3 else 0
+    requested = (requested_tier or "").strip().upper() or "2K"
+    req_idx = tier_order.index(requested) if requested in tier_order else 3
+    use_idx = max(min_idx, min(req_idx, max_idx))
+    return tier_order[use_idx]
+
+
+def _build_sent_request_playground(
+    config: PlaygroundPromptConfig,
+    prompt: str,
+    input_image_path: str | None,
+) -> dict[str, Any]:
+    """Build sanitized request payload as sent to Gemini (image data replaced with placeholder)."""
+    model = (config.model or "gemini-2.5-flash-image").strip()
+    temperature = config.temperature if config.temperature is not None else 0.4
+    temperature = max(0.0, min(2.0, float(temperature)))
+    seed = config.seed if config.seed is not None else 42
+    if not isinstance(seed, int):
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError):
+            seed = 42
+
+    parts: list[dict[str, Any]] = [{"text": prompt}]
+    if input_image_path and os.path.isfile(input_image_path):
+        size_bytes = os.path.getsize(input_image_path)
+        parts.append({
+            "inlineData": {
+                "mimeType": "image/jpeg",
+                "data": f"[REDACTED, {size_bytes} bytes]",
+            },
+        })
+
+    aspect_ratio = _playground_size_to_aspect_ratio(config.size or "1024x1024")
+    image_config: dict[str, Any] = {"aspectRatio": aspect_ratio}
+    if model in _MODELS_SUPPORTING_IMAGE_SIZE and config.image_size_tier:
+        image_config["imageSize"] = _effective_image_size_tier(model, config.image_size_tier)
+
+    return {
+        "model": model,
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "temperature": temperature,
+            "seed": seed,
+            "imageConfig": image_config,
+        },
+    }
 
 
 def trend_to_playground_config(
@@ -270,6 +360,10 @@ async def save_to_trend(
     return {"ok": True}
 
 
+def _run_log_entry(level: str, message: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"level": level, "message": message, "timestamp": time.time(), **({"extra": extra} if extra else {})}
+
+
 # ---------- POST /admin/playground/test ----------
 @router.post("/test")
 async def test_prompt(
@@ -279,16 +373,21 @@ async def test_prompt(
 ):
     """
     Multipart: config (JSON string), image1 (optional file — user photo for scene transfer).
-    Returns { image_url?: string, error?: string } (snake_case for frontend).
+    Returns { image_url?, error?, sent_request?, run_log? } (snake_case for frontend).
     """
+    run_log: list[dict[str, Any]] = []
+    sent_request: dict[str, Any] | None = None
+
     try:
         form = await request.form()
         config_raw = form.get("config")
         if not config_raw:
-            return {"error": "Missing 'config' in form"}
+            return {"error": "Missing 'config' in form", "sent_request": None, "run_log": run_log}
         if hasattr(config_raw, "read"):
             config_raw = (config_raw.read() or b"").decode("utf-8")
         config = PlaygroundPromptConfig.model_validate(json.loads(config_raw))
+
+        run_log.append(_run_log_entry("info", "Request started"))
 
         prompt = _build_full_prompt_for_playground(db, config)
         input_image_path: str | None = None
@@ -299,6 +398,19 @@ async def test_prompt(
             f.write(await image1.read())
             f.close()
             input_image_path = f.name
+
+        run_log.append(_run_log_entry("info", "Config", extra={
+            "model": config.model or "gemini-2.5-flash-image",
+            "size": config.size or "1024x1024",
+            "temperature": getattr(config, "temperature", 0.4),
+            "seed": config.seed,
+            "image_size_tier": config.image_size_tier,
+            "has_input_image": bool(input_image_path),
+            "prompt_length": len(prompt),
+        }))
+
+        sent_request = _build_sent_request_playground(config, prompt, input_image_path)
+        run_log.append(_run_log_entry("info", "Sending request to Gemini"))
 
         provider = ImageProviderFactory.create_from_settings(settings, "gemini")
         req = ImageGenerationRequest(
@@ -312,6 +424,7 @@ async def test_prompt(
             seed=config.seed,
             image_size_tier=config.image_size_tier,
         )
+        t0 = time.perf_counter()
         result = generate_with_retry(
             provider,
             req,
@@ -320,22 +433,28 @@ async def test_prompt(
             safety_settings_snapshot=getattr(settings, "gemini_safety_settings", None),
             streaming_enabled=False,
         )
+        elapsed = time.perf_counter() - t0
 
-        # Build data URL for frontend (image_url)
+        run_log.append(_run_log_entry("info", f"Gemini responded in {elapsed:.2f}s"))
+        run_log.append(_run_log_entry("info", f"Success: image received, {len(result.image_content)} bytes"))
+
         b64 = base64.standard_b64encode(result.image_content).decode("ascii")
         mime = "image/png" if (config.format or "").lower() == "png" else "image/jpeg"
         image_url = f"data:{mime};base64,{b64}"
         if input_image_path:
             try:
-                import os
                 os.unlink(input_image_path)
             except Exception:
                 pass
-        return {"image_url": image_url}
+        return {"image_url": image_url, "sent_request": sent_request, "run_log": run_log}
     except ImageGenerationError as e:
-        return {"error": str(e) or (e.detail.get("finish_message") if e.detail else "Generation failed")}
+        err_msg = str(e) or (e.detail.get("finish_message") if e.detail else "Generation failed")
+        run_log.append(_run_log_entry("error", f"Gemini call failed: {err_msg}", extra=e.detail))
+        return {"error": err_msg, "sent_request": sent_request, "run_log": run_log}
     except json.JSONDecodeError as e:
-        return {"error": f"Invalid config JSON: {e}"}
+        run_log.append(_run_log_entry("error", f"Invalid config JSON: {e}"))
+        return {"error": f"Invalid config JSON: {e}", "sent_request": None, "run_log": run_log}
     except Exception as e:
         logger.exception("Playground test failed")
-        return {"error": str(e)}
+        run_log.append(_run_log_entry("error", str(e)))
+        return {"error": str(e), "sent_request": sent_request, "run_log": run_log}

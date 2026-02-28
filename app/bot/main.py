@@ -71,6 +71,21 @@ def t(key: str, default: str) -> str:
 def tr(key: str, default: str, **variables: Any) -> str:
     return runtime_templates.render(key, default, **variables)
 
+
+def _resolve_trend_example_path(stored_path: str | None, trend_id: str) -> str | None:
+    """Резолв пути к файлу примера тренда: сначала сохранённый путь, иначе ищем по trend_examples_dir и шаблону {trend_id}_example.{ext} (как в API)."""
+    if stored_path and os.path.isabs(stored_path) and os.path.isfile(stored_path):
+        return stored_path
+    base = getattr(settings, "trend_examples_dir", "data/trend_examples")
+    if not os.path.isabs(base):
+        base = os.path.join(os.getcwd(), base)
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        p = os.path.join(base, f"{trend_id}_example{ext}")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 # Welcome banner for /start
 WELCOME_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "welcome.png")
 WELCOME_TEXT_DEFAULT = (
@@ -1653,8 +1668,8 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                     await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
                     trend_name = trend.name
                     trend_emoji = trend.emoji or ""
-                    example_path = getattr(trend, "example_image_path", None)
-                    if example_path and os.path.isfile(example_path):
+                    example_path = _resolve_trend_example_path(getattr(trend, "example_image_path", None), str(trend.id))
+                    if example_path:
                         try:
                             sent = await message.answer_photo(
                                 photo=FSInputFile(example_path),
@@ -1748,8 +1763,8 @@ async def handle_photo_as_document_step1(message: Message, state: FSMContext, bo
                     await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
                     trend_name = trend.name
                     trend_emoji = trend.emoji or ""
-                    example_path = getattr(trend, "example_image_path", None)
-                    if example_path and os.path.isfile(example_path):
+                    example_path = _resolve_trend_example_path(getattr(trend, "example_image_path", None), str(trend.id))
+                    if example_path:
                         try:
                             sent = await message.answer_photo(
                                 photo=FSInputFile(example_path),
@@ -1916,7 +1931,7 @@ async def select_trend_or_idea(callback: CallbackQuery, state: FSMContext, bot: 
                 return
             trend_name = trend.name
             trend_emoji = trend.emoji
-            example_path = getattr(trend, "example_image_path", None)  # читаем пока сессия открыта
+            example_path = _resolve_trend_example_path(getattr(trend, "example_image_path", None), str(trend.id))
             await state.update_data(selected_trend_id=trend_id, selected_trend_name=trend_name)
             await state.set_state(BotStates.waiting_for_format)
 
@@ -1929,7 +1944,7 @@ async def select_trend_or_idea(callback: CallbackQuery, state: FSMContext, bot: 
                 payload={},
             )
 
-        if example_path and os.path.isfile(example_path):
+        if example_path:
             try:
                 photo = FSInputFile(example_path)
                 sent = await callback.message.answer_photo(

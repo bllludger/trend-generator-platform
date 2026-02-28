@@ -257,7 +257,7 @@ export function MasterPromptPage() {
 
         <TabsContent value="system" className="space-y-4 mt-4">
           <p className="text-sm text-muted-foreground">
-            Блоки [INPUT], [TASK], [IDENTITY TRANSFER], [SAFETY] и дефолты модели. Для трендов [IDENTITY], [COMPOSITION], [AVOID] берутся из вкладки «Перенос (для трендов)».
+            Блоки [INPUT], [TASK], [IDENTITY TRANSFER], [SAFETY] (все опциональны) и дефолты модели. Для трендов [IDENTITY], [COMPOSITION], [AVOID] берутся из вкладки «Перенос (для трендов)».
           </p>
           <form onSubmit={handleMasterSubmit}>
             <Card>
@@ -266,7 +266,7 @@ export function MasterPromptPage() {
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="grid gap-2">
-                  <Label htmlFor="master-blocks">Блоки [INPUT], [TASK], [IDENTITY TRANSFER], [SAFETY]</Label>
+                  <Label htmlFor="master-blocks">Блоки [INPUT], [TASK], [IDENTITY TRANSFER], [SAFETY] (опционально)</Label>
                   <Textarea
                     id="master-blocks"
                     rows={16}

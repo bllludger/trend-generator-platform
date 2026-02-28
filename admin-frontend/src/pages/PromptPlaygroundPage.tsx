@@ -4,7 +4,7 @@
  * Interactive testing environment for Gemini prompts with:
  * - Drag & drop prompt sections
  * - Live JSON preview
- * - Real-time logs via SSE
+ * - Run log from last test (no SSE)
  * - Test with images
  * - Result visualization
  */
@@ -30,7 +30,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useQuery } from '@tanstack/react-query'
-import { playgroundApi, type PlaygroundPromptConfig, type LogEntry, type PlaygroundSection } from '@/services/playgroundApi'
+import { playgroundApi, type PlaygroundPromptConfig, type PlaygroundSection, type RunLogEntry } from '@/services/playgroundApi'
 import { trendsService, masterPromptService } from '@/services/api'
 import { parseFullTrendPrompt } from '@/utils/trendPromptParse'
 
@@ -51,9 +51,9 @@ export default function PromptPlaygroundPage() {
     queryKey: ['master-prompt-settings'],
     queryFn: () => masterPromptService.getSettings(),
   })
-  const [sessionId] = useState(() => `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`)
   const [config, setConfig] = useState<PlaygroundPromptConfig | null>(null)
-  const [logs, setLogs] = useState<LogEntry[]>([])
+  const [lastSentRequest, setLastSentRequest] = useState<Record<string, unknown> | null>(null)
+  const [lastRunLog, setLastRunLog] = useState<RunLogEntry[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [isTesting, setIsTesting] = useState(false)
   const [result, setResult] = useState<PlaygroundTestResult | null>(null)
@@ -77,43 +77,22 @@ export default function PromptPlaygroundPage() {
   const batchTestStopRef = useRef(false)
   
   const logsEndRef = useRef<HTMLDivElement>(null)
-  const sseCleanupRef = useRef<(() => void) | null>(null)
 
   // Load default config on mount
   useEffect(() => {
     loadDefaultConfig()
     loadTrends()
-    
-    // Setup SSE connection
-    const cleanup = playgroundApi.createLogStream(
-      sessionId,
-      (logEntry: LogEntry) => {
-        setLogs((prev) => [...prev, logEntry])
-      },
-      (error: unknown) => {
-        console.error('SSE error:', error)
-        toast.error('Lost connection to log stream')
-      }
-    )
-    
-    sseCleanupRef.current = cleanup
-    
-    return () => {
-      if (sseCleanupRef.current) {
-        sseCleanupRef.current()
-      }
-    }
-  }, [sessionId])
+  }, [])
 
-  // Auto-scroll logs
+  // Auto-scroll logs when last run log updates
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [logs])
+  }, [lastRunLog])
 
   function sectionsToFullText(sections: PlaygroundSection[]): string {
     const ordered = [...(sections || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
     const labelToTag: Record<string, string> = {
-      scene: '[SCENE]',
+      scene: '[]',
       style: '[STYLE]',
       avoid: '[AVOID]',
       composition: '[COMPOSITION]',
@@ -258,7 +237,18 @@ export default function PromptPlaygroundPage() {
       const start = Date.now()
       try {
         const trendConfig = await playgroundApi.loadTrend(trendId)
-        const response = await playgroundApi.testPrompt(trendConfig, image1)
+        const mergedConfig = config
+          ? {
+              ...trendConfig,
+              model: config.model ?? trendConfig.model,
+              temperature: config.temperature ?? trendConfig.temperature,
+              format: config.format ?? trendConfig.format,
+              size: config.size ?? trendConfig.size,
+              seed: config.seed ?? trendConfig.seed,
+              image_size_tier: config.image_size_tier ?? trendConfig.image_size_tier,
+            }
+          : trendConfig
+        const response = await playgroundApi.testPrompt(mergedConfig, image1)
         const duration = (Date.now() - start) / 1000
         if (response.imageUrl) {
           results.push({ trendId, trendName, trendEmoji, status: 'success', duration, imageUrl: response.imageUrl })
@@ -351,9 +341,10 @@ export default function PromptPlaygroundPage() {
     try {
       setIsTesting(true)
       setResult(null)
-      setLogs([])
       const configToSend: PlaygroundPromptConfig = { ...config, sections: fullPromptTextToSections(fullPromptText) }
       const response = await playgroundApi.testPrompt(configToSend, image1 ?? undefined)
+      setLastSentRequest(response.sent_request ?? null)
+      setLastRunLog(response.run_log ?? [])
       const mapped: PlaygroundTestResult = {
         success: !!response.imageUrl,
         imageUrl: response.imageUrl,
@@ -361,15 +352,18 @@ export default function PromptPlaygroundPage() {
         error: response.error,
       }
       setResult(mapped)
-      
       if (response.imageUrl) {
         toast.success('Generation completed')
+      } else if (response.error) {
+        toast.error(`Generation failed: ${response.error}`)
       } else {
-        toast.error(`Generation failed: ${response.error ?? 'Unknown error'}`)
+        console.warn('Playground test: no image_url and no error in response', response)
+        toast.error('Неожиданный ответ: нет изображения и нет ошибки. Возможно, ответ обрезан (большой размер).')
       }
     } catch (error: any) {
       console.error('Test failed:', error)
-      toast.error(`Test failed: ${error.message}`)
+      const msg = error?.response?.data?.detail ?? error?.message ?? String(error)
+      toast.error(`Test failed: ${msg}`)
     } finally {
       setIsTesting(false)
     }
@@ -388,6 +382,11 @@ export default function PromptPlaygroundPage() {
 
   function fullPromptTextToSections(text: string): PlaygroundSection[] {
     const parsed = parseFullTrendPrompt(text)
+    const trimmed = text.trim()
+    const hasMarkers = [parsed.scene, parsed.style, parsed.avoid, parsed.composition].some((s) => (s || '').trim().length > 0)
+    if (!hasMarkers && trimmed) {
+      return [{ id: `section_${Date.now()}_0`, label: 'prompt', content: trimmed, enabled: true, order: 0 }]
+    }
     const ts = Date.now()
     return [
       { id: `section_${ts}_0`, label: 'Scene', content: parsed.scene, enabled: true, order: 0 },
@@ -427,6 +426,7 @@ export default function PromptPlaygroundPage() {
     let style = (parsed.style || '').trim()
     let avoid = (parsed.avoid || '').trim()
     let composition = (parsed.composition || '').trim()
+    const hasMarkers = scene || style || avoid || composition
     for (const [key, value] of Object.entries(config.variables || {})) {
       scene = scene.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
       style = style.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
@@ -434,13 +434,17 @@ export default function PromptPlaygroundPage() {
       composition = composition.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
     }
     const sectionsParts: string[] = []
-    if (scene) sectionsParts.push('[SCENE]\n' + scene)
-    if (style) sectionsParts.push('[STYLE]\n' + style)
-    if (avoid) sectionsParts.push('[AVOID]\n' + avoid)
-    if (composition) sectionsParts.push('[COMPOSITION]\n' + composition)
-    const sectionsText = sectionsParts.join('\n\n')
-    if (sectionsText) textBlocks.push(sectionsText)
-    const safetyText = (masterSettings?.safety_constraints || '').trim() || 'no text generation, no chat.'
+    if (hasMarkers) {
+      if (scene) sectionsParts.push('[]\n' + scene)
+      if (style) sectionsParts.push('[STYLE]\n' + style)
+      if (avoid) sectionsParts.push('[AVOID]\n' + avoid)
+      if (composition) sectionsParts.push('[COMPOSITION]\n' + composition)
+      const sectionsText = sectionsParts.join('\n\n')
+      if (sectionsText) textBlocks.push(sectionsText)
+    } else if (fullPromptText.trim()) {
+      textBlocks.push(fullPromptText.trim())
+    }
+    const safetyText = (masterSettings?.safety_constraints ?? '').trim()
     if (masterSettings?.safety_constraints_enabled !== false && safetyText) {
       textBlocks.push('[SAFETY]\n' + safetyText)
     }
@@ -641,17 +645,17 @@ export default function PromptPlaygroundPage() {
                 Полный промпт
               </CardTitle>
               <p className="text-xs text-muted-foreground">
-                На отдельных строках укажите [SCENE], [STYLE], [AVOID], [COMPOSITION], далее текст до следующего маркера.
+                Можно вставить любой промпт. Опционально: маркеры [], [STYLE], [AVOID], [COMPOSITION] на отдельных строках разобьют текст на блоки ([] — сцена).
               </p>
             </CardHeader>
             <CardContent>
               <textarea
                 value={fullPromptText}
                 onChange={(e) => setFullPromptText(e.target.value)}
-                placeholder={'[SCENE]\nописание сцены...\n\n[STYLE]\n{"style": "cinematic"}\n\n[AVOID]\nчего избегать\n\n[COMPOSITION]\nправила композиции (необязательно)'}
+                placeholder="Вставьте промпт или опишите сцену…"
                 className="w-full p-3 border rounded-md text-sm font-mono min-h-[280px]"
                 rows={14}
-                aria-label="Полный промпт: блоки [SCENE], [STYLE], [AVOID], [COMPOSITION]"
+                aria-label="Полный промпт (любой текст или блоки [], [STYLE], [AVOID], [COMPOSITION])"
               />
             </CardContent>
           </Card>
@@ -790,65 +794,12 @@ export default function PromptPlaygroundPage() {
 
         {/* Right Column - Preview & Results */}
         <div className="space-y-6">
-          <Tabs defaultValue="json">
+          <Tabs defaultValue="result">
             <TabsList className="grid w-full grid-cols-3">
+              <TabsTrigger value="result">Result</TabsTrigger>
               <TabsTrigger value="json">Request JSON</TabsTrigger>
               <TabsTrigger value="logs">Logs</TabsTrigger>
-              <TabsTrigger value="result">Result</TabsTrigger>
             </TabsList>
-            
-            {/* JSON Preview */}
-            <TabsContent value="json">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Request JSON (Preview)</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <pre className="bg-gray-50 p-4 rounded text-xs overflow-auto max-h-[600px] font-mono">
-                    {JSON.stringify(buildRequestJson(), null, 2)}
-                  </pre>
-                </CardContent>
-              </Card>
-            </TabsContent>
-            
-            {/* Logs */}
-            <TabsContent value="logs">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <Terminal className="w-5 h-5" />
-                    Real-time Logs
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="bg-black text-green-400 p-4 rounded font-mono text-xs h-[600px] overflow-auto">
-                    {logs.length === 0 ? (
-                      <div className="text-gray-500">Waiting for logs...</div>
-                    ) : (
-                      logs.map((log: LogEntry, i: number) => (
-                        <div key={i} className="mb-1">
-                          <span className={`font-bold ${
-                            log.level === 'ERROR' ? 'text-red-400' :
-                            log.level === 'WARNING' ? 'text-yellow-400' :
-                            'text-green-400'
-                          }`}>
-                            [{String(log.level)}]
-                          </span>{' '}
-                          <span className="text-gray-400">{log.timestamp ?? ''}</span>{' '}
-                          {String(log.message)}
-                          {log.extra != null && typeof log.extra === 'object' && Object.keys(log.extra).length > 0 && (
-                            <div className="ml-4 text-blue-300">
-                              {JSON.stringify(log.extra, null, 2)}
-                            </div>
-                          )}
-                        </div>
-                      ))
-                    )}
-                    <div ref={logsEndRef} />
-                  </div>
-                </CardContent>
-              </Card>
-            </TabsContent>
             
             {/* Result */}
             <TabsContent value="result">
@@ -911,12 +862,164 @@ export default function PromptPlaygroundPage() {
                 </CardContent>
               </Card>
             </TabsContent>
+
+            {/* Request JSON: sent (after test) or preview */}
+            <TabsContent value="json">
+              <Card>
+                <CardHeader>
+                  <CardTitle>
+                    {lastSentRequest != null ? 'Request JSON (отправленный)' : 'Request JSON (Preview)'}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <pre className="bg-gray-50 p-4 rounded text-xs overflow-auto max-h-[600px] font-mono">
+                    {JSON.stringify(lastSentRequest ?? buildRequestJson(), null, 2)}
+                  </pre>
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            {/* Logs: last run only */}
+            <TabsContent value="logs">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Terminal className="w-5 h-5" />
+                    Лог последнего запроса
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="bg-black text-green-400 p-4 rounded font-mono text-xs h-[600px] overflow-auto">
+                    {lastRunLog.length === 0 ? (
+                      <div className="text-gray-500">Запустите тест, чтобы увидеть лог последнего запроса.</div>
+                    ) : (
+                      lastRunLog.map((log: RunLogEntry, i: number) => (
+                        <div key={i} className="mb-1">
+                          <span className={`font-bold ${
+                            log.level === 'error' ? 'text-red-400' :
+                            log.level === 'warning' ? 'text-yellow-400' :
+                            'text-green-400'
+                          }`}>
+                            [{String(log.level).toUpperCase()}]
+                          </span>{' '}
+                          <span className="text-gray-400">
+                            {typeof log.timestamp === 'number' ? new Date(log.timestamp * 1000).toISOString() : log.timestamp}
+                          </span>{' '}
+                          {String(log.message)}
+                          {log.extra != null && typeof log.extra === 'object' && Object.keys(log.extra).length > 0 && (
+                            <div className="ml-4 text-blue-300">
+                              {JSON.stringify(log.extra, null, 2)}
+                            </div>
+                          )}
+                        </div>
+                      ))
+                    )}
+                    <div ref={logsEndRef} />
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
           </Tabs>
         </div>
       </div>
         </TabsContent>
 
         <TabsContent value="batch" className="mt-0 space-y-4">
+          {/* Конфиг для запуска по трендам — общие параметры для всех выбранных трендов */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Settings className="w-5 h-5" />
+                Configuration
+              </CardTitle>
+              <p className="text-sm text-muted-foreground">
+                Параметры генерации для запуска по трендам. Промпты берутся из каждого тренда, остальное — из этого конфига.
+              </p>
+            </CardHeader>
+            <CardContent className="grid grid-cols-2 md:grid-cols-3 gap-4">
+              <div>
+                <Label>Model</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={config?.model || 'gemini-2.5-flash-image'}
+                  onChange={(e) => setConfig(config ? { ...config, model: e.target.value } : null)}
+                >
+                  <option value="gemini-2.5-flash-image">Стандарт (gemini-2.5-flash-image)</option>
+                  <option value="gemini-3-pro-image-preview">Gemini 3 Pro (gemini-3-pro-image-preview)</option>
+                  <option value="gemini-3.1-flash-image-preview">Nano Banana 2 (gemini-3.1-flash-image-preview)</option>
+                </select>
+              </div>
+              <div>
+                <Label>Aspect Ratio</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={(config as { aspect_ratio?: string })?.aspect_ratio || '1:1'}
+                  onChange={(e) => setConfig(config ? { ...config, aspect_ratio: e.target.value } as typeof config : null)}
+                >
+                  <option value="1:1">1:1 (квадрат)</option>
+                  <option value="16:9">16:9 (широкий)</option>
+                  <option value="9:16">9:16 (вертикальный)</option>
+                  <option value="4:3">4:3</option>
+                  <option value="3:4">3:4</option>
+                </select>
+              </div>
+              <div>
+                <Label>Image Size</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={config?.image_size_tier ?? '2K'}
+                  onChange={(e) => setConfig(config ? { ...config, image_size_tier: e.target.value || undefined } : null)}
+                >
+                  <option value="256">256px</option>
+                  <option value="512">512px</option>
+                  <option value="1K">1K (~1024px)</option>
+                  <option value="2K">2K (~2048px)</option>
+                  <option value="4K">4K (~4096px)</option>
+                </select>
+              </div>
+              <div>
+                <Label>Temperature</Label>
+                <Input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={2}
+                  value={config?.temperature ?? 0.7}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    const num = v === '' ? 0.7 : parseFloat(v)
+                    setConfig(config ? { ...config, temperature: Number.isFinite(num) ? num : 0 } : null)
+                  }}
+                />
+              </div>
+              <div>
+                <Label>Seed</Label>
+                <Input
+                  type="number"
+                  placeholder="Пусто = дефолт (42)"
+                  value={config?.seed ?? ''}
+                  onChange={(e) => {
+                    const val = e.target.value.trim()
+                    setConfig(config ? { ...config, seed: val ? parseInt(val, 10) : undefined } : null)
+                  }}
+                />
+                <p className="text-xs text-muted-foreground mt-1">Для воспроизводимости</p>
+              </div>
+              <div>
+                <Label>Format (постобработка)</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={config?.format || 'png'}
+                  onChange={(e) => setConfig(config ? { ...config, format: e.target.value } : null)}
+                >
+                  <option value="png">PNG</option>
+                  <option value="jpeg">JPEG</option>
+                  <option value="webp">WebP</option>
+                </select>
+              </div>
+            </CardContent>
+          </Card>
+
           <Card>
             <CardHeader>
               <CardTitle>Запуск по трендам</CardTitle>

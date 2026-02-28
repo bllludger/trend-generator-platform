@@ -73,7 +73,7 @@ def _build_prompt_for_take(db: Session, take: Take, trend: Trend) -> tuple[str, 
 
     sections = trend.prompt_sections if isinstance(trend.prompt_sections, list) else []
     if sections:
-        label_to_tag = {"scene": "[SCENE]", "style": "[STYLE]", "avoid": "[AVOID]", "composition": "[COMPOSITION]"}
+        label_to_tag = {"scene": "[]", "style": "[STYLE]", "avoid": "[AVOID]", "composition": "[COMPOSITION]"}
         parts = []
         for s in sorted(sections, key=lambda x: x.get("order", 0)):
             if not s.get("enabled") or not s.get("content"):
@@ -112,7 +112,7 @@ def _build_prompt_for_take(db: Session, take: Take, trend: Trend) -> tuple[str, 
         blocks.append(f"[COMPOSITION]\n{composition}")
     scene = (trend.scene_prompt or trend.system_prompt or "").strip()
     if scene:
-        blocks.append(f"[SCENE]\n{scene}")
+        blocks.append(f"[]\n{scene}")
     style_text = _style_preset_to_text(trend.style_preset)
     if style_text:
         blocks.append(f"[STYLE]\n{style_text}")

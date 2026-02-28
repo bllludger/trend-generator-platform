@@ -225,6 +225,8 @@ export function TrendsPage() {
   })
   const exampleFileInputRef = useRef<HTMLInputElement>(null)
   const [uploadProgress, setUploadProgress] = useState<number | null>(null)
+  const [pendingExampleFile, setPendingExampleFile] = useState<File | null>(null)
+  const pendingExampleFileRef = useRef<File | null>(null)
   const editButtonRef = useRef<HTMLButtonElement | null>(null)
   const dialogContentRef = useRef<HTMLDivElement>(null)
 
@@ -360,18 +362,6 @@ export function TrendsPage() {
     },
   })
 
-  const patchFramingMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: { subject_mode?: string; framing_hint?: string } }) =>
-      trendsService.update(id, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['trends'] })
-      toast.success('Параметры кадра обновлены')
-    },
-    onError: () => {
-      toast.error('Ошибка при обновлении параметров кадра')
-    },
-  })
-
   const moveToThemeMutation = useMutation({
     mutationFn: ({ id, theme_id, order_index }: { id: string; theme_id: string | null; order_index: number }) =>
       trendsService.update(id, { theme_id, order_index }),
@@ -425,11 +415,23 @@ export function TrendsPage() {
 
   const createMutation = useMutation({
     mutationFn: (data: Record<string, unknown>) => trendsService.create(data as Parameters<typeof trendsService.create>[0]),
-    onSuccess: () => {
+    onSuccess: (createdTrend: Trend) => {
       queryClient.invalidateQueries({ queryKey: ['trends'] })
       toast.success('Тренд создан')
       setIsCreating(false)
+      const fileToUpload = pendingExampleFileRef.current
+      pendingExampleFileRef.current = null
+      setPendingExampleFile(null)
       resetForm()
+      if (fileToUpload) {
+        setUploadProgress(0)
+        uploadExampleMutation.mutate({
+          id: createdTrend.id,
+          file: fileToUpload,
+          onProgress: setUploadProgress,
+        })
+        toast.info('Загружаем пример результата…')
+      }
     },
     onError: (err: unknown) => {
       toast.error(getValidationErrorMessage(err, 'Ошибка при создании тренда'))
@@ -497,6 +499,8 @@ export function TrendsPage() {
     })
     setFullPromptText('')
     setShowSceneError(false)
+    setPendingExampleFile(null)
+    pendingExampleFileRef.current = null
   }, [trends?.length])
 
   const handleCreate = (themeId?: string | null) => {
@@ -586,12 +590,20 @@ export function TrendsPage() {
     const parsed = parseFullTrendPrompt(fullPromptText)
     const hasScene = !!parsed.scene.trim()
     const hasLegacy = !!formData.system_prompt.trim()
-    if (!hasScene && !hasLegacy) {
+    const hasArbitraryPrompt = !!fullPromptText.trim()
+    const hasAnyPrompt = hasScene || hasLegacy || hasArbitraryPrompt
+    if (!hasAnyPrompt) {
       setShowSceneError(true)
       setTrendFormTab('prompts')
-      toast.error('Заполните блок [SCENE] на вкладке «Промпты».')
+      toast.error('Заполните блок [] (сцена) или введите произвольный промпт на вкладке «Промпты».')
       return
     }
+
+    // Если заполнен блок [] (сцена) — используем разобранные блоки; иначе весь текст считаем сценой (произвольный промпт)
+    const useParsedBlocks = hasScene
+    const scenePrompt = useParsedBlocks
+      ? parsed.scene.trim()
+      : (fullPromptText.trim() || formData.system_prompt)
 
     let style_preset: Record<string, unknown> | string
     const styleStr = (parsed.style || '').trim()
@@ -618,9 +630,9 @@ export function TrendsPage() {
       description: formData.description,
       order_index: formData.order_index,
       theme_id: formData.theme_id ?? null,
-      scene_prompt: parsed.scene.trim(),
-      negative_scene: (parsed.avoid || '').trim(),
-      composition_prompt: (parsed.composition || '').trim() || null,
+      scene_prompt: scenePrompt,
+      negative_scene: useParsedBlocks ? (parsed.avoid || '').trim() : '',
+      composition_prompt: useParsedBlocks ? (parsed.composition || '').trim() || null : null,
       subject_mode: formData.subject_mode,
       framing_hint: formData.framing_hint,
       style_preset,
@@ -634,6 +646,7 @@ export function TrendsPage() {
     if (editingTrend) {
       updateMutation.mutate({ id: editingTrend.id, data: payload })
     } else {
+      pendingExampleFileRef.current = pendingExampleFile
       createMutation.mutate(payload)
     }
   }
@@ -821,47 +834,6 @@ export function TrendsPage() {
                               <p className="text-sm text-muted-foreground line-clamp-2 mb-4">
                                 {trend.description}
                               </p>
-                              <div className="grid grid-cols-2 gap-2 mb-4">
-                                <div className="space-y-1">
-                                  <Label className="text-xs">Область объекта</Label>
-                                  <Select
-                                    value={trend.subject_mode ?? 'face'}
-                                    onValueChange={(v) =>
-                                      patchFramingMutation.mutate({ id: trend.id, data: { subject_mode: v } })
-                                    }
-                                    disabled={patchFramingMutation.isPending}
-                                  >
-                                    <SelectTrigger className="h-8 text-xs" aria-label="Область объекта">
-                                      <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      <SelectItem value="face">Лицо</SelectItem>
-                                      <SelectItem value="head_torso">Голова и торс</SelectItem>
-                                      <SelectItem value="full_body">В полный рост</SelectItem>
-                                    </SelectContent>
-                                  </Select>
-                                </div>
-                                <div className="space-y-1">
-                                  <Label className="text-xs">Кадрирование</Label>
-                                  <Select
-                                    value={trend.framing_hint ?? 'portrait'}
-                                    onValueChange={(v) =>
-                                      patchFramingMutation.mutate({ id: trend.id, data: { framing_hint: v } })
-                                    }
-                                    disabled={patchFramingMutation.isPending}
-                                  >
-                                    <SelectTrigger className="h-8 text-xs" aria-label="Кадрирование">
-                                      <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      <SelectItem value="close_up">Крупный план</SelectItem>
-                                      <SelectItem value="portrait">Портрет</SelectItem>
-                                      <SelectItem value="half_body">По пояс</SelectItem>
-                                      <SelectItem value="full_body">В полный рост</SelectItem>
-                                    </SelectContent>
-                                  </Select>
-                                </div>
-                              </div>
                               <div className="flex flex-wrap items-center gap-2">
                                 <div className="flex items-center rounded-md border border-input">
                                   <Button
@@ -953,10 +925,9 @@ export function TrendsPage() {
           </DialogHeader>
 
           <Tabs value={trendFormTab} onValueChange={setTrendFormTab} className="w-full">
-            <TabsList className="grid w-full grid-cols-4" role="tablist" aria-label="Вкладки формы тренда">
+            <TabsList className="grid w-full grid-cols-3" role="tablist" aria-label="Вкладки формы тренда">
               <TabsTrigger value="basic" role="tab">Основное</TabsTrigger>
               <TabsTrigger value="prompts" role="tab">Промпты</TabsTrigger>
-              <TabsTrigger value="media" role="tab">Медиа</TabsTrigger>
               <TabsTrigger value="preview" role="tab">Превью</TabsTrigger>
             </TabsList>
 
@@ -994,32 +965,17 @@ export function TrendsPage() {
                     aria-required
                   />
                 </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="grid gap-2">
-                    <Label htmlFor="order">Порядок</Label>
-                    <Input
-                      id="order"
-                      type="number"
-                      value={formData.order_index}
-                      onChange={(e) =>
-                        setFormData({ ...formData, order_index: parseInt(e.target.value, 10) || 0 })
-                      }
-                      aria-label="Порядок отображения"
-                    />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label htmlFor="max_images">Макс. изображений</Label>
-                    <Input
-                      id="max_images"
-                      type="number"
-                      value={formData.max_images}
-                      onChange={(e) =>
-                        setFormData({ ...formData, max_images: parseInt(e.target.value, 10) || 1 })
-                      }
-                      min={1}
-                      aria-label="Максимум изображений"
-                    />
-                  </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="order">Порядок</Label>
+                  <Input
+                    id="order"
+                    type="number"
+                    value={formData.order_index}
+                    onChange={(e) =>
+                      setFormData({ ...formData, order_index: parseInt(e.target.value, 10) || 0 })
+                    }
+                    aria-label="Порядок отображения"
+                  />
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="description">Описание</Label>
@@ -1031,6 +987,116 @@ export function TrendsPage() {
                     aria-describedby="description-hint"
                   />
                 </div>
+              </fieldset>
+
+              <fieldset className="space-y-4 rounded-lg border p-4">
+                <legend className="text-sm font-medium px-1">Пример результата</legend>
+                <p className="text-xs text-muted-foreground">
+                  Показывается пользователю в боте после выбора тренда. Форматы: JPG, PNG, WebP.
+                </p>
+                {(editingTrend || isCreating) && (
+                  <>
+                    {editingTrend?.has_example && (
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 min-h-[80px] rounded border bg-muted flex items-center justify-center overflow-hidden">
+                          <TrendExampleThumb
+                            trendId={editingTrend.id}
+                            hasExample={editingTrend.has_example}
+                            refreshKey={mediaRefreshKey}
+                          />
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => deleteExampleMutation.mutate(editingTrend.id)}
+                          disabled={deleteExampleMutation.isPending}
+                          aria-label="Удалить пример"
+                        >
+                          <Trash2 className="h-4 w-4 mr-1" />
+                          Удалить
+                        </Button>
+                      </div>
+                    )}
+                    {isCreating && pendingExampleFile && (
+                      <p className="text-xs text-muted-foreground">
+                        Будет загружено после создания: {pendingExampleFile.name}
+                      </p>
+                    )}
+                    {uploadProgress !== null && (
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-xs text-muted-foreground">
+                          <span>Загрузка...</span>
+                          <span>{uploadProgress}%</span>
+                        </div>
+                        <Progress value={uploadProgress} />
+                      </div>
+                    )}
+                    <div className="flex flex-wrap gap-2">
+                      <input
+                        ref={exampleFileInputRef}
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp"
+                        className="hidden"
+                        aria-hidden
+                        onChange={(e) => {
+                          const file = e.target.files?.[0]
+                          if (file) {
+                            if (editingTrend) {
+                              setUploadProgress(0)
+                              uploadExampleMutation.mutate({
+                                id: editingTrend.id,
+                                file,
+                                onProgress: setUploadProgress,
+                              })
+                            } else {
+                              setPendingExampleFile(file)
+                            }
+                            e.target.value = ''
+                          }
+                        }}
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => exampleFileInputRef.current?.click()}
+                        disabled={uploadExampleMutation.isPending}
+                        aria-label={editingTrend?.has_example ? 'Заменить пример' : 'Загрузить пример'}
+                      >
+                        <ImagePlus className="h-4 w-4 mr-1" />
+                        {editingTrend?.has_example ? 'Заменить пример' : 'Загрузить пример'}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={async () => {
+                          const file = await getImageFileFromClipboard()
+                          if (file) {
+                            if (editingTrend) {
+                              setUploadProgress(0)
+                              uploadExampleMutation.mutate({
+                                id: editingTrend.id,
+                                file,
+                                onProgress: setUploadProgress,
+                              })
+                            } else {
+                              setPendingExampleFile(file)
+                            }
+                          } else {
+                            toast.error('В буфере нет изображения (JPG, PNG, WebP). Скопируйте картинку и попробуйте снова.')
+                          }
+                        }}
+                        disabled={uploadExampleMutation.isPending}
+                        aria-label="Вставить пример из буфера обмена"
+                      >
+                        <ClipboardPaste className="h-4 w-4 mr-1" />
+                        Вставить из буфера
+                      </Button>
+                    </div>
+                  </>
+                )}
               </fieldset>
 
               <fieldset className="space-y-4 rounded-lg border p-4">
@@ -1053,7 +1119,7 @@ export function TrendsPage() {
 
             <TabsContent value="prompts" className="mt-4 space-y-6">
               <p className="rounded-md border border-border/50 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                Один способ ввода — полный промпт с маркерами. На отдельных строках укажите [SCENE], [STYLE], [AVOID], [COMPOSITION], далее текст до следующего маркера. Глобальные блоки [IDENTITY TRANSFER] и дефолт [COMPOSITION] — в{' '}
+                Можно ввести промпт двумя способами: (1) с маркерами [], [STYLE], [AVOID], [COMPOSITION] — текст до следующего маркера ([] — сцена); (2) произвольный текст без маркеров — он целиком уйдёт в сцену. Глобальные блоки [IDENTITY TRANSFER] и дефолт [COMPOSITION] — в{' '}
                 <Link to="/master-prompt" className="underline text-primary">
                   Мастер промпт
                 </Link>
@@ -1069,122 +1135,17 @@ export function TrendsPage() {
                     if (e.target.value.trim()) setShowSceneError(false)
                   }}
                   rows={14}
-                  placeholder={'[SCENE]\nописание сцены, свет, атмосфера...\n\n[STYLE]\n{"style": "cinematic"}\n\n[AVOID]\nчего избегать\n\n[COMPOSITION]\nправила композиции (необязательно)'}
+                  placeholder={'[]\nописание сцены, свет, атмосфера...\n\n[STYLE]\n{"style": "cinematic"}\n\n[AVOID]\nчего избегать\n\n[COMPOSITION]\nправила композиции (необязательно)'}
                   className={cn('font-mono text-sm', showSceneError && 'border-destructive focus-visible:ring-destructive')}
                   aria-invalid={showSceneError}
                   aria-describedby={showSceneError ? 'full_prompt_error' : undefined}
                 />
                 {showSceneError && (
                   <p id="full_prompt_error" className="text-xs text-destructive">
-                    Заполните блок [SCENE].
+                    Заполните блок [] (сцена) или введите произвольный промпт в поле выше.
                   </p>
                 )}
               </div>
-            </TabsContent>
-
-            <TabsContent value="media" className="space-y-4 mt-4">
-              {editingTrend && (
-                <>
-                  <div className="grid gap-2">
-                    <Label>Пример результата</Label>
-                    <p className="text-xs text-muted-foreground">
-                      Показывается пользователю в боте после выбора тренда. Форматы: JPG, PNG, WebP.
-                    </p>
-                    {editingTrend.has_example && (
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 min-h-[80px] rounded border bg-muted flex items-center justify-center overflow-hidden">
-                          <TrendExampleThumb
-                            trendId={editingTrend.id}
-                            hasExample={editingTrend.has_example}
-                            refreshKey={mediaRefreshKey}
-                          />
-                        </div>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => deleteExampleMutation.mutate(editingTrend.id)}
-                          disabled={deleteExampleMutation.isPending}
-                          aria-label="Удалить пример"
-                        >
-                          <Trash2 className="h-4 w-4 mr-1" />
-                          Удалить
-                        </Button>
-                      </div>
-                    )}
-                    {uploadProgress !== null && (
-                      <div className="space-y-1">
-                        <div className="flex justify-between text-xs text-muted-foreground">
-                          <span>Загрузка...</span>
-                          <span>{uploadProgress}%</span>
-                        </div>
-                        <Progress value={uploadProgress} />
-                      </div>
-                    )}
-                    <div className="flex flex-wrap gap-2">
-                      <input
-                        ref={exampleFileInputRef}
-                        type="file"
-                        accept="image/jpeg,image/png,image/webp"
-                        className="hidden"
-                        aria-hidden
-                        onChange={(e) => {
-                          const file = e.target.files?.[0]
-                          if (file && editingTrend) {
-                            setUploadProgress(0)
-                            uploadExampleMutation.mutate({
-                              id: editingTrend.id,
-                              file,
-                              onProgress: setUploadProgress,
-                            })
-                            e.target.value = ''
-                          }
-                        }}
-                      />
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        onClick={() => exampleFileInputRef.current?.click()}
-                        disabled={uploadExampleMutation.isPending}
-                        aria-label={editingTrend.has_example ? 'Заменить пример' : 'Загрузить пример'}
-                      >
-                        <ImagePlus className="h-4 w-4 mr-1" />
-                        {editingTrend.has_example ? 'Заменить пример' : 'Загрузить пример'}
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        onClick={async () => {
-                          if (!editingTrend) return
-                          const file = await getImageFileFromClipboard()
-                          if (file) {
-                            setUploadProgress(0)
-                            uploadExampleMutation.mutate({
-                              id: editingTrend.id,
-                              file,
-                              onProgress: setUploadProgress,
-                            })
-                          } else {
-                            toast.error('В буфере нет изображения (JPG, PNG, WebP). Скопируйте картинку и попробуйте снова.')
-                          }
-                        }}
-                        disabled={uploadExampleMutation.isPending}
-                        aria-label="Вставить пример из буфера обмена"
-                      >
-                        <ClipboardPaste className="h-4 w-4 mr-1" />
-                        Вставить из буфера
-                      </Button>
-                    </div>
-                  </div>
-                </>
-              )}
-              {!editingTrend && (
-                <p className="text-sm text-muted-foreground">
-                  Сохраните тренд, затем откройте редактирование, чтобы загрузить пример.
-                </p>
-              )}
             </TabsContent>
 
             <TabsContent value="preview" className="space-y-4 mt-4">

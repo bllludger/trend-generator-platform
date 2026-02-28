@@ -94,3 +94,4 @@ logs/
 .env
 .env.*.env_test
 .env_test
+backups/

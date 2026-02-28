@@ -27,10 +27,10 @@ class GenerationPromptSettingsService:
         if row:
             return row
         row = GenerationPromptSettings(id=1)
-        row.prompt_input = RECOMMENDED_DEFAULTS["prompt_input"]
-        row.prompt_task = RECOMMENDED_DEFAULTS["prompt_task"]
-        row.prompt_identity_transfer = RECOMMENDED_DEFAULTS["prompt_identity_transfer"]
-        row.safety_constraints = RECOMMENDED_DEFAULTS["safety_constraints"]
+        row.prompt_input = ""
+        row.prompt_task = ""
+        row.prompt_identity_transfer = ""
+        row.safety_constraints = ""
         self.db.add(row)
         self.db.commit()
         self.db.refresh(row)
@@ -46,7 +46,7 @@ class GenerationPromptSettingsService:
             "prompt_input": (row.prompt_input or "").strip() if row.prompt_input_enabled else "",
             "prompt_task": (row.prompt_task or "").strip() if row.prompt_task_enabled else "",
             "prompt_identity_transfer": (row.prompt_identity_transfer or "").strip() if row.prompt_identity_transfer_enabled else "",
-            "safety_constraints": (row.safety_constraints or "no text generation, no chat.").strip() if row.safety_constraints_enabled else "",
+            "safety_constraints": (row.safety_constraints or "").strip() if row.safety_constraints_enabled else "",
             "default_model": (row.default_model or "").strip() or getattr(settings, "gemini_image_model", "gemini-2.5-flash-image"),
             "default_size": (row.default_size or "").strip() or "1024x1024",
             "default_format": (row.default_format or "").strip() or "png",
@@ -90,7 +90,7 @@ class GenerationPromptSettingsService:
             "prompt_task_enabled": bool(row.prompt_task_enabled),
             "prompt_identity_transfer": (row.prompt_identity_transfer or "").strip(),
             "prompt_identity_transfer_enabled": bool(row.prompt_identity_transfer_enabled),
-            "safety_constraints": (row.safety_constraints or "no text generation, no chat.").strip(),
+            "safety_constraints": (row.safety_constraints or "").strip(),
             "safety_constraints_enabled": bool(row.safety_constraints_enabled),
             "default_model": (row.default_model or "gemini-2.5-flash-image").strip(),
             "default_size": (row.default_size or "1024x1024").strip(),

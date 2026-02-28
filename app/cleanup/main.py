@@ -19,6 +19,10 @@ def run_cleanup(
     db: Session = Depends(get_db),
     older_than_hours: int = settings.cleanup_temp_ttl_hours,
 ) -> dict:
+    """
+    Удаляет только временные входные файлы старых завершённых Job (input_local_paths).
+    Результаты генераций, примеры трендов и чеки не удаляются.
+    """
     service = CleanupService(db)
     return service.cleanup_temp_files(older_than_hours)
 

@@ -28,8 +28,24 @@ export interface PlaygroundPromptConfig {
 export interface LogEntry {
   level: string
   message: string
-  timestamp?: string
+  timestamp?: string | number
+  extra?: Record<string, unknown>
   [key: string]: unknown
+}
+
+/** Run log entry from POST /admin/playground/test (snake_case from backend). */
+export interface RunLogEntry {
+  level: string
+  message: string
+  timestamp: number
+  extra?: Record<string, unknown>
+}
+
+export interface PlaygroundTestResponse {
+  image_url?: string
+  error?: string
+  sent_request?: Record<string, unknown>
+  run_log?: RunLogEntry[]
 }
 
 const DEFAULT_CONFIG: PlaygroundPromptConfig = {
@@ -114,14 +130,27 @@ export const playgroundApi = {
   testPrompt: async (
     config: PlaygroundPromptConfig,
     image1?: File
-  ): Promise<{ imageUrl?: string; error?: string }> => {
+  ): Promise<{
+    imageUrl?: string
+    error?: string
+    sent_request?: Record<string, unknown>
+    run_log?: RunLogEntry[]
+  }> => {
     const form = new FormData()
     form.append('config', JSON.stringify(config))
     if (image1) form.append('image1', image1)
-    const r = await api.post<{ image_url?: string; error?: string }>('/admin/playground/test', form, {
+    const r = await api.post<PlaygroundTestResponse>('/admin/playground/test', form, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+      maxContentLength: 10 * 1024 * 1024,
+      maxBodyLength: 10 * 1024 * 1024,
     })
     const d = r.data
-    return { imageUrl: d?.image_url, error: d?.error }
+    return {
+      imageUrl: d?.image_url,
+      error: d?.error,
+      sent_request: d?.sent_request,
+      run_log: d?.run_log,
+    }
   },
 }
