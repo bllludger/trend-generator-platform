@@ -7,11 +7,11 @@ from app.db.base import Base
 
 
 class GenerationPromptSettings(Base):
-    """Одна запись (id=1): 4 блока промпта + дефолты модели."""
+    """Две записи: id=1 (Превью), id=2 (На релиз). 4 блока промпта + дефолты модели."""
 
     __tablename__ = "generation_prompt_settings"
 
-    id = Column(Integer, primary_key=True, default=1)
+    id = Column(Integer, primary_key=True)  # 1 = preview, 2 = release
     # Блоки [INPUT], [TASK], [IDENTITY TRANSFER], [SAFETY]
     prompt_input = Column(Text, nullable=False, default="")
     prompt_input_enabled = Column(Boolean, nullable=False, default=True)

@@ -17,13 +17,13 @@ def build_unlock_markup(
 ) -> dict[str, Any]:
     """
     Собрать inline_keyboard для кнопок разблокировки.
-    show_hd_credits добавляет кнопку «За HD credit» (реферальные бонусы).
+    show_hd_credits добавляет кнопку «За бонус 4K» (реферальные бонусы).
     """
     rows: list[list[dict[str, Any]]] = []
     if show_hd_credits:
         rows.append([
             {
-                "text": "🎁 За HD credit",
+                "text": "🎁 За бонус 4K",
                 "callback_data": f"unlock_hd:{job_id}",
             }
         ])

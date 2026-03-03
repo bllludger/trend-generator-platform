@@ -9,6 +9,7 @@ from app.core.config import settings
 
 
 def get_min_pack_stars() -> int:
+    """Minimum pack price in Stars for referral bonus (Neo Start = 153)."""
     return settings.referral_min_pack_stars
 
 
@@ -29,13 +30,13 @@ def get_monthly_limit() -> int:
 
 
 def get_bonus_ladder() -> dict[int, int]:
-    """Return {min_stars: hd_credits} sorted descending by stars."""
+    """Return {min_stars: credits_4k}. Thresholds align with Neo plans: 153 (Neo Start), 538 (Neo Pro), 1531 (Neo Unlimited)."""
     raw = json.loads(settings.referral_bonus_ladder)
     return {int(k): int(v) for k, v in raw.items()}
 
 
 def calc_bonus_credits(pack_stars: int) -> int:
-    """Determine HD credits for a given pack price using the bonus ladder."""
+    """Credits (4K) for the referrer from the bonus ladder by pack price in Stars (Neo plan tiers)."""
     ladder = get_bonus_ladder()
     result = 0
     for threshold in sorted(ladder.keys()):

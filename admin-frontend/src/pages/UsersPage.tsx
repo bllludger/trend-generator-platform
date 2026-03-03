@@ -413,21 +413,29 @@ export function UsersPage() {
                 <ul className="space-y-2">
                   {analytics.top_users.slice(0, 5).map((user: any, idx: number) => (
                     <li
-                      key={user.telegram_id}
+                      key={user.telegram_id ?? idx}
                       className="flex items-center justify-between rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5 transition-colors hover:bg-muted/50"
                     >
                       <div className="flex items-center gap-3">
                         <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10 text-sm font-bold text-primary">
                           {idx + 1}
                         </div>
-                        <div>
-                          <p className="font-mono text-sm font-medium">{user.telegram_id}</p>
+                        <div className="min-w-0">
+                          <p className="truncate font-medium text-foreground">
+                            {user.user_display_name ?? user.telegram_id ?? '—'}
+                          </p>
+                          {user.telegram_id && (user.user_display_name !== user.telegram_id) && (
+                            <p className="font-mono text-xs text-muted-foreground">{user.telegram_id}</p>
+                          )}
                           <p className="text-xs text-muted-foreground">
                             {user.jobs_count} задач · {user.succeeded} успешно
+                            {(user.failed ?? 0) > 0 && (
+                              <span className="text-red-600 dark:text-red-400"> · {user.failed} ошибок</span>
+                            )}
                           </p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex shrink-0 items-center gap-2">
                         {user.subscription_active && (
                           <Badge variant="success" className="text-xs">
                             <Crown className="mr-1 h-3 w-3" />
@@ -435,7 +443,7 @@ export function UsersPage() {
                           </Badge>
                         )}
                         <Badge variant="outline" className="text-xs">
-                          {user.token_balance} токенов
+                          {user.token_balance ?? 0} токенов
                         </Badge>
                       </div>
                     </li>

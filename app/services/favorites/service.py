@@ -104,6 +104,16 @@ class FavoriteService:
         self.db.flush()
         return True
 
+    def clear_all_for_user(self, user_id: str) -> int:
+        """Удалить все избранные пользователя, кроме уже выданных 4K. Возвращает количество удалённых."""
+        deleted = (
+            self.db.query(Favorite)
+            .filter(Favorite.user_id == user_id, Favorite.hd_status != "delivered")
+            .delete(synchronize_session="fetch")
+        )
+        self.db.flush()
+        return deleted
+
     def list_favorites(self, session_id: str) -> list[Favorite]:
         return (
             self.db.query(Favorite)
@@ -141,14 +151,19 @@ class FavoriteService:
         return True
 
     def mark_hd_delivered(self, favorite_id: str, hd_path: str) -> bool:
-        """Set hd_status='delivered'. Idempotent — returns True if already delivered."""
+        """Set hd_status='delivered'. Idempotent — returns True if already delivered. Сбрасывает selected_for_hd."""
         fav = self.get_favorite(favorite_id)
         if not fav:
             return False
         if fav.hd_status == "delivered":
+            if fav.selected_for_hd:
+                fav.selected_for_hd = False
+                self.db.add(fav)
+                self.db.flush()
             return True
         fav.hd_status = "delivered"
         fav.hd_path = hd_path
+        fav.selected_for_hd = False
         self.db.add(fav)
         self.db.flush()
         return True

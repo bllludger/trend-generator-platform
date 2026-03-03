@@ -15,18 +15,25 @@ RECOMMENDED_DEFAULTS = {
 }
 
 
+PROFILE_PREVIEW = 1
+PROFILE_RELEASE = 2
+
+
 class GenerationPromptSettingsService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def get(self) -> GenerationPromptSettings | None:
-        return self.db.query(GenerationPromptSettings).filter(GenerationPromptSettings.id == 1).first()
+    def get_row(self, row_id: int) -> GenerationPromptSettings | None:
+        return self.db.query(GenerationPromptSettings).filter(GenerationPromptSettings.id == row_id).first()
 
-    def get_or_create(self) -> GenerationPromptSettings:
-        row = self.get()
+    def get(self) -> GenerationPromptSettings | None:
+        return self.get_row(PROFILE_PREVIEW)
+
+    def get_or_create_row(self, row_id: int) -> GenerationPromptSettings:
+        row = self.get_row(row_id)
         if row:
             return row
-        row = GenerationPromptSettings(id=1)
+        row = GenerationPromptSettings(id=row_id)
         row.prompt_input = ""
         row.prompt_task = ""
         row.prompt_identity_transfer = ""
@@ -36,10 +43,20 @@ class GenerationPromptSettingsService:
         self.db.refresh(row)
         return row
 
-    def get_effective(self) -> dict[str, Any]:
-        """Для воркера: только включённые блоки и дефолты."""
+    def get_preview(self) -> GenerationPromptSettings:
+        return self.get_or_create_row(PROFILE_PREVIEW)
+
+    def get_release(self) -> GenerationPromptSettings:
+        return self.get_or_create_row(PROFILE_RELEASE)
+
+    def get_or_create(self) -> GenerationPromptSettings:
+        return self.get_preview()
+
+    def get_effective(self, profile: str = "release") -> dict[str, Any]:
+        """Для воркера: только включённые блоки и дефолты. profile='release' (id=2) или 'preview' (id=1)."""
+        row_id = PROFILE_RELEASE if profile == "release" else PROFILE_PREVIEW
         try:
-            row = self.get_or_create()
+            row = self.get_or_create_row(row_id)
         except Exception:
             return self._default_effective()
         return {
@@ -76,11 +93,17 @@ class GenerationPromptSettingsService:
         }
 
     def as_dict(self) -> dict[str, Any]:
+        """Возвращает оба профиля: preview (id=1) и release (id=2)."""
         try:
-            row = self.get_or_create()
+            preview = self.get_or_create_row(PROFILE_PREVIEW)
+            release = self.get_or_create_row(PROFILE_RELEASE)
         except Exception:
-            return self._default_as_dict()
-        return self._row_to_dict(row)
+            d = self._default_as_dict()
+            return {"preview": d, "release": dict(d)}
+        return {
+            "preview": self._row_to_dict(preview),
+            "release": self._row_to_dict(release),
+        }
 
     def _row_to_dict(self, row: GenerationPromptSettings) -> dict[str, Any]:
         return {
@@ -120,8 +143,7 @@ class GenerationPromptSettingsService:
             "updated_at": None,
         }
 
-    def update(self, data: dict[str, Any]) -> dict[str, Any]:
-        row = self.get_or_create()
+    def _apply_row_data(self, row: GenerationPromptSettings, data: dict[str, Any]) -> None:
         for key in ("prompt_input", "prompt_task", "prompt_identity_transfer", "safety_constraints"):
             if key in data:
                 setattr(row, key, "" if data[key] is None else str(data[key]))
@@ -148,12 +170,22 @@ class GenerationPromptSettingsService:
                 row.default_aspect_ratio = ar
         row.updated_at = datetime.now(timezone.utc)
         self.db.add(row)
+
+    def update(self, data: dict[str, Any]) -> dict[str, Any]:
+        if "preview" in data:
+            row = self.get_or_create_row(PROFILE_PREVIEW)
+            self._apply_row_data(row, data["preview"])
+        if "release" in data:
+            row = self.get_or_create_row(PROFILE_RELEASE)
+            self._apply_row_data(row, data["release"])
+        if "preview" not in data and "release" not in data:
+            row = self.get_or_create_row(PROFILE_PREVIEW)
+            self._apply_row_data(row, data)
         self.db.commit()
-        self.db.refresh(row)
-        return self._row_to_dict(row)
+        return self.as_dict()
 
     def reset_to_recommended(self) -> dict[str, Any]:
-        row = self.get_or_create()
+        row = self.get_or_create_row(PROFILE_PREVIEW)
         row.prompt_input = RECOMMENDED_DEFAULTS["prompt_input"]
         row.prompt_task = RECOMMENDED_DEFAULTS["prompt_task"]
         row.prompt_identity_transfer = RECOMMENDED_DEFAULTS["prompt_identity_transfer"]

@@ -32,7 +32,7 @@ PURCHASE_RATE_LIMIT = 3  # макс покупок за окно
 PURCHASE_RATE_WINDOW = 60  # секунд
 
 # Единственные SKU в продаже (product ladder). Остальные пакеты не показывать и не принимать в paywall/bank.
-PRODUCT_LADDER_IDS = ("trial", "avatar_pack", "dating_pack", "creator")
+PRODUCT_LADDER_IDS = ("trial", "neo_start", "neo_pro", "neo_unlimited")
 
 
 class PaymentService:
@@ -96,6 +96,19 @@ class PaymentService:
                     self.db.add(Pack(
                         id=pid, name=pname, emoji=pemoji, tokens=ptokens,
                         stars_price=pstars, description=pdesc, order_index=pidx, enabled=True,
+                    ))
+                    self.db.flush()
+                    logger.info(f"{pid}_pack_added", extra={"reason": "missing_in_existing_db"})
+            for pid, pname, pemoji, pstars, pdesc, pidx, ptakes, phd in [
+                ("neo_start", "Neo Start", "🚀", 153, "10 образов + 10 4K без watermark", 1, 10, 10),
+                ("neo_pro", "Neo Pro", "⭐", 538, "40 образов + 40 4K без watermark", 2, 40, 40),
+                ("neo_unlimited", "Neo Unlimited", "👑", 1531, "120 образов + 120 4K без watermark", 3, 120, 120),
+            ]:
+                if self.get_pack(pid) is None:
+                    self.db.add(Pack(
+                        id=pid, name=pname, emoji=pemoji, tokens=0,
+                        stars_price=pstars, description=pdesc, order_index=pidx, enabled=True,
+                        takes_limit=ptakes, hd_amount=phd, pack_type="session",
                     ))
                     self.db.flush()
                     logger.info(f"{pid}_pack_added", extra={"reason": "missing_in_existing_db"})

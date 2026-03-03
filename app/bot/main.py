@@ -48,10 +48,15 @@ from app.models.user import User
 from app.models.job import Job
 from app.models.bank_transfer_receipt_log import BankTransferReceiptLog
 from app.paywall import record_unlock as paywall_record_unlock
+from app.referral.config import get_min_pack_stars
 from app.referral.service import ReferralService
 from app.services.telegram_messages.runtime import runtime_templates
+from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
 from app.utils.currency import format_stars_rub
-from app.services.balance_tariffs import build_balance_tariffs_message
+from app.utils.telegram_photo import path_for_telegram_photo
+from app.constants import AUDIENCE_COUPLES, AUDIENCE_MEN, AUDIENCE_WOMEN, audience_in_target_audiences
+from app.utils.image_formats import ASPECT_RATIO_TO_SIZE
+from app.services.balance_tariffs import build_balance_tariffs_message, _pack_outcome_label
 from app.services.sessions.service import SessionService
 from app.services.takes.service import TakeService
 from app.services.favorites.service import FavoriteService
@@ -59,6 +64,8 @@ from app.services.hd_balance.service import HDBalanceService
 from app.services.compensations.service import CompensationService
 from app.models.pack import Pack
 from app.models.session import Session as SessionModel
+from app.models.take import Take as TakeModel
+from app.models.trend import Trend as TrendModel
 
 configure_logging()
 logger = logging.getLogger("bot")
@@ -70,6 +77,15 @@ def t(key: str, default: str) -> str:
 
 def tr(key: str, default: str, **variables: Any) -> str:
     return runtime_templates.render(key, default, **variables)
+
+
+def _escape_markdown(s: str) -> str:
+    """Экранировать символы для parse_mode='Markdown' (Telegram), чтобы * _ ` [ не ломали разбор."""
+    if not s:
+        return s
+    for char, replacement in (("\\", "\\\\"), ("*", "\\*"), ("_", "\\_"), ("`", "\\`"), ("[", "\\[")):
+        s = s.replace(char, replacement)
+    return s
 
 
 def _resolve_trend_example_path(stored_path: str | None, trend_id: str) -> str | None:
@@ -86,8 +102,14 @@ def _resolve_trend_example_path(stored_path: str | None, trend_id: str) -> str |
     return None
 
 
-# Welcome banner for /start
-WELCOME_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "welcome.png")
+# Welcome banner for /start (image/start_page.png в корне проекта)
+_BOT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_IMAGE_DIR = os.path.join(_BOT_ROOT, "..", "..", "image")
+WELCOME_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "start_page.png")
+# Картинка к экрану «Выбор фотосессии» (баланс + тарифы)
+MONEY_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "money2.png")
+# Картинка к экрану «Загрузи своё фото» (правила для идеального кадра)
+RULE_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "rule.png")
 WELCOME_TEXT_DEFAULT = (
     "👋 Nano Banana — ИИ фотостудия\n\n"
     "Это просто фото.\n"
@@ -97,16 +119,16 @@ WELCOME_TEXT_DEFAULT = (
     "👇 Попробовать бесплатно"
 )
 
-# Image format options (aspect ratio -> size for providers)
-IMAGE_FORMATS = {
-    "1:1": "1024x1024",      # Квадрат
-    "16:9": "1024x576",      # Широкий
-    "4:3": "1024x768",       # Классика
-    "9:16": "576x1024",      # Портрет
-    "3:4": "768x1024",       # Вертикальный
-}
+# Image format options (aspect ratio -> size); общий маппинг с app.utils.image_formats
+IMAGE_FORMATS = ASPECT_RATIO_TO_SIZE
 TREND_CUSTOM_ID = "custom"  # Special ID for "Своя идея"
 TRENDS_PER_PAGE = 6  # Трендов на одной странице внутри тематики
+# Отбивка для ЦА «Мужчина» (тренды пока не поддерживаются)
+AUDIENCE_MEN_OFFRAMP_TEXT = (
+    "Извините, мы пока не работаем с мужскими профилями. "
+    "Скоро добавим тренды для мужчин.\n\n"
+    "Подпишитесь на канал, чтобы первыми узнать о запуске."
+)
 THEME_CB_PREFIX = "theme:"  # callback_data: theme:{id} или theme:{id}:{page}
 NAV_THEMES = "nav:themes"   # Назад к тематикам
 
@@ -319,6 +341,7 @@ def get_db_session() -> Generator[Session, None, None]:
 # FSM States (2026 flow: photo → trend/idea → format → generate)
 # ===========================================
 class BotStates(StatesGroup):
+    waiting_for_audience = State()        # Step 0: выбор ЦА (Женщина/Мужчина/Пара)
     waiting_for_photo = State()           # Step 1: upload photo
     waiting_for_trend = State()           # Step 2: select trend or "Своя идея"
     waiting_for_prompt = State()          # Step 2b: if "Своя идея" — user's text prompt
@@ -425,17 +448,42 @@ def copy_photos_choice_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _get_default_aspect_ratio() -> str:
+    """Дефолтный формат кадра из админки (Мастер промпт → На релиз → default_aspect_ratio)."""
+    try:
+        with get_db_session() as db:
+            effective = GenerationPromptSettingsService(db).get_effective(profile="release")
+            return (effective.get("default_aspect_ratio") or "1:1").strip()
+    except Exception:
+        return "1:1"
+
+
+def _format_button_label(key: str, default_ar: str) -> str:
+    """Текст кнопки формата; для дефолтного с админки добавляем « (по умолч.)»."""
+    labels = {
+        "1:1": t("format.btn.1_1", "1:1 Квадрат"),
+        "16:9": t("format.btn.16_9", "16:9 Широкий"),
+        "4:3": t("format.btn.4_3", "4:3 Классика"),
+        "9:16": t("format.btn.9_16", "9:16 Портрет"),
+        "3:4": t("format.btn.3_4", "3:4 Вертикальный"),
+    }
+    base = labels.get(key, key)
+    return f"{base} (по умолч.)" if key == default_ar else base
+
+
 def format_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора формата кадра. Дефолт из админки помечается « (по умолч.)»; выбор пользователя приоритетный."""
+    default_ar = _get_default_aspect_ratio()
     buttons = [
         [
-            InlineKeyboardButton(text=t("format.btn.1_1", "1:1 Квадрат"), callback_data="format:1:1"),
-            InlineKeyboardButton(text=t("format.btn.16_9", "16:9 Широкий"), callback_data="format:16:9"),
+            InlineKeyboardButton(text=_format_button_label("1:1", default_ar), callback_data="format:1:1"),
+            InlineKeyboardButton(text=_format_button_label("16:9", default_ar), callback_data="format:16:9"),
         ],
         [
-            InlineKeyboardButton(text=t("format.btn.4_3", "4:3 Классика 🔥"), callback_data="format:4:3"),
-            InlineKeyboardButton(text=t("format.btn.9_16", "9:16 Портрет"), callback_data="format:9:16"),
+            InlineKeyboardButton(text=_format_button_label("4:3", default_ar), callback_data="format:4:3"),
+            InlineKeyboardButton(text=_format_button_label("9:16", default_ar), callback_data="format:9:16"),
         ],
-        [InlineKeyboardButton(text=t("format.btn.3_4", "3:4 Вертикальный"), callback_data="format:3:4")],
+        [InlineKeyboardButton(text=_format_button_label("3:4", default_ar), callback_data="format:3:4")],
         [
             InlineKeyboardButton(text=t("nav.btn.back_to_trends", "⬅️ Назад к трендам"), callback_data="nav:trends"),
             InlineKeyboardButton(text=t("nav.btn.menu", "📋 В меню"), callback_data="nav:menu"),
@@ -629,18 +677,37 @@ async def cmd_start(message: Message, state: FSMContext):
 
         await state.clear()
         welcome_text = t("start.welcome_text", WELCOME_TEXT_DEFAULT)
+        welcome_sent = False
         if os.path.exists(WELCOME_IMAGE_PATH):
-            await message.answer_photo(
-                photo=FSInputFile(WELCOME_IMAGE_PATH),
-                caption=welcome_text,
-                reply_markup=main_menu_keyboard(),
-            )
-        else:
+            try:
+                photo_path, is_temp = path_for_telegram_photo(WELCOME_IMAGE_PATH)
+                await message.answer_photo(
+                    photo=FSInputFile(photo_path),
+                    caption=welcome_text,
+                    reply_markup=main_menu_keyboard(),
+                )
+                welcome_sent = True
+                if is_temp and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning("start_welcome_photo_failed", extra={"path": WELCOME_IMAGE_PATH, "error": str(e)})
+        if not welcome_sent:
+            if not os.path.exists(WELCOME_IMAGE_PATH):
+                logger.warning("start_welcome_image_not_found", extra={"path": WELCOME_IMAGE_PATH})
             await message.answer(welcome_text, reply_markup=main_menu_keyboard())
         logger.info("start", extra={"user_id": telegram_id})
     except Exception:
         logger.exception("Error in cmd_start", extra={"user_id": telegram_id})
-        await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
+        try:
+            await message.answer(
+                t("start.welcome_text", WELCOME_TEXT_DEFAULT),
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception:
+            await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
 
 
 @router.callback_query(F.data == SUBSCRIPTION_CALLBACK)
@@ -691,13 +758,26 @@ async def subscription_check(callback: CallbackQuery, state: FSMContext, bot: Bo
                     return
 
         welcome_text = t("start.welcome_text", WELCOME_TEXT_DEFAULT)
+        welcome_sent = False
         if os.path.exists(WELCOME_IMAGE_PATH):
-            await callback.message.answer_photo(
-                photo=FSInputFile(WELCOME_IMAGE_PATH),
-                caption=welcome_text,
-                reply_markup=main_menu_keyboard(),
-            )
-        else:
+            try:
+                photo_path, is_temp = path_for_telegram_photo(WELCOME_IMAGE_PATH)
+                await callback.message.answer_photo(
+                    photo=FSInputFile(photo_path),
+                    caption=welcome_text,
+                    reply_markup=main_menu_keyboard(),
+                )
+                welcome_sent = True
+                if is_temp and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning("start_welcome_photo_failed", extra={"path": WELCOME_IMAGE_PATH, "error": str(e)})
+        if not welcome_sent:
+            if not os.path.exists(WELCOME_IMAGE_PATH):
+                logger.warning("start_welcome_image_not_found", extra={"path": WELCOME_IMAGE_PATH})
             await callback.message.answer(welcome_text, reply_markup=main_menu_keyboard())
         await callback.answer(t("subscription.done", "Спасибо! Добро пожаловать."))
     except Exception as e:
@@ -708,33 +788,45 @@ async def subscription_check(callback: CallbackQuery, state: FSMContext, bot: Bo
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     """Handle /help command."""
-    await message.answer(
-        tr("help.main_text", HELP_TEXT_DEFAULT, max_file_size_mb=settings.max_file_size_mb),
-        parse_mode="Markdown",
-    )
+    try:
+        await message.answer(
+            tr("help.main_text", HELP_TEXT_DEFAULT, max_file_size_mb=settings.max_file_size_mb),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Error in cmd_help")
+        await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
 
 
 @router.message(Command("trends"))
 async def cmd_trends(message: Message):
     """Legacy: trends are shown after photo upload."""
-    await message.answer(
-        t("flow.send_photo_first", "Сначала отправьте фото — после этого появятся тренды на выбор."),
-        reply_markup=main_menu_keyboard(),
-    )
+    try:
+        await message.answer(
+            t("flow.send_photo_first", "Сначала отправьте фото — после этого появятся тренды на выбор."),
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        logger.exception("Error in cmd_trends")
+        await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     """Handle /cancel command."""
-    await state.clear()
-    await message.answer(
-        tr(
-            "flow.cancelled",
-            "❌ Выбор отменён.\n\nНажмите «{create_btn}» чтобы начать заново.",
-            create_btn=t("menu.btn.create_photo", "🔥 Создать фото"),
-        ),
-        reply_markup=main_menu_keyboard(),
-    )
+    try:
+        await state.clear()
+        await message.answer(
+            tr(
+                "flow.cancelled",
+                "❌ Выбор отменён.\n\nНажмите «{create_btn}» чтобы начать заново.",
+                create_btn=t("menu.btn.create_photo", "🔥 Создать фото"),
+            ),
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        logger.exception("Error in cmd_cancel")
+        await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
 
 
 # --- Мой профиль (баланс, бесплатные генерации) ---
@@ -746,6 +838,8 @@ async def my_profile(message: Message):
         with get_db_session() as db:
             user_service = UserService(db)
             sec_svc = SecuritySettingsService(db)
+            session_svc = SessionService(db)
+            hd_svc = HDBalanceService(db)
             user = user_service.get_by_telegram_id(telegram_id)
             if not user:
                 user = user_service.get_or_create_user(
@@ -766,27 +860,45 @@ async def my_profile(message: Message):
             hd_credits = getattr(user, "hd_credits_balance", 0)
             show_referral = getattr(user, "has_purchased_hd", False)
 
-        text = (
-            t("profile.title", "👤 *Мой профиль*")
-            + "\n\n"
-            + tr(
-                "profile.body",
-                "🆓 *Бесплатные превью:* {free_left} из {free_limit}\n"
-                "🔄 *«Сделать такую же»:* {copy_left} из {copy_limit}\n"
-                "💰 *Баланс генераций:* {token_balance}\n"
-                "📊 *Всего куплено:* {total_purchased}\n\n"
-                "Бесплатные генерации дают превью с watermark.\n"
-                "Купите пакет — получайте фото в полном качестве!",
-                free_left=free_left,
-                free_limit=free_limit,
-                copy_left=copy_left,
-                copy_limit=copy_limit,
-                token_balance=token_balance,
-                total_purchased=total_purchased,
+            active_session = session_svc.get_active_session(user.id)
+            plan_name = None
+            remaining_takes = 0
+            total_takes = 0
+            hd_balance_total = 0
+            if active_session:
+                _pack = db.query(Pack).filter(Pack.id == active_session.pack_id).one_or_none()
+                plan_name = _pack.name if _pack else active_session.pack_id
+                remaining_takes = active_session.takes_limit - active_session.takes_used
+                total_takes = active_session.takes_limit
+                hd_balance_total = hd_svc.get_balance(user)["total"]
+
+        text = t("profile.title", "👤 *Мой профиль*") + "\n\n"
+        if plan_name:
+            plan_safe = _escape_markdown(str(plan_name))
+            text += (
+                f"📦 *Текущий план:* {plan_safe}\n"
+                f"📸 *Осталось снимков:* {remaining_takes} из {total_takes}\n"
+                f"🖼 *4K без watermark:* {hd_balance_total}\n\n"
             )
+        else:
+            text += "📦 *Текущий план:* Нет активного плана\n\n"
+        text += tr(
+            "profile.body",
+            "🆓 *Бесплатные превью:* {free_left} из {free_limit}\n"
+            "🔄 *«Сделать такую же»:* {copy_left} из {copy_limit}\n"
+            "💰 *Баланс генераций:* {token_balance}\n"
+            "📊 *Всего куплено:* {total_purchased}\n\n"
+            "Бесплатные генерации дают превью с watermark.\n"
+            "Купите пакет — получайте фото в полном качестве!",
+            free_left=free_left,
+            free_limit=free_limit,
+            copy_left=copy_left,
+            copy_limit=copy_limit,
+            token_balance=token_balance,
+            total_purchased=total_purchased,
         )
         if hd_credits > 0:
-            text += f"\n\n🎁 *HD credits:* {hd_credits}"
+            text += f"\n\n🎁 *Бонусы 4K:* {hd_credits}"
 
         buttons = [
             [InlineKeyboardButton(text=t("profile.btn.top_up", "🛒 Выбрать фотосессию"), callback_data="shop:open")],
@@ -832,15 +944,18 @@ async def referral_invite(callback: CallbackQuery):
 
         bot_username = settings.telegram_bot_username
         link = f"https://t.me/{bot_username}?start=ref_{code}" if bot_username else f"ref_{code}"
+        min_stars = get_min_pack_stars()
+        rate = getattr(settings, "star_to_rub", 1.3)
+        min_price_str = format_stars_rub(min_stars, rate)
 
         text = (
             "💌 *Пригласи подругу — получи бонус на фотосессию*\n\n"
             f"Твоя персональная ссылка:\n`{link}`\n\n"
             "📌 *Условия:*\n"
-            "• Бонус начислим, когда подруга купит пакет от 249⭐\n"
+            f"• Бонус начислим, когда подруга купит пакет от {min_price_str}\n"
             "• Бонус станет доступен через 12–24 часа\n"
             "• Работает для новых пользователей\n\n"
-            "Поделись ссылкой — получи HD credits!"
+            "Поделись ссылкой — получи бонусы 4K!"
         )
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -907,14 +1022,14 @@ async def referral_status(callback: CallbackQuery):
             "📊 *Реферальная программа*\n\n"
             f"👥 Приглашено: {stats['attributed']}\n"
             f"💰 Купили пакет: {stats['bought']}\n\n"
-            f"🎁 *HD credits:*\n"
+            f"🎁 *Бонусы 4K:*\n"
             f"  Доступно: {stats['available']}\n"
             f"  В ожидании: {stats['pending']}\n"
             f"  Потрачено: {stats['spent']}\n"
         )
         if hd_debt > 0:
             text += f"  ⚠️ Долг: {hd_debt}\n"
-        text += "\nHD credits можно использовать при разблокировке фото."
+        text += "\nБонусы 4K можно использовать при разблокировке фото."
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💌 Пригласить ещё", callback_data="referral:invite")],
@@ -935,12 +1050,16 @@ async def referral_status(callback: CallbackQuery):
 async def referral_back_to_profile(callback: CallbackQuery):
     """Return to profile from referral screen."""
     try:
-        await callback.message.delete()
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        fake_msg = callback.message
+        fake_msg.from_user = callback.from_user
+        await my_profile(fake_msg)
     except Exception:
-        pass
-    fake_msg = callback.message
-    fake_msg.from_user = callback.from_user
-    await my_profile(fake_msg)
+        logger.exception("Error in referral_back_to_profile")
+        await callback.message.answer(t("errors.profile_load", "Ошибка загрузки профиля."), reply_markup=main_menu_keyboard())
     await callback.answer()
 
 
@@ -957,36 +1076,126 @@ REQUEST_PHOTO_TEXT_DEFAULT = (
 )
 
 
+def audience_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора ЦА: Женщина, Мужчина, Пара."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=t("audience.women", "👩 Женщина"), callback_data="audience:women"),
+            InlineKeyboardButton(text=t("audience.men", "👨 Мужчина"), callback_data="audience:men"),
+        ],
+        [InlineKeyboardButton(text=t("audience.couples", "👫 Пара"), callback_data="audience:couples")],
+    ])
+
+
 @router.message(lambda m: (m.text or "").strip() == t("menu.btn.create_photo", "🔥 Создать фото"))
 async def request_photo(message: Message, state: FSMContext, bot: Bot):
-    """User clicks 'Upload photo' button."""
-    await state.set_state(BotStates.waiting_for_photo)
-    sent = await message.answer(
-        t("flow.request_photo", REQUEST_PHOTO_TEXT_DEFAULT),
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(),
-    )
-    await state.update_data(last_bot_message_id=sent.message_id)
+    """User clicks 'Create photo' → сначала выбор ЦА, затем запрос фото."""
+    try:
+        await state.set_state(BotStates.waiting_for_audience)
+        sent = await message.answer(
+            t("audience.prompt", "Для кого создаём образ?"),
+            reply_markup=audience_keyboard(),
+        )
+        await state.update_data(last_bot_message_id=sent.message_id)
+    except Exception:
+        logger.exception("Error in request_photo")
+        await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), reply_markup=main_menu_keyboard())
+
+
+@router.callback_query(F.data.startswith("audience:"))
+async def on_audience_selected(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Выбор ЦА: сохраняем в state, логируем audit, переходим к запросу фото."""
+    audience = callback.data.replace("audience:", "").strip().lower()
+    if audience not in (AUDIENCE_WOMEN, AUDIENCE_MEN, AUDIENCE_COUPLES):
+        await callback.answer()
+        return
+    try:
+        await state.update_data(audience_type=audience)
+        await state.set_state(BotStates.waiting_for_photo)
+        await callback.answer()
+
+        telegram_id = str(callback.from_user.id) if callback.from_user else None
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    AuditService(db).log(
+                        actor_type="user",
+                        actor_id=telegram_id,
+                        action="audience_selected",
+                        entity_type="user",
+                        entity_id=telegram_id,
+                        payload={"audience": audience},
+                    )
+            except Exception as e:
+                logger.warning("Audit audience_selected failed: %s", e)
+
+        audience_label = {"women": "Женщина", "men": "Мужчина", "couples": "Пара"}.get(audience, audience)
+        request_text = t("flow.request_photo", REQUEST_PHOTO_TEXT_DEFAULT)
+        if os.path.exists(RULE_IMAGE_PATH):
+            try:
+                await callback.message.delete()
+                photo_path, is_temp = path_for_telegram_photo(RULE_IMAGE_PATH)
+                sent = await callback.message.answer_photo(
+                    photo=FSInputFile(photo_path),
+                    caption=request_text,
+                    parse_mode="HTML",
+                )
+                if is_temp and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning("rule_photo_failed", extra={"path": RULE_IMAGE_PATH, "error": str(e)})
+                sent = await callback.message.answer(request_text, parse_mode="HTML")
+        else:
+            await callback.message.edit_text(request_text, parse_mode="HTML")
+            sent = None
+        if sent is None:
+            sent = await callback.message.answer(
+                t("audience.selected_then_upload", "Выбрано: {audience}. Отправьте фото или нажмите «🔥 Создать фото».").replace("{audience}", audience_label),
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            sent = await callback.message.answer(
+                t("audience.selected_then_upload", "Выбрано: {audience}. Отправьте фото или нажмите «🔥 Создать фото».").replace("{audience}", audience_label),
+                reply_markup=main_menu_keyboard(),
+            )
+        await state.update_data(last_bot_message_id=sent.message_id)
+    except Exception:
+        logger.exception("Error in on_audience_selected")
+        await callback.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), show_alert=True)
+        try:
+            await callback.message.answer(
+                t("nav.upload_photo_or_btn", "Отправьте фото или нажмите «🔥 Создать фото»."),
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception:
+            pass
 
 
 # --- "Сделать такую же" flow ---
 @router.message(lambda m: (m.text or "").strip() == t("menu.btn.copy_style", "🔄 Сделать такую же"))
 async def start_copy_flow(message: Message, state: FSMContext, bot: Bot):
     """Начало флоу копирования стиля 1:1."""
-    await state.set_state(BotStates.waiting_for_reference_photo)
-    sent = await message.answer(
-        t(
-            "copy.start_text",
-            "🔄 *Сделать такую же*\n\n"
-            "Я могу скопировать 1:1 любой тренд.\n\n"
-            "Загрузи картинку-образец в хорошем качестве — "
-            "я изучу дизайн и подскажу, как сделать такую же.\n\n"
-            "Поддерживаются: JPG, PNG, WEBP.",
-        ),
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(),
-    )
-    await state.update_data(last_bot_message_id=sent.message_id)
+    try:
+        await state.set_state(BotStates.waiting_for_reference_photo)
+        sent = await message.answer(
+            t(
+                "copy.start_text",
+                "🔄 *Сделать такую же*\n\n"
+                "Я могу скопировать 1:1 любой тренд.\n\n"
+                "Загрузи картинку-образец в хорошем качестве — "
+                "я изучу дизайн и подскажу, как сделать такую же.\n\n"
+                "Поддерживаются: JPG, PNG, WEBP.",
+            ),
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+        await state.update_data(last_bot_message_id=sent.message_id)
+    except Exception:
+        logger.exception("Error in start_copy_flow")
+        await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), reply_markup=main_menu_keyboard())
 
 
 @router.message(BotStates.waiting_for_reference_photo, F.photo)
@@ -1061,6 +1270,7 @@ async def handle_reference_photo_as_document(message: Message, state: FSMContext
     """Принимаем референс, отправленный как файл (документ) — тот же флоу, что и фото."""
     doc = message.document
     if not doc:
+        await message.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."))
         return
     ext = _document_image_ext(doc.mime_type, doc.file_name)
     if not ext:
@@ -1234,6 +1444,7 @@ async def handle_self_photo_as_document_for_copy(message: Message, state: FSMCon
     """Принимаем своё фото (1-е или единственное), отправленное как документ."""
     doc = message.document
     if not doc:
+        await message.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."))
         return
     ext = _document_image_ext(doc.mime_type, doc.file_name)
     if not ext:
@@ -1366,6 +1577,7 @@ async def handle_self_photo_2_as_document_for_copy(message: Message, state: FSMC
     """Принимаем второе фото как документ в флоу «2 фотографии»."""
     doc = message.document
     if not doc:
+        await message.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."))
         return
     ext = _document_image_ext(doc.mime_type, doc.file_name)
     if not ext:
@@ -1565,13 +1777,23 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                 )
                 return
 
+        data_early = await state.get_data()
+        audience = (data_early.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
+        if audience == AUDIENCE_MEN:
+            await message.answer(
+                t("audience.men_offramp", AUDIENCE_MEN_OFFRAMP_TEXT),
+                reply_markup=main_menu_keyboard(),
+            )
+            await state.clear()
+            return
+
         # Validate photo
         photo = message.photo[-1]
         _, ext = os.path.splitext(photo.file_id)
         if ext and ext.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
             await message.answer(t("flow.only_jpg_png_webp", "Поддерживаются только JPG, PNG, WEBP."))
             return
-        
+
         with get_db_session() as db:
             user_service = UserService(db)
             theme_service = ThemeService(db)
@@ -1583,7 +1805,7 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                 telegram_first_name=u.first_name,
                 telegram_last_name=u.last_name,
             )
-            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends()
+            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends(audience)
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
             themes_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in themes]
@@ -1658,12 +1880,20 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                     return
 
         data = await state.get_data()
-        # Deep link: trend already selected — skip trend choice, go to format
+        audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
+        # Deep link: trend already selected — skip trend choice, go to format (проверяем ЦА)
         pre_selected_id = data.get("selected_trend_id")
         if pre_selected_id and pre_selected_id != TREND_CUSTOM_ID:
             with get_db_session() as db:
                 trend = TrendService(db).get(pre_selected_id)
                 if trend and trend.enabled:
+                    if not audience_in_target_audiences(audience, getattr(trend, "target_audiences", None)):
+                        await message.answer(
+                            t("audience.trend_unavailable_audience", "Тренд недоступен для выбранной целевой аудитории."),
+                            reply_markup=main_menu_keyboard(),
+                        )
+                        await state.clear()
+                        return
                     await state.set_state(BotStates.waiting_for_format)
                     await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
                     trend_name = trend.name
@@ -1713,12 +1943,22 @@ async def handle_photo_as_document_step1(message: Message, state: FSMContext, bo
     telegram_id = str(message.from_user.id)
     doc = message.document
     if not doc:
+        await message.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."))
         return
     ext = _document_image_ext(doc.mime_type, doc.file_name)
     if not ext:
         await message.answer(t("flow.only_images", "Поддерживаются только изображения: JPG, PNG, WEBP. Отправьте файл с фото."))
         return
     try:
+        data_early = await state.get_data()
+        audience = (data_early.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
+        if audience == AUDIENCE_MEN:
+            await message.answer(
+                t("audience.men_offramp", AUDIENCE_MEN_OFFRAMP_TEXT),
+                reply_markup=main_menu_keyboard(),
+            )
+            await state.clear()
+            return
         with get_db_session() as db:
             user_service = UserService(db)
             theme_service = ThemeService(db)
@@ -1730,7 +1970,7 @@ async def handle_photo_as_document_step1(message: Message, state: FSMContext, bo
                 telegram_first_name=u.first_name,
                 telegram_last_name=u.last_name,
             )
-            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends()
+            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends(audience)
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
             themes_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in themes]
@@ -1838,7 +2078,8 @@ async def select_theme_or_theme_page(callback: CallbackQuery, state: FSMContext,
             if not theme or not theme.enabled:
                 await callback.answer(t("errors.trend_unavailable", "Тематика недоступна."), show_alert=True)
                 return
-            trends = trend_service.list_active_by_theme(theme_id)
+            audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
+            trends = trend_service.list_active_by_theme(theme_id, audience)
             if not trends:
                 await callback.answer(t("errors.no_trends_short", "Нет трендов в этой тематике."), show_alert=True)
                 return
@@ -1874,10 +2115,11 @@ async def nav_back_to_themes(callback: CallbackQuery, state: FSMContext, bot: Bo
         await callback.message.answer(t("flow.start_over", "Начните заново:"), reply_markup=main_menu_keyboard())
         return
     try:
+        audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
         with get_db_session() as db:
             theme_service = ThemeService(db)
             trend_service = TrendService(db)
-            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends()
+            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends(audience)
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
             themes_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in themes]
@@ -1918,6 +2160,7 @@ async def select_trend_or_idea(callback: CallbackQuery, state: FSMContext, bot: 
         return
     
     try:
+        audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
         trend_name = ""
         trend_emoji = ""
         example_path = None
@@ -1928,6 +2171,9 @@ async def select_trend_or_idea(callback: CallbackQuery, state: FSMContext, bot: 
             trend = trend_service.get(trend_id)
             if not trend or not trend.enabled:
                 await callback.answer(t("errors.trend_unavailable", "Тренд недоступен"), show_alert=True)
+                return
+            if not audience_in_target_audiences(audience, getattr(trend, "target_audiences", None)):
+                await callback.answer(t("audience.trend_unavailable_audience", "Тренд недоступен для выбранной ЦА."), show_alert=True)
                 return
             trend_name = trend.name
             trend_emoji = trend.emoji
@@ -2010,6 +2256,7 @@ async def nav_back_to_trends(callback: CallbackQuery, state: FSMContext, bot: Bo
         await callback.message.answer(t("flow.start_over", "Начните заново:"), reply_markup=main_menu_keyboard())
         return
     try:
+        audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
         await state.set_state(BotStates.waiting_for_trend)
         await state.update_data(selected_trend_id=None, selected_trend_name=None, custom_prompt=None)
         with get_db_session() as db:
@@ -2019,7 +2266,7 @@ async def nav_back_to_trends(callback: CallbackQuery, state: FSMContext, bot: Bo
             if current_theme_id:
                 theme = theme_service.get(current_theme_id)
                 if theme and theme.enabled:
-                    trends = trend_service.list_active_by_theme(current_theme_id)
+                    trends = trend_service.list_active_by_theme(current_theme_id, audience)
                     if trends:
                         page = max(0, min(data.get("current_theme_page", 0), (len(trends) - 1) // TRENDS_PER_PAGE))
                         total_pages = (len(trends) + TRENDS_PER_PAGE - 1) // TRENDS_PER_PAGE
@@ -2037,7 +2284,7 @@ async def nav_back_to_trends(callback: CallbackQuery, state: FSMContext, bot: Bo
                         await state.update_data(current_theme_id=current_theme_id, current_theme_page=page)
                         await callback.answer()
                         return
-            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends()
+            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends(audience)
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
             themes_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in themes]
@@ -2062,6 +2309,92 @@ async def nav_back_to_menu(callback: CallbackQuery, state: FSMContext, bot: Bot)
         reply_markup=main_menu_keyboard(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "nav:profile")
+async def nav_profile(callback: CallbackQuery):
+    """Открыть «Мой профиль» (баланс) по кнопке после 4K или из меню."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_service = UserService(db)
+            sec_svc = SecuritySettingsService(db)
+            session_svc = SessionService(db)
+            hd_svc = HDBalanceService(db)
+            user = user_service.get_by_telegram_id(telegram_id)
+            if not user:
+                user = user_service.get_or_create_user(
+                    telegram_id,
+                    telegram_username=callback.from_user.username,
+                    telegram_first_name=callback.from_user.first_name,
+                    telegram_last_name=callback.from_user.last_name,
+                )
+            sec = sec_svc.get_or_create()
+            free_limit = getattr(sec, "free_generations_per_user", 3)
+            free_used = getattr(user, "free_generations_used", 0)
+            free_left = max(0, free_limit - free_used)
+            copy_limit = getattr(sec, "copy_generations_per_user", 1)
+            copy_used = getattr(user, "copy_generations_used", 0)
+            copy_left = max(0, copy_limit - copy_used)
+            token_balance = user.token_balance
+            total_purchased = getattr(user, "total_purchased", 0)
+            hd_credits = getattr(user, "hd_credits_balance", 0)
+            show_referral = getattr(user, "has_purchased_hd", False)
+
+            active_session = session_svc.get_active_session(user.id)
+            plan_name = None
+            remaining_takes = 0
+            total_takes = 0
+            hd_balance_total = 0
+            if active_session:
+                _pack = db.query(Pack).filter(Pack.id == active_session.pack_id).one_or_none()
+                plan_name = _pack.name if _pack else active_session.pack_id
+                remaining_takes = active_session.takes_limit - active_session.takes_used
+                total_takes = active_session.takes_limit
+                hd_balance_total = hd_svc.get_balance(user)["total"]
+
+        text = t("profile.title", "👤 *Мой профиль*") + "\n\n"
+        if plan_name:
+            plan_safe = _escape_markdown(str(plan_name))
+            text += (
+                f"📦 *Текущий план:* {plan_safe}\n"
+                f"📸 *Осталось снимков:* {remaining_takes} из {total_takes}\n"
+                f"🖼 *4K без watermark:* {hd_balance_total}\n\n"
+            )
+        else:
+            text += "📦 *Текущий план:* Нет активного плана\n\n"
+        text += tr(
+            "profile.body",
+            "🆓 *Бесплатные превью:* {free_left} из {free_limit}\n"
+            "🔄 *«Сделать такую же»:* {copy_left} из {copy_limit}\n"
+            "💰 *Баланс генераций:* {token_balance}\n"
+            "📊 *Всего куплено:* {total_purchased}\n\n"
+            "Бесплатные генерации дают превью с watermark.\n"
+            "Купите пакет — получайте фото в полном качестве!",
+            free_left=free_left,
+            free_limit=free_limit,
+            copy_left=copy_left,
+            copy_limit=copy_limit,
+            token_balance=token_balance,
+            total_purchased=total_purchased,
+        )
+        if hd_credits > 0:
+            text += f"\n\n🎁 *Бонусы 4K:* {hd_credits}"
+
+        buttons = [
+            [InlineKeyboardButton(text=t("profile.btn.top_up", "🛒 Выбрать фотосессию"), callback_data="shop:open")],
+        ]
+        if show_referral:
+            buttons.append([
+                InlineKeyboardButton(text="💌 Пригласить подругу", callback_data="referral:invite"),
+                InlineKeyboardButton(text="📊 Реферальный баланс", callback_data="referral:status"),
+            ])
+        profile_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=profile_kb)
+        await callback.answer()
+    except Exception:
+        logger.exception("Error in nav_profile")
+        await callback.answer(t("errors.profile_load", "Ошибка загрузки профиля."), show_alert=True)
 
 
 # --- Step 3: Format selected, create job and generate ---
@@ -2196,6 +2529,7 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
             )
             created_take_id = take.id
 
+            audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
             audit.log(
                 actor_type="user",
                 actor_id=telegram_id,
@@ -2208,6 +2542,7 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
                     "take_type": take_type,
                     "session_id": session_id,
                     "custom": bool(custom_prompt),
+                    "audience": audience,
                 },
             )
 
@@ -2215,7 +2550,7 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
 
         await _try_delete_messages(bot, callback.message.chat.id, data.get("last_bot_message_id"), callback.message.message_id)
         progress_msg = await callback.message.answer(
-            t("progress.take_step_1", "⏳ Генерация снимка [🟩🟩⬜⬜⬜] 1/3"),
+            t("progress.take_step_1", "⏳ Генерация снимка [🟩⬜⬜] 1/3"),
         )
 
         celery_app.send_task(
@@ -2439,7 +2774,25 @@ async def _show_shop(message: Message, edit: bool = False):
             for row in rows
         ]
         kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
-        await message.answer(text, reply_markup=kb)
+        if os.path.exists(MONEY_IMAGE_PATH):
+            try:
+                photo_path, is_temp = path_for_telegram_photo(MONEY_IMAGE_PATH)
+                await message.answer_photo(
+                    photo=FSInputFile(photo_path),
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+                if is_temp and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning("shop_money_photo_failed", extra={"path": MONEY_IMAGE_PATH, "error": str(e)})
+                await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         logger.exception("Error in shop_menu")
         await message.answer(t("shop.load_error", "Ошибка загрузки."), reply_markup=main_menu_keyboard())
@@ -2580,7 +2933,7 @@ async def unlock_photo_with_tokens(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("unlock_hd:"))
 async def unlock_photo_with_hd_credits(callback: CallbackQuery, bot: Bot):
-    """Unlock photo using HD credits from referral bonuses."""
+    """Unlock photo using 4K credits from referral bonuses."""
     job_id = callback.data.split(":", 1)[1]
     telegram_id = str(callback.from_user.id)
 
@@ -2606,7 +2959,7 @@ async def unlock_photo_with_hd_credits(callback: CallbackQuery, bot: Bot):
 
             ref_svc = ReferralService(db)
             if not ref_svc.spend_credits(user, 1):
-                await callback.answer("Недостаточно HD credits или есть долг.", show_alert=True)
+                await callback.answer("Недостаточно бонусов 4K или есть долг.", show_alert=True)
                 return
 
             ref_svc.mark_oldest_available_spent(user.id, 1)
@@ -2631,7 +2984,7 @@ async def unlock_photo_with_hd_credits(callback: CallbackQuery, bot: Bot):
             photo = FSInputFile(original_path)
             await callback.message.answer_document(
                 document=photo,
-                caption="🎁 Фото разблокировано за HD credit! Вот ваш кадр в полном качестве.",
+                caption="🎁 Фото разблокировано за бонус 4K! Вот ваш кадр в полном качестве.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [
                         InlineKeyboardButton(text=t("success.btn.menu", "📋 В меню"), callback_data="success_action:menu"),
@@ -2639,7 +2992,7 @@ async def unlock_photo_with_hd_credits(callback: CallbackQuery, bot: Bot):
                     ]
                 ]),
             )
-            await callback.answer("Разблокировано за HD credit!")
+            await callback.answer("Разблокировано за бонус 4K!")
             latency = (datetime.now(timezone.utc) - preview_created_at).total_seconds() if preview_created_at else None
             paywall_record_unlock(
                 job_id=job_id,
@@ -2789,7 +3142,7 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                             await message.answer(
                                 f"✅ Пакет {pack.emoji} {pack.name} активирован!\n\n"
                                 f"Снимков: {remaining}\n"
-                                f"HD баланс: {balance['total']}\n\n"
+                                f"4K без watermark: {balance['total']}\n\n"
                                 f"Отправьте фото для первого снимка!",
                                 reply_markup=main_menu_keyboard(),
                             )
@@ -2829,7 +3182,7 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                         await message.answer(
                             f"⬆️ Апгрейд до {pack.emoji} {pack.name}!\n\n"
                             f"Снимков: {remaining}\n"
-                            f"HD баланс: {balance['total']}\n\n"
+                            f"4K без watermark: {balance['total']}\n\n"
                             f"Продолжайте съёмку!",
                             reply_markup=main_menu_keyboard(),
                         )
@@ -3020,7 +3373,7 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                                         try:
                                             tg_notify.send_message(
                                                 referrer_tg_id,
-                                                f"🎉 Подруга купила пакет! Твой бонус ({bonus_credits} HD credits) в обработке.\n"
+                                                f"🎉 Подруга купила пакет! Твой бонус ({bonus_credits} 4K) в обработке.\n"
                                                 f"Будет доступен через 12–24 часа.",
                                             )
                                         finally:
@@ -3050,40 +3403,48 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
 @router.message(Command("paysupport"))
 async def cmd_paysupport(message: Message):
     """Поддержка по платежам (требование Telegram для ботов с оплатой)."""
-    await message.answer(
-        t(
-            "cmd.paysupport",
-            "💬 *Поддержка по платежам*\n\n"
-            "Если у вас возникли проблемы с оплатой или начислением генераций:\n\n"
-            "1. Убедитесь, что у вас достаточно Telegram Stars\n"
-            "2. Проверьте баланс в «👤 Мой профиль»\n"
-            "3. Напишите нам в чат поддержки\n\n"
-            "Мы обработаем ваш запрос в кратчайшие сроки.\n\n"
-            "⚠️ Telegram support не рассматривает вопросы по покупкам в ботах.",
-        ),
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(),
-    )
+    try:
+        await message.answer(
+            t(
+                "cmd.paysupport",
+                "💬 *Поддержка по платежам*\n\n"
+                "Если у вас возникли проблемы с оплатой или начислением генераций:\n\n"
+                "1. Убедитесь, что у вас достаточно Telegram Stars\n"
+                "2. Проверьте баланс в «👤 Мой профиль»\n"
+                "3. Напишите нам в чат поддержки\n\n"
+                "Мы обработаем ваш запрос в кратчайшие сроки.\n\n"
+                "⚠️ Telegram support не рассматривает вопросы по покупкам в ботах.",
+            ),
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        logger.exception("Error in cmd_paysupport")
+        await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
 
 
 @router.message(Command("terms"))
 async def cmd_terms(message: Message):
     """Условия использования (требование Telegram для ботов с оплатой)."""
-    await message.answer(
-        t(
-            "cmd.terms",
-            "📄 *Условия использования NanoBanan*\n\n"
-            "1. Генерации приобретаются за Telegram Stars.\n"
-            "2. Бесплатные генерации дают результат с watermark (превью).\n"
-            "3. Оплаченные генерации дают полное качество без watermark.\n"
-            "4. Возврат Stars возможен до использования генераций.\n"
-            "5. Администрация вправе отказать в обслуживании при нарушении правил.\n"
-            "6. Все сгенерированные изображения — результат работы ИИ.\n\n"
-            "Используя бота, вы соглашаетесь с этими условиями.",
-        ),
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(),
-    )
+    try:
+        await message.answer(
+            t(
+                "cmd.terms",
+                "📄 *Условия использования NanoBanan*\n\n"
+                "1. Генерации приобретаются за Telegram Stars.\n"
+                "2. Бесплатные генерации дают результат с watermark (превью).\n"
+                "3. Оплаченные генерации дают полное качество без watermark.\n"
+                "4. Возврат Stars возможен до использования генераций.\n"
+                "5. Администрация вправе отказать в обслуживании при нарушении правил.\n"
+                "6. Все сгенерированные изображения — результат работы ИИ.\n\n"
+                "Используя бота, вы соглашаетесь с этими условиями.",
+            ),
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        logger.exception("Error in cmd_terms")
+        await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
 
 
 # ===========================================
@@ -3116,11 +3477,26 @@ async def error_replace_photo(callback: CallbackQuery, state: FSMContext):
     """После ошибки: перейти к шагу загрузки нового исходного фото."""
     await state.clear()
     await state.set_state(BotStates.waiting_for_photo)
-    sent = await callback.message.answer(
-        t("flow.request_photo", REQUEST_PHOTO_TEXT_DEFAULT),
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(),
-    )
+    request_text = t("flow.request_photo", REQUEST_PHOTO_TEXT_DEFAULT)
+    if os.path.exists(RULE_IMAGE_PATH):
+        try:
+            photo_path, is_temp = path_for_telegram_photo(RULE_IMAGE_PATH)
+            sent = await callback.message.answer_photo(
+                photo=FSInputFile(photo_path),
+                caption=request_text,
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
+            if is_temp and os.path.isfile(photo_path):
+                try:
+                    os.unlink(photo_path)
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.warning("rule_photo_failed", extra={"path": RULE_IMAGE_PATH, "error": str(e)})
+            sent = await callback.message.answer(request_text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    else:
+        sent = await callback.message.answer(request_text, parse_mode="HTML", reply_markup=main_menu_keyboard())
     await state.update_data(last_bot_message_id=sent.message_id)
     await callback.answer()
 
@@ -3135,6 +3511,8 @@ async def error_choose_trend(callback: CallbackQuery, state: FSMContext, bot: Bo
         return
 
     try:
+        data = await state.get_data()
+        audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
         with get_db_session() as db:
             job_service = JobService(db)
             trend_service = TrendService(db)
@@ -3154,7 +3532,7 @@ async def error_choose_trend(callback: CallbackQuery, state: FSMContext, bot: Bo
 
             photo_file_id = file_ids[0]
             theme_service = ThemeService(db)
-            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends()
+            theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends(audience)
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
             themes_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in themes]
@@ -3187,6 +3565,7 @@ async def error_choose_trend(callback: CallbackQuery, state: FSMContext, bot: Bo
             selected_trend_id=None,
             selected_trend_name=None,
             custom_prompt=None,
+            audience_type=audience,
         )
         await state.set_state(BotStates.waiting_for_trend)
         sent = await callback.message.answer(
@@ -3217,7 +3596,7 @@ async def bank_transfer_start(callback: CallbackQuery, state: FSMContext):
             payment_service = PaymentService(db)
             packs = payment_service.list_product_ladder_packs()
             packs_data = [
-                {"id": p.id, "name": p.name, "emoji": p.emoji, "tokens": getattr(p, "tokens", 0), "stars_price": p.stars_price}
+                {"id": p.id, "name": p.name, "emoji": p.emoji, "tokens": getattr(p, "tokens", 0), "stars_price": p.stars_price, "outcome": _pack_outcome_label(p)}
                 for p in packs
             ]
             step1_text = effective["step1_description"]
@@ -3231,7 +3610,8 @@ async def bank_transfer_start(callback: CallbackQuery, state: FSMContext):
         buttons = []
         for pack in packs_data:
             rub = round(pack["stars_price"] * rate)
-            label = f"{pack['emoji']} {pack['name']} — {pack['stars_price']}⭐ ({rub} ₽)"
+            outcome = pack.get("outcome", "")
+            label = f"{pack['emoji']} {pack['name']}: {outcome} — {pack['stars_price']}⭐ ({rub} ₽)" if outcome else f"{pack['emoji']} {pack['name']} — {pack['stars_price']}⭐ ({rub} ₽)"
             buttons.append([InlineKeyboardButton(text=label, callback_data=f"bank_pack:{pack['id']}")])
         buttons.append([InlineKeyboardButton(text=t("nav.btn.menu", "📋 В меню"), callback_data="nav:menu")])
 
@@ -3329,10 +3709,15 @@ async def bank_transfer_cancel(callback: CallbackQuery, state: FSMContext):
 async def bank_transfer_retry(callback: CallbackQuery, state: FSMContext):
     """Сброс счётчика попыток после 3 неудач — можно отправить чек снова."""
     await state.update_data(bank_receipt_attempts=0)
-    await callback.message.edit_text(
-        "🔄 Отправьте скриншот чека ещё раз. Счётчик попыток сброшен.",
-        reply_markup=None,
-    )
+    try:
+        await callback.message.edit_text(
+            "🔄 Отправьте скриншот чека ещё раз. Счётчик попыток сброшен.",
+            reply_markup=None,
+        )
+    except Exception:
+        await callback.message.answer(
+            "🔄 Отправьте скриншот чека ещё раз. Счётчик попыток сброшен."
+        )
     await callback.answer()
 
 
@@ -3506,15 +3891,16 @@ async def _process_bank_receipt(message: Message, state: FSMContext, file_path: 
         # --- Проверка карты (п.2) ---
         card_number = effective.get("card_number", "")
         card_digits = "".join(c for c in card_number if c.isdigit())
-        if len(card_digits) >= 8 and card_first4 and card_last4:
+        if len(card_digits) < 8:
+            card_match = True
+        elif card_first4 and card_last4:
             expected_first4 = card_digits[:4]
             expected_last4 = card_digits[-4:]
             card_match = (card_first4 == expected_first4 and card_last4 == expected_last4)
-        elif len(card_digits) < 8:
-            # Карта не задана или слишком короткая → не проверять
-            card_match = True
+        elif card_last4:
+            expected_last4 = card_digits[-4:]
+            card_match = (card_last4 == expected_last4)
         else:
-            # Карту не извлекли с чека
             card_match = False
 
         # --- Проверка комментария (6.3) ---
@@ -3810,7 +4196,12 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 action="choose_best_variant",
                 entity_type="take",
                 entity_id=take_id,
-                payload={"variant": variant, "session_id": take.session_id, "favorite_id": fav.id if fav else None},
+                payload={
+                    "variant": variant,
+                    "session_id": take.session_id,
+                    "favorite_id": fav.id if fav else None,
+                    "trend_id": getattr(take, "trend_id", None),
+                },
             )
             audit.log(
                 actor_type="user",
@@ -3818,7 +4209,11 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 action="favorites_auto_add",
                 entity_type="favorite",
                 entity_id=fav.id if fav else None,
-                payload={"take_id": take_id, "variant": variant},
+                payload={
+                    "take_id": take_id,
+                    "variant": variant,
+                    "trend_id": getattr(take, "trend_id", None),
+                },
             )
             session_id = take.session_id
             user_is_moderator = getattr(user, "is_moderator", False)
@@ -3826,7 +4221,13 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
             hd_svc = HDBalanceService(db)
             balance = hd_svc.get_balance(user)
 
-        await callback.answer(f"⭐ Вариант {variant} добавлен в избранное!")
+            trend_label = "Снимок"
+            if getattr(take, "trend_id", None):
+                trend = TrendService(db).get(take.trend_id)
+                if trend:
+                    trend_label = f"{trend.emoji} {trend.name}"
+
+        await callback.answer(f"⭐ Добавлено: {trend_label}, вариант {variant}")
 
         is_free = False
         if session_id:
@@ -3853,7 +4254,7 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                         hd_rem_c = session_svc.hd_remaining(session)
                         collection_info = (
                             f"\n\nВсего превью: {session.takes_used * 3}/{session.takes_limit * 3}\n"
-                            f"HD осталось: {hd_rem_c} | В избранном: {fav_count_c} (для HD: {selected_c})"
+                            f"4K осталось: {hd_rem_c} | В избранном: {fav_count_c} (для 4K: {selected_c})"
                         )
 
             await state.set_state(BotStates.viewing_take_result)
@@ -3861,7 +4262,7 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
             short_menu_buttons = []
             if fav_id and balance.get("total", 0) > 0 and not is_collection:
                 short_menu_buttons.append([
-                    InlineKeyboardButton(text="🖼 Забрать HD для этого", callback_data=f"deliver_hd_one:{fav_id}"),
+                    InlineKeyboardButton(text="🖼 Забрать 4K для этого", callback_data=f"deliver_hd_one:{fav_id}"),
                 ])
             if is_collection:
                 short_menu_buttons.append([
@@ -3874,7 +4275,7 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                     InlineKeyboardButton(text="📋 В избранное", callback_data="open_favorites"),
                 ])
             await callback.message.answer(
-                f"Вариант {variant} в избранном.{collection_info}",
+                f"{trend_label} · Вариант {variant} в избранном.{collection_info}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=short_menu_buttons),
             )
 
@@ -3884,7 +4285,7 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 async def _show_paywall_after_free_take(message: Message, telegram_id: str, take_id: str, variant: str):
-    """Show contextual paywall after free take — only ladder packs (trial / avatar_pack / dating_pack / creator)."""
+    """Show contextual paywall after free take — all ladder packs."""
     try:
         with get_db_session() as db:
             audit = AuditService(db)
@@ -3895,50 +4296,20 @@ async def _show_paywall_after_free_take(message: Message, telegram_id: str, take
             payment_service = PaymentService(db)
             all_packs = payment_service.list_product_ladder_packs()
 
-            trial_pack = None
-            collection_pack = None
-            creator_pack = None
+            buttons_data = []
+            position = 1
             for p in all_packs:
                 if getattr(p, "pack_subtype", "standalone") == "collection" and not getattr(p, "playlist", None):
                     continue
-                if p.is_trial and is_trial_eligible and not trial_pack:
-                    trial_pack = p
-                elif getattr(p, "pack_subtype", "standalone") == "collection" and not collection_pack:
-                    collection_pack = p
-                elif p.stars_price and p.stars_price >= 500 and not creator_pack:
-                    creator_pack = p
-
-            buttons_data = []
-            if trial_pack:
+                if p.is_trial and not is_trial_eligible:
+                    continue
                 buttons_data.append({
-                    "id": trial_pack.id, "emoji": trial_pack.emoji,
-                    "name": trial_pack.name, "stars_price": trial_pack.stars_price,
-                    "hd_amount": getattr(trial_pack, "hd_amount", None), "position": 1,
+                    "id": p.id, "emoji": p.emoji,
+                    "name": p.name, "stars_price": p.stars_price,
+                    "outcome": _pack_outcome_label(p),
+                    "hd_amount": getattr(p, "hd_amount", None), "position": position,
                 })
-            if collection_pack:
-                label_extra = " ⭐ Популярное" if getattr(collection_pack, "collection_label", None) else ""
-                buttons_data.append({
-                    "id": collection_pack.id, "emoji": collection_pack.emoji,
-                    "name": (getattr(collection_pack, "collection_label", None) or collection_pack.name) + label_extra,
-                    "stars_price": collection_pack.stars_price,
-                    "hd_amount": getattr(collection_pack, "hd_amount", None), "position": 2,
-                })
-            if creator_pack:
-                buttons_data.append({
-                    "id": creator_pack.id, "emoji": creator_pack.emoji,
-                    "name": creator_pack.name, "stars_price": creator_pack.stars_price,
-                    "hd_amount": getattr(creator_pack, "hd_amount", None), "position": 3,
-                })
-
-            if not buttons_data:
-                for p in all_packs[:3]:
-                    if getattr(p, "pack_subtype", "standalone") == "collection" and not getattr(p, "playlist", None):
-                        continue
-                    buttons_data.append({
-                        "id": p.id, "emoji": p.emoji,
-                        "name": p.name, "stars_price": p.stars_price,
-                        "hd_amount": getattr(p, "hd_amount", None), "position": len(buttons_data) + 1,
-                    })
+                position += 1
 
             audit.log(
                 actor_type="user",
@@ -3952,21 +4323,27 @@ async def _show_paywall_after_free_take(message: Message, telegram_id: str, take
                 },
             )
 
+        rate = getattr(settings, "star_to_rub", 1.3)
         buttons = []
         for bd in buttons_data:
-            label = f"{bd['emoji']} {bd['name']} — {bd['stars_price']}⭐"
-            if bd.get("hd_amount"):
-                label += f" ({bd['hd_amount']} HD)"
+            outcome = bd.get("outcome", "")
+            label = f"{bd['emoji']} {bd['name']}: {outcome} — {format_stars_rub(bd['stars_price'], rate)}" if outcome else f"{bd['emoji']} {bd['name']} — {format_stars_rub(bd['stars_price'], rate)}"
             buttons.append([InlineKeyboardButton(text=label, callback_data=f"paywall:{bd['id']}")])
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         await message.answer(
             "👀 Смотри бесплатно, плати только если нравится!\n\n"
-            "🎬 Получи HD версию без watermark:",
+            "🎬 Получи 4K версию без watermark:",
             reply_markup=keyboard,
         )
     except Exception:
         logger.exception("_show_paywall_after_free_take error")
+        try:
+            await message.answer(
+                "Не удалось загрузить тарифы. Выберите фотосессию в меню (🛒 Купить тариф)."
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("add_var:"))
@@ -4011,6 +4388,12 @@ async def add_variant_to_favorites(callback: CallbackQuery, state: FSMContext):
                 session_id=take.session_id,
             )
 
+            trend_label = "Снимок"
+            if getattr(take, "trend_id", None):
+                trend = TrendService(db).get(take.trend_id)
+                if trend:
+                    trend_label = f"{trend.emoji} {trend.name}"
+
             audit = AuditService(db)
             audit.log(
                 actor_type="user",
@@ -4018,10 +4401,14 @@ async def add_variant_to_favorites(callback: CallbackQuery, state: FSMContext):
                 action="favorites_auto_add",
                 entity_type="favorite",
                 entity_id=fav.id if fav else None,
-                payload={"take_id": take_id, "variant": variant},
+                payload={
+                    "take_id": take_id,
+                    "variant": variant,
+                    "trend_id": getattr(take, "trend_id", None),
+                },
             )
 
-        await callback.answer(f"⭐ Вариант {variant} добавлен!")
+        await callback.answer(f"⭐ Добавлено: {trend_label}, вариант {variant}")
     except Exception:
         logger.exception("add_variant_to_favorites error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
@@ -4061,7 +4448,25 @@ async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
                     if session:
                         buttons.append([InlineKeyboardButton(text="📋 Избранное", callback_data="open_favorites")])
                     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-                    await callback.message.answer(text, reply_markup=keyboard)
+                    if os.path.exists(MONEY_IMAGE_PATH):
+                        try:
+                            photo_path, is_temp = path_for_telegram_photo(MONEY_IMAGE_PATH)
+                            await callback.message.answer_photo(
+                                photo=FSInputFile(photo_path),
+                                caption=text,
+                                parse_mode="HTML",
+                                reply_markup=keyboard,
+                            )
+                            if is_temp and os.path.isfile(photo_path):
+                                try:
+                                    os.unlink(photo_path)
+                                except OSError:
+                                    pass
+                        except Exception as e:
+                            logger.warning("take_more_money_photo_failed", extra={"path": MONEY_IMAGE_PATH, "error": str(e)})
+                            await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+                    else:
+                        await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
                     await callback.answer()
                     return
 
@@ -4090,12 +4495,12 @@ async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
                     await callback.message.answer(
                         f"🎉 Коллекция завершена!\n\n"
                         f"Всего превью: {session.takes_used * 3}\n"
-                        f"В избранном: {fav_count} (отмечено для HD: {selected_count})\n"
-                        f"HD осталось: {session_svc.hd_remaining(session)}\n\n"
-                        f"Отметьте лучшие и нажмите «Забрать HD альбомом».",
+                        f"В избранном: {fav_count} (отмечено для 4K: {selected_count})\n"
+                        f"4K осталось: {session_svc.hd_remaining(session)}\n\n"
+                        f"Отметьте лучшие и нажмите «Забрать 4K альбомом».",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                             [InlineKeyboardButton(text="⭐ Открыть избранное", callback_data="open_favorites")],
-                            [InlineKeyboardButton(text="🖼 Забрать HD альбомом", callback_data="deliver_hd_album")],
+                            [InlineKeyboardButton(text="🖼 Забрать 4K альбомом", callback_data="deliver_hd_album")],
                         ]),
                     )
                     await callback.answer()
@@ -4155,6 +4560,111 @@ async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
+def _build_favorites_message(db, user) -> tuple[str | None, list[list[dict]], int]:
+    """Собрать текст и кнопки списка избранного. Возвращает (text, rows, favorites_count) или (None, [], 0) если пусто."""
+    fav_svc = FavoriteService(db)
+    hd_svc = HDBalanceService(db)
+    session_svc = SessionService(db)
+
+    all_favorites = fav_svc.list_favorites_for_user(user.id)
+    # Показываем только актуальные: уже выданные в 4K не показываем в списке
+    favorites = [f for f in all_favorites if f.hd_status != "delivered"]
+    if not favorites:
+        return (None, [], 0)
+
+    balance = hd_svc.get_balance(user)
+    session = session_svc.get_active_session(user.id)
+    is_collection = session and session_svc.is_collection(session)
+    hd_rem = session_svc.hd_remaining(session) if session else 0
+    selected_count = fav_svc.count_selected_for_hd(session.id) if session else 0
+    has_session = session is not None
+
+    take_ids = list({f.take_id for f in favorites if f.take_id})
+    takes = db.query(TakeModel).filter(TakeModel.id.in_(take_ids)).all() if take_ids else []
+    take_by_id = {t.id: t for t in takes}
+    trend_ids = list({t.trend_id for t in takes if getattr(t, "trend_id", None)})
+    trends = db.query(TrendModel).filter(TrendModel.id.in_(trend_ids)).all() if trend_ids else []
+    trend_by_id = {tr.id: tr for tr in trends}
+
+    now = datetime.now(timezone.utc)
+    favorites_data = []
+    for f in favorites:
+        rendering_too_long = False
+        if f.hd_status == "rendering" and f.updated_at:
+            elapsed_min = (now - f.updated_at).total_seconds() / 60.0
+            if elapsed_min > 5:
+                rendering_too_long = True
+        trend_label = "Снимок"
+        take = take_by_id.get(f.take_id) if f.take_id else None
+        if take and getattr(take, "trend_id", None):
+            trend = trend_by_id.get(take.trend_id)
+            if trend:
+                trend_label = f"{trend.emoji} {trend.name}"
+        favorites_data.append({
+            "id": f.id,
+            "variant": f.variant,
+            "hd_status": f.hd_status,
+            "selected_for_hd": getattr(f, "selected_for_hd", False),
+            "rendering_too_long": rendering_too_long,
+            "trend_label": trend_label,
+        })
+
+    lines = [f"⭐ Избранное ({len(favorites_data)})\n"]
+    button_rows = []
+    for i, fav in enumerate(favorites_data, 1):
+        if fav["hd_status"] == "rendering":
+            status_icon = "⏳"
+        elif fav["selected_for_hd"]:
+            status_icon = "🟢 4K"
+        else:
+            status_icon = ""
+        trend_label = fav.get("trend_label") or "Снимок"
+        lines.append(f"{i}. {trend_label} · Вариант {fav['variant']} {status_icon}")
+
+        row = []
+        if fav["hd_status"] == "none":
+            if fav["selected_for_hd"]:
+                row.append({"text": f"↩️ Убрать 4K #{i}", "callback_data": f"deselect_hd:{fav['id']}"})
+            else:
+                row.append({"text": f"🟢 Выбрать 4K #{i}", "callback_data": f"select_hd:{fav['id']}"})
+            row.append({"text": f"❌ #{i}", "callback_data": f"remove_fav:{fav['id']}"})
+        if fav["rendering_too_long"]:
+            row.append({"text": f"⚠️ Проблема #{i}", "callback_data": f"hd_problem:{fav['id']}"})
+        if row:
+            button_rows.append(row)
+
+    if is_collection and session:
+        lines.append(f"\n4K осталось: {hd_rem} | Отмечено для 4K: {selected_count}")
+    else:
+        lines.append(f"\n4K баланс: {balance['total']}")
+
+    action_buttons = []
+    removable_count = sum(1 for f in favorites_data if f["hd_status"] != "delivered")
+    pending_count = sum(1 for f in favorites_data if f["hd_status"] == "none")
+    if is_collection and selected_count > 0:
+        action_buttons.append({"text": f"🖼 Забрать 4K альбомом ({selected_count})", "callback_data": "deliver_hd_album"})
+    elif pending_count > 0 and balance["total"] > 0:
+        action_buttons.append({"text": "🖼 Забрать 4K", "callback_data": "deliver_hd"})
+    if removable_count > 0:
+        action_buttons.append({"text": "🗑 Очистить все", "callback_data": "favorites_clear_all"})
+    if has_session:
+        action_buttons.append({"text": "📸 Назад к сессии", "callback_data": "session_status"})
+    if action_buttons:
+        button_rows.append(action_buttons)
+
+    return ("\n".join(lines), button_rows, len(favorites_data))
+
+
+def _favorites_rows_to_keyboard(rows: list[list[dict]]) -> InlineKeyboardMarkup | None:
+    """Преобразовать rows из _build_favorites_message в InlineKeyboardMarkup."""
+    if not rows:
+        return None
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=b["text"], callback_data=b["callback_data"]) for b in row] for row in rows]
+    )
+    return keyboard
+
+
 @router.callback_query(F.data == "open_favorites")
 async def open_favorites(callback: CallbackQuery, state: FSMContext):
     """Show favorites list with HD selection controls."""
@@ -4168,34 +4678,7 @@ async def open_favorites(callback: CallbackQuery, state: FSMContext):
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
-            fav_svc = FavoriteService(db)
-            hd_svc = HDBalanceService(db)
-            session_svc = SessionService(db)
-
-            favorites = fav_svc.list_favorites_for_user(user.id)
-            balance = hd_svc.get_balance(user)
-            session = session_svc.get_active_session(user.id)
-            is_collection = session and session_svc.is_collection(session)
-            hd_rem = session_svc.hd_remaining(session) if session else 0
-            selected_count = fav_svc.count_selected_for_hd(session.id) if session else 0
-
-            favorites_data = []
-            now = datetime.now(timezone.utc)
-            for f in (favorites or []):
-                rendering_too_long = False
-                if f.hd_status == "rendering" and f.updated_at:
-                    elapsed_min = (now - f.updated_at).total_seconds() / 60.0
-                    if elapsed_min > 5:
-                        rendering_too_long = True
-                favorites_data.append({
-                    "id": f.id,
-                    "variant": f.variant,
-                    "hd_status": f.hd_status,
-                    "selected_for_hd": getattr(f, "selected_for_hd", False),
-                    "rendering_too_long": rendering_too_long,
-                })
-
-            has_session = session is not None
+            text, rows, favorites_count = _build_favorites_message(db, user)
 
             audit = AuditService(db)
             audit.log(
@@ -4204,77 +4687,56 @@ async def open_favorites(callback: CallbackQuery, state: FSMContext):
                 action="favorites_opened",
                 entity_type="user",
                 entity_id=user.id,
-                payload={"count": len(favorites) if favorites else 0},
+                payload={"count": favorites_count},
             )
 
-        if not favorites_data:
+        if text is None:
             await callback.answer("Избранное пусто", show_alert=True)
             return
 
-        lines = [f"⭐ Избранное ({len(favorites_data)})\n"]
-        buttons = []
-        for i, fav in enumerate(favorites_data, 1):
-            if fav["hd_status"] == "delivered":
-                status_icon = "✅"
-            elif fav["hd_status"] == "rendering":
-                status_icon = "⏳"
-            elif fav["selected_for_hd"]:
-                status_icon = "🟢 HD"
-            else:
-                status_icon = ""
-            lines.append(f"{i}. Вариант {fav['variant']} {status_icon}")
-
-            row = []
-            if fav["hd_status"] == "none":
-                if fav["selected_for_hd"]:
-                    row.append(InlineKeyboardButton(
-                        text=f"↩️ Убрать HD #{i}",
-                        callback_data=f"deselect_hd:{fav['id']}",
-                    ))
-                else:
-                    row.append(InlineKeyboardButton(
-                        text=f"🟢 Выбрать HD #{i}",
-                        callback_data=f"select_hd:{fav['id']}",
-                    ))
-                row.append(InlineKeyboardButton(
-                    text=f"❌ #{i}",
-                    callback_data=f"remove_fav:{fav['id']}",
-                ))
-            if fav["rendering_too_long"]:
-                row.append(InlineKeyboardButton(
-                    text=f"⚠️ Проблема #{i}",
-                    callback_data=f"hd_problem:{fav['id']}",
-                ))
-            if row:
-                buttons.append(row)
-
-        if is_collection and session:
-            lines.append(
-                f"\nHD осталось: {hd_rem} | Отмечено для HD: {selected_count}"
-            )
-        else:
-            lines.append(f"\nHD баланс: {balance['total']}")
-
-        action_buttons = []
-        pending_count = sum(1 for f in favorites_data if f["hd_status"] == "none")
-        if is_collection and selected_count > 0:
-            action_buttons.append(InlineKeyboardButton(
-                text=f"🖼 Забрать HD альбомом ({selected_count})",
-                callback_data="deliver_hd_album",
-            ))
-        elif pending_count > 0 and balance["total"] > 0:
-            action_buttons.append(InlineKeyboardButton(text="🖼 Забрать HD", callback_data="deliver_hd"))
-        if has_session:
-            action_buttons.append(InlineKeyboardButton(text="📸 Назад к сессии", callback_data="session_status"))
-        if action_buttons:
-            buttons.append(action_buttons)
-
-        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-        await callback.message.answer("\n".join(lines), reply_markup=keyboard)
+        keyboard = _favorites_rows_to_keyboard(rows)
+        await callback.message.answer(text, reply_markup=keyboard)
         await state.set_state(BotStates.viewing_favorites)
         await callback.answer()
     except Exception:
         logger.exception("open_favorites error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "favorites_clear_all")
+async def clear_all_favorites(callback: CallbackQuery, state: FSMContext):
+    """Удалить все избранное (кроме уже выданных 4K)."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user_svc = UserService(db)
+            user = user_svc.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            fav_svc = FavoriteService(db)
+            deleted = fav_svc.clear_all_for_user(user.id)
+        if deleted > 0:
+            await callback.answer(f"🗑 Удалено из избранного: {deleted}")
+            try:
+                with get_db_session() as db:
+                    user_svc = UserService(db)
+                    user = user_svc.get_by_telegram_id(telegram_id)
+                    if user:
+                        text, rows, _ = _build_favorites_message(db, user)
+                        if text:
+                            kb = _favorites_rows_to_keyboard(rows)
+                            await callback.message.edit_text(text, reply_markup=kb)
+                        else:
+                            await callback.message.edit_text("⭐ Избранное\n\nСписок пуст.", reply_markup=None)
+            except Exception as e:
+                logger.debug("favorites_clear_all refresh list failed", extra={"error": str(e)})
+        else:
+            await callback.answer("Нечего удалять (или всё уже 4K)", show_alert=True)
+    except Exception:
+        logger.exception("clear_all_favorites error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
@@ -4289,8 +4751,21 @@ async def remove_favorite(callback: CallbackQuery, state: FSMContext):
             removed = fav_svc.remove_favorite(fav_id)
         if removed:
             await callback.answer("Удалено из избранного")
+            try:
+                with get_db_session() as db:
+                    user_svc = UserService(db)
+                    user = user_svc.get_by_telegram_id(telegram_id)
+                    if user:
+                        text, rows, _ = _build_favorites_message(db, user)
+                        if text:
+                            kb = _favorites_rows_to_keyboard(rows)
+                            await callback.message.edit_text(text, reply_markup=kb)
+                        else:
+                            await callback.message.edit_text("⭐ Избранное\n\nСписок пуст.", reply_markup=None)
+            except Exception as e:
+                logger.debug("remove_fav refresh list failed", extra={"error": str(e)})
         else:
-            await callback.answer("Не удалось удалить (возможно, уже HD)")
+            await callback.answer("Не удалось удалить (возможно, уже 4K)")
     except Exception:
         logger.exception("remove_favorite error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
@@ -4322,9 +4797,20 @@ async def select_hd_callback(callback: CallbackQuery, state: FSMContext):
                 return
             ok = fav_svc.select_for_hd(fav_id, session_id)
         if ok:
-            await callback.answer("🟢 Отмечено для HD")
+            await callback.answer("🟢 Отмечено для 4K")
+            try:
+                with get_db_session() as db:
+                    user_svc = UserService(db)
+                    user = user_svc.get_by_telegram_id(telegram_id)
+                    if user:
+                        text, rows, _ = _build_favorites_message(db, user)
+                        if text:
+                            kb = _favorites_rows_to_keyboard(rows)
+                            await callback.message.edit_text(text, reply_markup=kb)
+            except Exception as e:
+                logger.debug("select_hd refresh list failed", extra={"error": str(e)})
         else:
-            await callback.answer("❌ Лимит HD достигнут", show_alert=True)
+            await callback.answer("❌ Лимит 4K достигнут", show_alert=True)
     except Exception:
         logger.exception("select_hd error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
@@ -4332,7 +4818,7 @@ async def select_hd_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("deselect_hd:"))
 async def deselect_hd_callback(callback: CallbackQuery, state: FSMContext):
-    """Unmark favorite from HD selection."""
+    """Unmark favorite from 4K selection."""
     telegram_id = str(callback.from_user.id)
     fav_id = callback.data.split(":", 1)[1]
     try:
@@ -4350,7 +4836,18 @@ async def deselect_hd_callback(callback: CallbackQuery, state: FSMContext):
                 await callback.answer("❌ Не найдено", show_alert=True)
                 return
             fav_svc.deselect_for_hd(fav_id)
-        await callback.answer("↩️ HD отменено")
+        await callback.answer("↩️ 4K отменено")
+        try:
+            with get_db_session() as db:
+                user_svc = UserService(db)
+                user = user_svc.get_by_telegram_id(telegram_id)
+                if user:
+                    text, rows, _ = _build_favorites_message(db, user)
+                    if text:
+                        kb = _favorites_rows_to_keyboard(rows)
+                        await callback.message.edit_text(text, reply_markup=kb)
+        except Exception as e:
+            logger.debug("deselect_hd refresh list failed", extra={"error": str(e)})
     except Exception:
         logger.exception("deselect_hd error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
@@ -4358,7 +4855,7 @@ async def deselect_hd_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("hd_problem:"))
 async def hd_problem_callback(callback: CallbackQuery, state: FSMContext):
-    """Report a problem with HD rendering."""
+    """Report a problem with 4K rendering."""
     telegram_id = str(callback.from_user.id)
     fav_id = callback.data.split(":", 1)[1]
     try:
@@ -4389,7 +4886,7 @@ async def hd_problem_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "deliver_hd_album")
 async def deliver_hd_album_callback(callback: CallbackQuery, state: FSMContext):
-    """Deliver HD for all favorites marked as selected_for_hd."""
+    """Deliver 4K for all favorites marked as selected_for_hd."""
     telegram_id = str(callback.from_user.id)
     try:
         with get_db_session() as db:
@@ -4418,20 +4915,20 @@ async def deliver_hd_album_callback(callback: CallbackQuery, state: FSMContext):
 
             selected = fav_svc.list_selected_for_hd(session.id)
             if not selected:
-                await callback.answer("❌ Не выбрано ни одного HD", show_alert=True)
+                await callback.answer("❌ Не выбрано ни одного 4K", show_alert=True)
                 return
 
             hd_svc = HDBalanceService(db)
             balance = hd_svc.get_balance(user)
             can_deliver = min(len(selected), balance["total"])
             if can_deliver == 0:
-                await callback.answer("❌ Недостаточно HD на балансе", show_alert=True)
+                await callback.answer("❌ Недостаточно 4K на балансе", show_alert=True)
                 return
 
             selected_ids = [f.id for f in selected[:can_deliver]]
 
         await callback.message.answer(
-            f"🖼 Запущена HD выдача для {len(selected_ids)} избранных.\n"
+            f"🖼 Запущена 4K выдача для {len(selected_ids)} избранных.\n"
             f"Ожидайте файлы в чате..."
         )
 
@@ -4443,7 +4940,7 @@ async def deliver_hd_album_callback(callback: CallbackQuery, state: FSMContext):
                 args=[fav_id],
                 kwargs={"status_chat_id": chat_id},
             )
-        await callback.answer(f"🖼 Запущено {len(selected_ids)} HD")
+        await callback.answer(f"🖼 Запущено {len(selected_ids)} 4K")
     except Exception:
         logger.exception("deliver_hd_album error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
@@ -4451,7 +4948,7 @@ async def deliver_hd_album_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("deliver_hd_one:"))
 async def deliver_hd_one_callback(callback: CallbackQuery, state: FSMContext):
-    """Deliver HD for one favorite (short path after choosing variant)."""
+    """Deliver 4K for one favorite (short path after choosing variant)."""
     telegram_id = str(callback.from_user.id)
     parts = callback.data.split(":", 1)
     if len(parts) != 2:
@@ -4474,11 +4971,11 @@ async def deliver_hd_one_callback(callback: CallbackQuery, state: FSMContext):
                 await callback.answer("❌ Избранное не найдено", show_alert=True)
                 return
             if fav.hd_status != "none":
-                await callback.answer("HD уже выдан или в обработке", show_alert=True)
+                await callback.answer("4K уже выдан или в обработке", show_alert=True)
                 return
             balance = hd_svc.get_balance(user)
             if balance.get("total", 0) < 1:
-                await callback.answer("❌ Недостаточно HD на балансе", show_alert=True)
+                await callback.answer("❌ Недостаточно 4K на балансе", show_alert=True)
                 return
 
         from app.core.celery_app import celery_app as _celery
@@ -4489,7 +4986,7 @@ async def deliver_hd_one_callback(callback: CallbackQuery, state: FSMContext):
             args=[fav_id],
             kwargs={"status_chat_id": chat_id},
         )
-        await callback.answer("🖼 Запущена выдача HD")
+        await callback.answer("🖼 Запущена выдача 4K")
         await callback.message.answer("⏳ Ожидайте файл в чате.")
     except Exception:
         logger.exception("deliver_hd_one_callback error", extra={"user_id": telegram_id})
@@ -4498,7 +4995,7 @@ async def deliver_hd_one_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "deliver_hd")
 async def deliver_hd_callback(callback: CallbackQuery, state: FSMContext):
-    """Deliver HD for all pending favorites."""
+    """Deliver 4K for all pending favorites."""
     telegram_id = str(callback.from_user.id)
     try:
         with get_db_session() as db:
@@ -4516,17 +5013,16 @@ async def deliver_hd_callback(callback: CallbackQuery, state: FSMContext):
             pending = [f for f in favorites if f.hd_status == "none"]
 
             if not pending:
-                await callback.answer("Нет избранных для HD", show_alert=True)
+                await callback.answer("Нет избранных для 4K", show_alert=True)
                 return
 
             balance = hd_svc.get_balance(user)
             can_deliver = min(len(pending), balance["total"])
 
             if can_deliver == 0:
-                await callback.answer("❌ Недостаточно HD на балансе", show_alert=True)
+                await callback.answer("❌ Недостаточно 4K на балансе", show_alert=True)
                 return
 
-            # Сохраняем id внутри сессии, чтобы не обращаться к fav после выхода
             pending_ids = [f.id for f in pending[:can_deliver]]
 
         from app.core.celery_app import celery_app as _celery
@@ -4541,8 +5037,8 @@ async def deliver_hd_callback(callback: CallbackQuery, state: FSMContext):
             )
             launched += 1
 
-        await callback.answer(f"🖼 Запущена HD выдача ({launched} шт.)")
-        await callback.message.answer(f"⏳ HD выдача запущена для {launched} избранных. Ожидайте файлы...")
+        await callback.answer(f"🖼 Запущена 4K выдача ({launched} шт.)")
+        await callback.message.answer(f"⏳ 4K выдача запущена для {launched} избранных. Ожидайте файлы...")
     except Exception:
         logger.exception("deliver_hd_callback error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
@@ -4582,6 +5078,10 @@ async def session_status(callback: CallbackQuery, state: FSMContext):
             is_collection = session_svc.is_collection(session)
             hd_rem = session_svc.hd_remaining(session)
             selected_count = fav_svc.count_selected_for_hd(session.id)
+            pack_id = session.pack_id
+            takes_used = session.takes_used
+            takes_limit = session.takes_limit
+            hd_limit = session.hd_limit
 
         buttons = []
         if remaining > 0:
@@ -4590,28 +5090,28 @@ async def session_status(callback: CallbackQuery, state: FSMContext):
 
         if is_collection and selected_count > 0:
             buttons.append([InlineKeyboardButton(
-                text=f"🖼 Забрать HD альбомом ({selected_count})",
+                text=f"🖼 Забрать 4K альбомом ({selected_count})",
                 callback_data="deliver_hd_album",
             )])
         elif fav_count > 0 and balance["total"] > 0:
-            buttons.append([InlineKeyboardButton(text="🖼 Забрать HD", callback_data="deliver_hd")])
+            buttons.append([InlineKeyboardButton(text="🖼 Забрать 4K", callback_data="deliver_hd")])
 
-        if session.pack_id == "trial":
-            buttons.append([InlineKeyboardButton(text="⬆️ Avatar — доплата 250⭐", callback_data="upgrade:avatar_pack")])
-            buttons.append([InlineKeyboardButton(text="⬆️ Dating — доплата 400⭐", callback_data="upgrade:dating_pack")])
+        if pack_id == "trial":
+            buttons.append([InlineKeyboardButton(text="⬆️ Neo Start — доплата 54⭐", callback_data="upgrade:neo_start")])
+            buttons.append([InlineKeyboardButton(text="⬆️ Neo Pro — доплата 439⭐", callback_data="upgrade:neo_pro")])
 
         if is_collection:
             status_text = (
                 f"📸 Ваша коллекция\n\n"
-                f"Всего превью: {session.takes_used * 3}/{session.takes_limit * 3}\n"
-                f"Выбери до {session.hd_limit} HD — осталось: {hd_rem}\n"
-                f"В избранном: {fav_count} (отмечено для HD: {selected_count})"
+                f"Всего превью: {takes_used * 3}/{takes_limit * 3}\n"
+                f"Выбери до {hd_limit} 4K — осталось: {hd_rem}\n"
+                f"В избранном: {fav_count} (отмечено для 4K: {selected_count})"
             )
         else:
             status_text = (
                 f"📸 Ваша фотосессия\n\n"
-                f"Осталось снимков: {remaining} из {session.takes_limit}\n"
-                f"HD баланс: {balance['total']}\n"
+                f"Осталось снимков: {remaining} из {takes_limit}\n"
+                f"4K баланс: {balance['total']}\n"
                 f"В избранном: {fav_count}"
             )
 
@@ -4674,7 +5174,7 @@ async def paywall_buy(callback: CallbackQuery, bot: Bot):
 
         payload = f"session:{pack_id}"
         title = f"{pack_emoji} {pack_name}"
-        description = pack_description or f"{pack_takes_limit} снимков + {pack_hd_amount} HD"
+        description = pack_description or f"{pack_takes_limit} снимков + {pack_hd_amount} 4K без watermark"
         prices = [LabeledPrice(label=title, amount=pack_stars_price)]
 
         await bot.send_invoice(
@@ -4755,14 +5255,24 @@ async def upgrade_session(callback: CallbackQuery, bot: Bot):
 
 @router.message()
 async def unknown_message(message: Message, state: FSMContext):
-    """Handle unknown messages."""
+    """Handle unknown messages (wrong content type in current state)."""
     current = await state.get_state()
-    if current == BotStates.waiting_for_photo:
+    if current == BotStates.waiting_for_audience:
+        await message.answer(t("audience.prompt", "Для кого создаём образ?"), reply_markup=audience_keyboard())
+    elif current == BotStates.waiting_for_photo:
         await message.answer(t("nav.upload_photo_or_btn", "Отправьте фото или нажмите «🔥 Создать фото»."), reply_markup=main_menu_keyboard())
+    elif current == BotStates.waiting_for_trend:
+        await message.answer("Выберите тематику и тренд по кнопкам выше.")
+    elif current == BotStates.waiting_for_format:
+        await message.answer("Выберите формат кадра по кнопкам выше.")
     elif current == BotStates.waiting_for_reference_photo:
         await message.answer(t("flow.send_reference", "Отправьте картинку-образец для копирования стиля."))
     elif current == BotStates.waiting_for_self_photo:
         await message.answer(t("flow.send_your_photo", "Отправьте свою фотографию."))
+    elif current == BotStates.waiting_for_self_photo_2:
+        await message.answer(t("flow.send_second_photo", "Отправьте вторую фотографию (фото или файл изображения)."))
+    elif current == BotStates.waiting_for_prompt:
+        await message.answer(t("flow.enter_idea", "Введите текстом описание своей идеи для образа (или выберите тренд по кнопкам)."))
     elif current == BotStates.bank_transfer_waiting_receipt:
         await message.answer("📸 Отправьте скриншот или фото чека перевода.")
     else:

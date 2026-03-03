@@ -125,6 +125,7 @@ class TelegramClient:
         photo_path: str,
         caption: str | None = None,
         reply_markup: dict | None = None,
+        parse_mode: str | None = None,
     ) -> None:
         """Send photo to chat. reply_markup — inline-клавиатура (например, «Что дальше?»)."""
         start = time.time()
@@ -134,6 +135,8 @@ class TelegramClient:
                 data = {"chat_id": int(chat_id)}
                 if caption:
                     data["caption"] = runtime_templates.resolve_literal(caption)
+                if parse_mode:
+                    data["parse_mode"] = parse_mode
                 if reply_markup:
                     # В multipart/form-data reply_markup передаётся как JSON-строка
                     data["reply_markup"] = json.dumps(reply_markup)
@@ -186,11 +189,12 @@ class TelegramClient:
         document_path: str,
         caption: str | None = None,
         reply_markup: dict | None = None,
+        filename: str | None = None,
     ) -> None:
-        """Send document to chat (original file, no compression)."""
+        """Send document to chat (original file, no compression). filename — отображаемое имя файла (без пути)."""
         start = time.time()
         try:
-            filename = document_path.split("/")[-1]
+            filename = filename or document_path.split("/")[-1]
             mime_type = "application/octet-stream"
             lower = filename.lower()
             if lower.endswith(".png"):

@@ -131,12 +131,12 @@ class Settings(BaseSettings):
     # ===========================================
     # REFERRAL PROGRAM
     # ===========================================
-    referral_min_pack_stars: int = 249
+    referral_min_pack_stars: int = 153  # Neo Start
     referral_hold_hours: int = 24
     referral_attribution_window_days: int = 7
     referral_daily_limit: int = 2
     referral_monthly_limit: int = 10
-    referral_bonus_ladder: str = '{"249": 2, "499": 4, "999": 8}'
+    referral_bonus_ladder: str = '{"153": 2, "538": 4, "1531": 8}'  # Neo Start / Neo Pro / Neo Unlimited
 
     # ===========================================
     # BANK TRANSFER (альтернативная оплата переводом на карту)
@@ -161,6 +161,8 @@ class Settings(BaseSettings):
     max_worker_concurrency: int = 2
     celery_task_retry_delay: int = 5
     celery_task_max_retries: int = 3
+    # Параллельность генерации вариантов Take: 1 = последовательно, 2 или 3 = параллельно (ThreadPoolExecutor)
+    take_generation_parallel_workers: int = 2
     
     # ===========================================
     # ADMIN API

@@ -26,9 +26,9 @@ def _make_payment(**kwargs):
     p = MagicMock()
     p.id = kwargs.get("id", str(uuid4()))
     p.user_id = kwargs.get("user_id", str(uuid4()))
-    p.stars_amount = kwargs.get("stars_amount", 249)
-    p.pack_id = kwargs.get("pack_id", "premium")
-    p.tokens_granted = kwargs.get("tokens_granted", 80)
+    p.stars_amount = kwargs.get("stars_amount", 153)
+    p.pack_id = kwargs.get("pack_id", "neo_start")
+    p.tokens_granted = kwargs.get("tokens_granted", 0)
     return p
 
 
@@ -98,7 +98,7 @@ class TestAttribution:
 
 
 class TestCreateBonus:
-    @patch("app.referral.service.get_min_pack_stars", return_value=249)
+    @patch("app.referral.service.get_min_pack_stars", return_value=153)
     @patch("app.referral.service.get_hold_hours", return_value=24)
     @patch("app.referral.service.calc_bonus_credits", return_value=2)
     def test_create_bonus_success(self, mock_calc, mock_hold, mock_min):
@@ -106,7 +106,7 @@ class TestCreateBonus:
         db.query.return_value.filter.return_value.first.return_value = None
         referrer = _make_user()
         referral = _make_user()
-        payment = _make_payment(stars_amount=249)
+        payment = _make_payment(stars_amount=153)
 
         from app.referral.service import ReferralService
 
@@ -119,7 +119,7 @@ class TestCreateBonus:
         assert bonus.hd_credits_amount == 2
         assert bonus.status == "pending"
 
-    @patch("app.referral.service.get_min_pack_stars", return_value=249)
+    @patch("app.referral.service.get_min_pack_stars", return_value=153)
     def test_create_bonus_below_threshold(self, mock_min):
         db = MagicMock()
         referrer = _make_user()
@@ -132,12 +132,12 @@ class TestCreateBonus:
         bonus = svc.create_bonus(referrer, referral, payment)
         assert bonus is None
 
-    @patch("app.referral.service.get_min_pack_stars", return_value=249)
+    @patch("app.referral.service.get_min_pack_stars", return_value=153)
     def test_create_bonus_unlock_excluded(self, mock_min):
         db = MagicMock()
         referrer = _make_user()
         referral = _make_user()
-        payment = _make_payment(stars_amount=300, pack_id="unlock")
+        payment = _make_payment(stars_amount=538, pack_id="unlock")
 
         from app.referral.service import ReferralService
 
@@ -145,7 +145,7 @@ class TestCreateBonus:
         bonus = svc.create_bonus(referrer, referral, payment)
         assert bonus is None
 
-    @patch("app.referral.service.get_min_pack_stars", return_value=249)
+    @patch("app.referral.service.get_min_pack_stars", return_value=153)
     @patch("app.referral.service.get_hold_hours", return_value=24)
     @patch("app.referral.service.calc_bonus_credits", return_value=2)
     def test_create_bonus_limits_exceeded(self, mock_calc, mock_hold, mock_min):
@@ -153,7 +153,7 @@ class TestCreateBonus:
         db.query.return_value.filter.return_value.first.return_value = None
         referrer = _make_user()
         referral = _make_user()
-        payment = _make_payment(stars_amount=249)
+        payment = _make_payment(stars_amount=153)
 
         from app.referral.service import ReferralService
 
@@ -162,7 +162,7 @@ class TestCreateBonus:
             bonus = svc.create_bonus(referrer, referral, payment)
         assert bonus is None
 
-    @patch("app.referral.service.get_min_pack_stars", return_value=249)
+    @patch("app.referral.service.get_min_pack_stars", return_value=153)
     @patch("app.referral.service.get_hold_hours", return_value=24)
     @patch("app.referral.service.calc_bonus_credits", return_value=4)
     def test_create_bonus_anomaly_flagged(self, mock_calc, mock_hold, mock_min):
@@ -170,7 +170,7 @@ class TestCreateBonus:
         db.query.return_value.filter.return_value.first.return_value = None
         referrer = _make_user()
         referral = _make_user()
-        payment = _make_payment(stars_amount=499)
+        payment = _make_payment(stars_amount=538)
 
         from app.referral.service import ReferralService
 

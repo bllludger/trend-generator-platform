@@ -56,6 +56,10 @@ type TrendAnalyticsItem = {
   jobs_window?: number
   succeeded_window?: number
   failed_window?: number
+  takes_window?: number
+  takes_succeeded_window?: number
+  takes_failed_window?: number
+  chosen_window?: number
   selected_window?: number
 }
 
@@ -63,6 +67,7 @@ type TelemetryDashboardData = {
   trend_analytics_window?: TrendAnalyticsItem[]
   jobs_total?: number
   jobs_window?: number
+  takes_window?: number
   jobs_by_status?: Record<string, number>
   jobs_failed_by_error?: Record<string, number>
   queue_length?: number
@@ -121,14 +126,22 @@ export function TelemetryPage() {
     refetchInterval: 60000,
   })
 
+  const historyDays = 14
   const { data: historyData } = useQuery({
-    queryKey: ['telemetry-history', 7],
-    queryFn: () => telemetryService.getHistory(7),
+    queryKey: ['telemetry-history', historyDays],
+    queryFn: () => telemetryService.getHistory(historyDays),
   })
 
   const { data: productMetrics } = useQuery({
     queryKey: ['telemetry-product', 30],
     queryFn: () => telemetryService.getProductMetrics(30),
+  })
+
+  const errorsWindowDays = 30
+  const { data: errorsData } = useQuery({
+    queryKey: ['telemetry-errors', errorsWindowDays],
+    queryFn: () => telemetryService.getErrors(errorsWindowDays),
+    refetchInterval: 60000,
   })
 
   if (isLoading) {
@@ -245,7 +258,7 @@ export function TelemetryPage() {
               <BarChart3 className="h-5 w-5" />
               Производительность
             </h2>
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
               <MetricCard
                 title="Всего задач"
                 value={formatNumber(data?.jobs_total ?? 0)}
@@ -281,20 +294,27 @@ export function TelemetryPage() {
                 icon={Clock}
                 color="bg-orange-500"
               />
+              <MetricCard
+                title={`Снимков за ${windowHours}ч`}
+                value={formatNumber(data?.takes_window ?? 0)}
+                subtitle="Take (основной поток)"
+                icon={Activity}
+                color="bg-violet-500"
+              />
             </div>
           </div>
 
           {/* Charts */}
           <div className="grid gap-6 lg:grid-cols-2">
-            {/* Historical trend */}
-            {historyData && historyData.history.length > 0 && (
+            {/* Historical trend: Jobs + Takes + active users (DAU from Job и Take) */}
+            {historyData?.history?.length ? (
               <Card>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <TrendingUp className="h-5 w-5" />
-                    Динамика (7 дней)
+                    Динамика ({historyData.window_days ?? 7} д.)
                   </CardTitle>
-                  <CardDescription>Задачи и активные пользователи</CardDescription>
+                  <CardDescription>Задачи (Job), снимки (Take) и активные пользователи</CardDescription>
                 </CardHeader>
                 <CardContent>
                   <div className="h-[280px]">
@@ -313,6 +333,10 @@ export function TelemetryPage() {
                             <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.8} />
                             <stop offset="95%" stopColor="#f59e0b" stopOpacity={0.1} />
                           </linearGradient>
+                          <linearGradient id="colorTakes" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.8} />
+                            <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0.1} />
+                          </linearGradient>
                         </defs>
                         <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                         <XAxis dataKey="date" tick={{ fontSize: 11 }} className="text-muted-foreground" />
@@ -330,7 +354,15 @@ export function TelemetryPage() {
                           dataKey="jobs_total"
                           stroke="#3b82f6"
                           fill="url(#colorTotal)"
-                          name="Задач"
+                          name="Задач (Job)"
+                          strokeWidth={2}
+                        />
+                        <Area
+                          type="monotone"
+                          dataKey="takes_total"
+                          stroke="#8b5cf6"
+                          fill="url(#colorTakes)"
+                          name="Снимков (Take)"
                           strokeWidth={2}
                         />
                         <Area
@@ -351,6 +383,21 @@ export function TelemetryPage() {
                         />
                       </AreaChart>
                     </ResponsiveContainer>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <TrendingUp className="h-5 w-5" />
+                    Динамика
+                  </CardTitle>
+                  <CardDescription>Нет данных за период</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[280px] flex items-center justify-center text-muted-foreground">
+                    Нет данных за период
                   </div>
                 </CardContent>
               </Card>
@@ -505,9 +552,14 @@ export function TelemetryPage() {
             <CardContent>
               <div className="space-y-4">
                 {(data?.trend_analytics_window ?? []).map((trend: TrendAnalyticsItem) => {
-                  const total = trend.jobs_window ?? 0
-                  const succeeded = trend.succeeded_window ?? 0
+                  const jobs = trend.jobs_window ?? 0
+                  const takes = trend.takes_window ?? 0
+                  const total = jobs + takes
+                  const succeeded =
+                    (trend.succeeded_window ?? 0) + (trend.takes_succeeded_window ?? 0)
+                  const failed = (trend.failed_window ?? 0) + (trend.takes_failed_window ?? 0)
                   const successRate = total > 0 ? ((succeeded / total) * 100).toFixed(1) : '0'
+                  const chosen = trend.chosen_window ?? trend.selected_window ?? 0
                   return (
                     <div
                       key={trend.trend_id}
@@ -517,13 +569,22 @@ export function TelemetryPage() {
                         <span className="text-4xl">{trend.emoji}</span>
                         <div>
                           <div className="font-semibold text-lg">{trend.name}</div>
-                          <div className="flex items-center gap-3 mt-1">
-                            <Badge variant="secondary" className="text-xs">
-                              {trend.jobs_window} задач
-                            </Badge>
-                            <Badge variant="outline" className="text-xs">
-                              {trend.selected_window ?? 0} выборов
-                            </Badge>
+                          <div className="flex items-center gap-3 mt-1 flex-wrap">
+                            {jobs > 0 && (
+                              <Badge variant="secondary" className="text-xs">
+                                {jobs} задач
+                              </Badge>
+                            )}
+                            {takes > 0 && (
+                              <Badge variant="secondary" className="text-xs">
+                                {takes} снимков
+                              </Badge>
+                            )}
+                            {chosen > 0 && (
+                              <Badge variant="outline" className="text-xs">
+                                {chosen} выборов
+                              </Badge>
+                            )}
                             <span className="text-xs text-muted-foreground">
                               Success: {successRate}%
                             </span>
@@ -532,14 +593,12 @@ export function TelemetryPage() {
                       </div>
                       <div className="text-right">
                         <div className="flex items-center gap-2">
-                          <div className="text-2xl font-bold text-green-600">
-                            {trend.succeeded_window}
-                          </div>
+                          <div className="text-2xl font-bold text-green-600">{succeeded}</div>
                           <CheckCircle className="h-5 w-5 text-green-600" />
                         </div>
-                        {(trend.failed_window ?? 0) > 0 && (
+                        {failed > 0 && (
                           <div className="flex items-center gap-2 justify-end mt-1">
-                            <div className="text-sm text-red-600">{trend.failed_window ?? 0}</div>
+                            <div className="text-sm text-red-600">{failed}</div>
                             <AlertCircle className="h-4 w-4 text-red-600" />
                           </div>
                         )}
@@ -559,35 +618,110 @@ export function TelemetryPage() {
 
         {/* HEALTH */}
         <TabsContent value="health" className="space-y-6">
+          {/* График распределения ошибок по датам за 30 дней */}
+          {errorsData?.errors_by_day?.length ? (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <TrendingUp className="h-5 w-5" />
+                  Распределение ошибок по датам ({errorsData.window_days} д.)
+                </CardTitle>
+                <CardDescription>Job и Take по дням</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[280px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={errorsData.errors_by_day}>
+                      <defs>
+                        <linearGradient id="colorJobsFailed" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#ef4444" stopOpacity={0.8} />
+                          <stop offset="95%" stopColor="#ef4444" stopOpacity={0.1} />
+                        </linearGradient>
+                        <linearGradient id="colorTakesFailed" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#f97316" stopOpacity={0.8} />
+                          <stop offset="95%" stopColor="#f97316" stopOpacity={0.1} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                      <XAxis dataKey="date" tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                      <YAxis tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: 'hsl(var(--background))',
+                          border: '1px solid hsl(var(--border))',
+                          borderRadius: '8px',
+                        }}
+                      />
+                      <Legend wrapperStyle={{ fontSize: '12px' }} />
+                      <Area
+                        type="monotone"
+                        dataKey="jobs_failed"
+                        stroke="#ef4444"
+                        fill="url(#colorJobsFailed)"
+                        name="Job (перегенерация)"
+                        strokeWidth={2}
+                        stackId="1"
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="takes_failed"
+                        stroke="#f97316"
+                        fill="url(#colorTakesFailed)"
+                        name="Take (снимок)"
+                        strokeWidth={2}
+                        stackId="1"
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </CardContent>
+            </Card>
+          ) : null}
+
           <div className="grid gap-6 md:grid-cols-2">
-            {/* Errors */}
+            {/* Полная телеметрия ошибок за 30 дней (Job + Take) */}
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <AlertCircle className="h-5 w-5 text-red-600" />
-                  Ошибки ({windowHours}ч)
+                  Ошибки ({errorsData?.window_days ?? 30} д.)
                 </CardTitle>
                 <CardDescription>
-                  Топ ошибок за период
+                  Все ошибки Job и Take за период (телеметрия)
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="space-y-2 max-h-[300px] overflow-y-auto">
-                  {Object.entries(data?.jobs_failed_by_error ?? {})
-                    .sort((a, b) => (b[1] as number) - (a[1] as number))
-                    .slice(0, 10)
-                    .map(([code, count]) => (
-                      <div
-                        key={code}
-                        className="flex items-center justify-between p-3 rounded-lg border bg-card"
-                      >
-                        <span className="font-mono text-sm text-muted-foreground truncate flex-1">
-                          {code}
-                        </span>
-                        <Badge variant="destructive">{formatNumber(count as number)}</Badge>
-                      </div>
-                    ))}
-                  {Object.keys(data?.jobs_failed_by_error ?? {}).length === 0 && (
+                <div className="space-y-2 max-h-[400px] overflow-y-auto">
+                  {Object.entries(errorsData?.combined ?? {})
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([code, count]) => {
+                      const jobCnt = errorsData?.jobs_failed_by_error?.[code] ?? 0
+                      const takeCnt = errorsData?.takes_failed_by_error?.[code] ?? 0
+                      return (
+                        <div
+                          key={code}
+                          className="flex items-center justify-between p-3 rounded-lg border bg-card gap-2"
+                        >
+                          <span className="font-mono text-sm text-muted-foreground truncate flex-1" title={code}>
+                            {code}
+                          </span>
+                          <div className="flex items-center gap-2 shrink-0">
+                            {jobCnt > 0 && (
+                              <Badge variant="secondary" title="Job (перегенерация)">
+                                J: {formatNumber(jobCnt)}
+                              </Badge>
+                            )}
+                            {takeCnt > 0 && (
+                              <Badge variant="secondary" title="Take (снимок)">
+                                T: {formatNumber(takeCnt)}
+                              </Badge>
+                            )}
+                            <Badge variant="destructive">{formatNumber(count)}</Badge>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  {Object.keys(errorsData?.combined ?? {}).length === 0 && (
                     <p className="text-center text-muted-foreground py-8">
                       Нет ошибок за выбранный период 🎉
                     </p>

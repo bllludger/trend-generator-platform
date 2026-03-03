@@ -46,8 +46,8 @@ def process_pending_bonuses() -> dict:
                         try:
                             telegram.send_message(
                                 referrer.telegram_id,
-                                f"🎁 Бонус доступен: +HD credits на твоём балансе!\n"
-                                f"Доступно: {referrer.hd_credits_balance} HD credits.\n"
+                                f"🎁 Бонус доступен: +4K на твоём балансе!\n"
+                                f"Доступно: {referrer.hd_credits_balance} бонусов 4K.\n"
                                 f"Используй при разблокировке фото.",
                             )
                         except Exception:

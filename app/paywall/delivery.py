@@ -21,10 +21,13 @@ def prepare_delivery(
     storage_dir: str,
     job_id: str,
     attempt: int | str,
+    *,
+    watermark_params: dict | None = None,
 ) -> DeliveryResult:
     """
     По решению access при необходимости накладывает watermark, сохраняет файлы
     с именами {job_id}_{attempt}_preview.{ext} / _original.{ext}; возвращает пути и флаги.
+    watermark_params: опционально {"text", "opacity", "tile_spacing"} из админки.
     """
     if not os.path.isfile(raw_file_path):
         raise FileNotFoundError(f"Raw file not found: {raw_file_path}")
@@ -37,7 +40,7 @@ def prepare_delivery(
     if access_decision.show_preview:
         os.makedirs(storage_dir, exist_ok=True)
         shutil.copy2(raw_file_path, original_path)
-        apply_watermark(raw_file_path, preview_path)
+        apply_watermark(raw_file_path, preview_path, params=watermark_params)
         logger.info(
             "paywall_delivery_preview",
             extra={"job_id": job_id, "attempt": attempt, "preview": preview_path, "original": original_path},

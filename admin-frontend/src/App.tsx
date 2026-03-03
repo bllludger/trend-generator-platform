@@ -18,6 +18,7 @@ import { BroadcastPage } from '@/pages/BroadcastPage'
 import { CleanupPage } from '@/pages/CleanupPage'
 import { CopyStylePage } from '@/pages/CopyStylePage'
 import { TrendsPage } from '@/pages/TrendsPage'
+import { TrendsAnalyticsPage } from '@/pages/TrendsAnalyticsPage'
 import PromptPlaygroundPage from '@/pages/PromptPlaygroundPage'
 import ReferralsPage from '@/pages/ReferralsPage'
 
@@ -45,6 +46,7 @@ export default function App() {
           <Route path="audit" element={<AuditPage />} />
           <Route path="telemetry" element={<TelemetryPage />} />
           <Route path="trends" element={<TrendsPage />} />
+          <Route path="trends-analytics" element={<TrendsAnalyticsPage />} />
           <Route path="prompt-playground" element={<PromptPlaygroundPage />} />
           <Route path="copy-style" element={<CopyStylePage />} />
           <Route path="settings" element={<SettingsPage />} />

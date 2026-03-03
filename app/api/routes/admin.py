@@ -19,7 +19,9 @@ from app.models.audit_log import AuditLog
 from app.models.bank_transfer_receipt_log import BankTransferReceiptLog
 from app.models.job import Job
 from app.models.pack import Pack
+from app.models.take import Take
 from app.models.payment import Payment
+from app.constants import AUDIENCE_CHOICES, normalize_target_audiences
 from app.models.theme import Theme
 from app.models.trend import Trend
 from app.models.user import User
@@ -226,16 +228,33 @@ def transfer_policy_put(payload: dict, db: Session = Depends(get_db)):
 # ---------- Master prompt (Generation Prompt Settings: INPUT, TASK, IDENTITY, SAFETY + defaults) ----------
 @router.get("/settings/master-prompt")
 def master_prompt_get(db: Session = Depends(get_db)):
-    from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
     svc = GenerationPromptSettingsService(db)
-    return svc.as_dict()
+    app_svc = AppSettingsService(db)
+    result = svc.as_dict()
+    app_dict = app_svc.as_dict()
+    result["use_nano_banana_pro"] = app_dict.get("use_nano_banana_pro", False)
+    result["watermark_text"] = app_dict.get("watermark_text")
+    result["watermark_text_effective"] = (
+        app_dict.get("watermark_text") or getattr(app_settings, "watermark_text", "NanoBanan Preview")
+    )
+    result["watermark_opacity"] = app_dict.get("watermark_opacity", 60)
+    result["watermark_tile_spacing"] = app_dict.get("watermark_tile_spacing", 200)
+    result["take_preview_max_dim"] = app_dict.get("take_preview_max_dim", 800)
+    return result
 
 
 @router.put("/settings/master-prompt")
 def master_prompt_put(payload: dict, db: Session = Depends(get_db)):
-    from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
     svc = GenerationPromptSettingsService(db)
-    return svc.update(payload)
+    app_svc = AppSettingsService(db)
+    app_keys = {"use_nano_banana_pro", "watermark_text", "watermark_opacity", "watermark_tile_spacing", "take_preview_max_dim"}
+    app_payload = {k: v for k, v in payload.items() if k in app_keys}
+    if app_payload:
+        app_svc.update(app_payload)
+    data = {k: v for k, v in payload.items() if k not in app_keys}
+    if data:
+        svc.update(data)
+    return master_prompt_get(db)
 
 
 # ---------- Env / App settings ----------
@@ -277,9 +296,13 @@ def _users_analytics_since(db: Session, since: datetime) -> tuple[int, int, list
     for i in range(14):
         d = (now - timedelta(days=13 - i)).date()
         growth_list.append({"date": str(d), "new_users": growth_map.get(str(d), 0)})
-    # Jobs in window: total and per user
     jobs_in_window = (
-        db.query(Job.user_id, func.count(Job.job_id).label("jobs_count"), func.sum(case((Job.status == "SUCCEEDED", 1), else_=0)).label("succeeded"))
+        db.query(
+            Job.user_id,
+            func.count(Job.job_id).label("jobs_count"),
+            func.sum(case((Job.status == "SUCCEEDED", 1), else_=0)).label("succeeded"),
+            func.sum(case((Job.status.in_(["FAILED", "ERROR"]), 1), else_=0)).label("failed"),
+        )
         .filter(Job.created_at >= since)
         .group_by(Job.user_id)
     )
@@ -287,15 +310,41 @@ def _users_analytics_since(db: Session, since: datetime) -> tuple[int, int, list
     top_list = []
     for row in jobs_in_window:
         total_jobs += row.jobs_count or 0
-        top_list.append({"user_id": row.user_id, "jobs_count": int(row.jobs_count or 0), "succeeded": int(row.succeeded or 0)})
+        top_list.append({
+            "user_id": row.user_id,
+            "jobs_count": int(row.jobs_count or 0),
+            "succeeded": int(row.succeeded or 0),
+            "failed": int(row.failed or 0),
+        })
     top_list.sort(key=lambda x: x["jobs_count"], reverse=True)
     users_with_jobs = len(top_list)
-    # Enrich top with telegram_id from User
     user_ids = [t["user_id"] for t in top_list[:20]]
-    users_map = {u.id: u.telegram_id for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+    users_rows = db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else []
+    users_map = {}
+    for u in users_rows:
+        if u.telegram_username:
+            display_name = f"@{u.telegram_username}"
+        else:
+            name = f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip()
+            display_name = name or u.telegram_id
+        users_map[u.id] = {
+            "telegram_id": u.telegram_id,
+            "user_display_name": display_name,
+            "subscription_active": u.subscription_active,
+            "token_balance": u.token_balance or 0,
+        }
+    top_users = []
     for t in top_list[:10]:
-        t["telegram_id"] = users_map.get(t["user_id"], t["user_id"])
-    top_users = [{"telegram_id": t["telegram_id"], "jobs_count": t["jobs_count"], "succeeded": t["succeeded"]} for t in top_list[:10]]
+        u = users_map.get(t["user_id"], {})
+        top_users.append({
+            "telegram_id": u.get("telegram_id", t["user_id"]),
+            "user_display_name": u.get("user_display_name"),
+            "jobs_count": t["jobs_count"],
+            "succeeded": t["succeeded"],
+            "failed": t["failed"],
+            "subscription_active": u.get("subscription_active", False),
+            "token_balance": u.get("token_balance", 0),
+        })
     return users_with_jobs, total_jobs, growth_list, top_users
 
 
@@ -488,9 +537,32 @@ def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query
     users_subscribed = db.query(func.count(User.id)).filter(User.subscription_active.is_(True)).scalar() or 0
     jobs_total = db.query(func.count(Job.job_id)).scalar() or 0
     jobs_window, jobs_by_status = _telemetry_since(db, since)
+    takes_window = (
+        db.query(func.count(Take.id)).filter(Take.created_at >= since).scalar() or 0
+    )
     succeeded = (db.query(func.count(Job.job_id)).filter(Job.status == "SUCCEEDED").scalar() or 0)
     queue_length = (db.query(func.count(Job.job_id)).filter(Job.status.in_(["CREATED", "RUNNING"])).scalar() or 0)
-    # Топ трендов за окно: trend_id, name, emoji, jobs_window, succeeded_window, failed_window
+    # Статистика Take по трендам за окно (снимки — основной флоу «Создать фото»)
+    take_stats_q = (
+        db.query(
+            Take.trend_id,
+            func.count(Take.id).label("takes_window"),
+            func.sum(case((Take.status.in_(["ready", "partial_fail"]), 1), else_=0)).label("takes_succeeded"),
+            func.sum(case((Take.status == "failed", 1), else_=0)).label("takes_failed"),
+        )
+        .filter(Take.trend_id.isnot(None), Take.trend_id != "", Take.created_at >= since)
+        .group_by(Take.trend_id)
+        .all()
+    )
+    take_stats_by_trend = {
+        r.trend_id: {
+            "takes_window": r.takes_window or 0,
+            "takes_succeeded": r.takes_succeeded or 0,
+            "takes_failed": r.takes_failed or 0,
+        }
+        for r in take_stats_q
+    }
+    # Топ трендов за окно: по Job (задачи) и по Take (снимки)
     trend_stats = (
         db.query(
             Trend.id,
@@ -514,9 +586,68 @@ def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query
             "jobs_window": r.jobs_window or 0,
             "succeeded_window": r.succeeded_window or 0,
             "failed_window": r.failed_window or 0,
+            "takes_window": take_stats_by_trend.get(r.id, {}).get("takes_window", 0),
+            "takes_succeeded_window": take_stats_by_trend.get(r.id, {}).get("takes_succeeded", 0),
+            "takes_failed_window": take_stats_by_trend.get(r.id, {}).get("takes_failed", 0),
         }
         for r in trend_stats
     ]
+    # Добавить тренды, у которых есть только Take (снимки), без Job
+    trend_ids_in_analytics = {t["trend_id"] for t in trend_analytics_window}
+    only_take_trend_ids = [tid for tid in take_stats_by_trend if tid not in trend_ids_in_analytics]
+    if only_take_trend_ids:
+        for trend_row in db.query(Trend).filter(Trend.id.in_(only_take_trend_ids)).all():
+            ts = take_stats_by_trend.get(trend_row.id, {})
+            trend_analytics_window.append({
+                "trend_id": trend_row.id,
+                "name": trend_row.name or trend_row.id,
+                "emoji": trend_row.emoji or "",
+                "jobs_window": 0,
+                "succeeded_window": 0,
+                "failed_window": 0,
+                "takes_window": ts.get("takes_window", 0),
+                "takes_succeeded_window": ts.get("takes_succeeded", 0),
+                "takes_failed_window": ts.get("takes_failed", 0),
+            })
+    # Телеметрия «какие картинки выбраны»: выбор варианта (в избранное) по трендам за окно
+    chosen_actions = ("choose_best_variant", "favorites_auto_add")
+    chosen_q = (
+        db.query(
+            func.coalesce(AuditLog.payload["trend_id"].astext, "").label("trend_id"),
+            func.count(AuditLog.id).label("cnt"),
+        )
+        .filter(
+            AuditLog.action.in_(chosen_actions),
+            AuditLog.created_at >= since,
+        )
+        .group_by(func.coalesce(AuditLog.payload["trend_id"].astext, ""))
+    )
+    variants_chosen_by_trend = {
+        r.trend_id: r.cnt for r in chosen_q.all() if r.trend_id and str(r.trend_id).strip()
+    }
+    for t in trend_analytics_window:
+        t["chosen_window"] = variants_chosen_by_trend.get(t["trend_id"], 0)
+    # Сортировка по суммарной активности (задачи + снимки), чтобы топ был релевантным
+    def _trend_activity(t: dict) -> int:
+        return (t.get("jobs_window") or 0) + (t.get("takes_window") or 0)
+    trend_analytics_window.sort(key=_trend_activity, reverse=True)
+    trend_ids_in_analytics = {t["trend_id"] for t in trend_analytics_window}
+    only_chosen_ids = [tid for tid in variants_chosen_by_trend if tid not in trend_ids_in_analytics]
+    if only_chosen_ids:
+        for trend_row in db.query(Trend).filter(Trend.id.in_(only_chosen_ids)).all():
+            ts = take_stats_by_trend.get(trend_row.id, {})
+            trend_analytics_window.append({
+                "trend_id": trend_row.id,
+                "name": trend_row.name or trend_row.id,
+                "emoji": trend_row.emoji or "",
+                "jobs_window": 0,
+                "succeeded_window": 0,
+                "failed_window": 0,
+                "takes_window": ts.get("takes_window", 0),
+                "takes_succeeded_window": ts.get("takes_succeeded", 0),
+                "takes_failed_window": ts.get("takes_failed", 0),
+                "chosen_window": variants_chosen_by_trend.get(trend_row.id, 0),
+            })
     # Ошибки по коду за окно
     failed_by_code_q = (
         db.query(func.coalesce(Job.error_code, "unknown").label("code"), func.count(Job.job_id).label("cnt"))
@@ -524,17 +655,20 @@ def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query
         .group_by(func.coalesce(Job.error_code, "unknown"))
     )
     jobs_failed_by_error = {row[0]: row[1] for row in failed_by_code_q}
+
     return {
         "window_hours": window_hours,
         "users_total": users_total,
         "users_subscribed": users_subscribed,
         "jobs_total": jobs_total,
         "jobs_window": jobs_window,
+        "takes_window": takes_window,
         "queue_length": queue_length,
         "succeeded": succeeded,
         "jobs_by_status": jobs_by_status,
         "jobs_failed_by_error": jobs_failed_by_error,
         "trend_analytics_window": trend_analytics_window,
+        "variants_chosen_by_trend": variants_chosen_by_trend,
     }
 
 
@@ -569,34 +703,148 @@ def telemetry_trends(db: Session = Depends(get_db), window_hours: int = Query(24
     return {"window_hours": window_hours, "trend_analytics_window": trends}
 
 
+@router.get("/telemetry/errors")
+def telemetry_errors(db: Session = Depends(get_db), window_days: int = Query(30, ge=1, le=90)):
+    """Телеметрия ошибок за период: Job и Take по error_code + распределение по датам. По умолчанию 30 дней."""
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=window_days)
+    job_errors = (
+        db.query(func.coalesce(Job.error_code, "unknown").label("code"), func.count(Job.job_id).label("cnt"))
+        .filter(Job.status == "FAILED", Job.created_at >= since)
+        .group_by(func.coalesce(Job.error_code, "unknown"))
+        .all()
+    )
+    take_errors = (
+        db.query(func.coalesce(Take.error_code, "unknown").label("code"), func.count(Take.id).label("cnt"))
+        .filter(Take.status == "failed", Take.created_at >= since)
+        .group_by(func.coalesce(Take.error_code, "unknown"))
+        .all()
+    )
+    jobs_failed_by_error = {row[0]: row[1] for row in job_errors}
+    takes_failed_by_error = {row[0]: row[1] for row in take_errors}
+    combined: dict[str, dict[str, int]] = {}
+    for code, cnt in job_errors:
+        combined.setdefault(code, {"job": 0, "take": 0})["job"] = cnt
+    for code, cnt in take_errors:
+        combined.setdefault(code, {"job": 0, "take": 0})["take"] = cnt
+
+    # Распределение ошибок по датам за окно (для графика)
+    jobs_by_day = (
+        db.query(func.date(Job.created_at).label("date"), func.count(Job.job_id).label("cnt"))
+        .filter(Job.status == "FAILED", Job.created_at >= since)
+        .group_by(func.date(Job.created_at))
+        .all()
+    )
+    takes_by_day = (
+        db.query(func.date(Take.created_at).label("date"), func.count(Take.id).label("cnt"))
+        .filter(Take.status == "failed", Take.created_at >= since)
+        .group_by(func.date(Take.created_at))
+        .all()
+    )
+    jobs_failed_by_date = {str(r.date): r.cnt for r in jobs_by_day}
+    takes_failed_by_date = {str(r.date): r.cnt for r in takes_by_day}
+    errors_by_day = []
+    for i in range(window_days):
+        d = (now - timedelta(days=window_days - 1 - i)).date()
+        key = str(d)
+        j_cnt = jobs_failed_by_date.get(key, 0)
+        t_cnt = takes_failed_by_date.get(key, 0)
+        errors_by_day.append({
+            "date": key,
+            "jobs_failed": j_cnt,
+            "takes_failed": t_cnt,
+            "total": j_cnt + t_cnt,
+        })
+
+    return {
+        "window_days": window_days,
+        "jobs_failed_by_error": jobs_failed_by_error,
+        "takes_failed_by_error": takes_failed_by_error,
+        "combined": {code: data["job"] + data["take"] for code, data in combined.items()},
+        "errors_by_day": errors_by_day,
+    }
+
+
 @router.get("/telemetry/history")
 def telemetry_history(db: Session = Depends(get_db), window_days: int = Query(7, ge=1)):
-    since = datetime.now(timezone.utc) - timedelta(days=window_days)
-    # По дням: date, jobs_total, jobs_succeeded, jobs_failed, active_users
-    day = func.date(Job.created_at)
-    q = (
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=window_days)
+    day_j = func.date(Job.created_at)
+    q_jobs = (
         db.query(
-            day.label("date"),
+            day_j.label("date"),
             func.count(Job.job_id).label("jobs_total"),
             func.sum(case((Job.status == "SUCCEEDED", 1), else_=0)).label("jobs_succeeded"),
             func.sum(case((Job.status == "FAILED", 1), else_=0)).label("jobs_failed"),
-            func.count(func.distinct(Job.user_id)).label("active_users"),
+            func.count(func.distinct(Job.user_id)).label("job_users"),
         )
         .filter(Job.created_at >= since)
-        .group_by(day)
-        .order_by(day)
+        .group_by(day_j)
+        .order_by(day_j)
     )
-    history = [
-        {
-            "date": str(r.date),
+    jobs_rows = q_jobs.all()
+    by_date = {
+        str(r.date): {
             "jobs_total": r.jobs_total or 0,
             "jobs_succeeded": r.jobs_succeeded or 0,
             "jobs_failed": r.jobs_failed or 0,
-            "active_users": r.active_users or 0,
         }
-        for r in q.all()
-    ]
+        for r in jobs_rows
+    }
+    job_user_pairs = (
+        db.query(func.date(Job.created_at).label("date"), Job.user_id)
+        .filter(Job.created_at >= since, Job.user_id.isnot(None))
+        .distinct()
+        .all()
+    )
+    take_user_pairs = (
+        db.query(func.date(Take.created_at).label("date"), Take.user_id)
+        .filter(Take.created_at >= since, Take.user_id.isnot(None))
+        .distinct()
+        .all()
+    )
+    users_by_date: dict[str, set[str]] = {}
+    for d, uid in job_user_pairs:
+        if uid:
+            users_by_date.setdefault(str(d), set()).add(uid)
+    for d, uid in take_user_pairs:
+        if uid:
+            users_by_date.setdefault(str(d), set()).add(uid)
+    takes_by_date = (
+        db.query(func.date(Take.created_at).label("date"), func.count(Take.id).label("cnt"))
+        .filter(Take.created_at >= since)
+        .group_by(func.date(Take.created_at))
+        .all()
+    )
+    takes_by_date_map = {str(r.date): r.cnt for r in takes_by_date}
+    history = []
+    for i in range(window_days):
+        d = (now - timedelta(days=window_days - 1 - i)).date()
+        key = str(d)
+        row = by_date.get(key, {"jobs_total": 0, "jobs_succeeded": 0, "jobs_failed": 0})
+        active_users = len(users_by_date.get(key, set()))
+        history.append({
+            "date": key,
+            "jobs_total": row["jobs_total"],
+            "jobs_succeeded": row["jobs_succeeded"],
+            "jobs_failed": row["jobs_failed"],
+            "active_users": active_users,
+            "takes_total": takes_by_date_map.get(key, 0),
+        })
     return {"window_days": window_days, "history": history}
+
+
+def _active_user_ids_in_period(db: Session, since: datetime) -> set[str]:
+    """Уникальные user_id, у которых есть хотя бы один Job или Take за период (основной поток — Take)."""
+    job_users = {
+        r[0] for r in db.query(Job.user_id).filter(Job.created_at >= since).distinct().all()
+        if r[0]
+    }
+    take_users = {
+        r[0] for r in db.query(Take.user_id).filter(Take.created_at >= since).distinct().all()
+        if r[0]
+    }
+    return job_users | take_users
 
 
 @router.get("/telemetry/product-metrics")
@@ -606,24 +854,9 @@ def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = 
     since_7d = now - timedelta(days=7)
     since_30d = now - timedelta(days=30)
 
-    dau = (
-        db.query(func.count(func.distinct(Job.user_id)))
-        .filter(Job.created_at >= since_1d)
-        .scalar()
-        or 0
-    )
-    wau = (
-        db.query(func.count(func.distinct(Job.user_id)))
-        .filter(Job.created_at >= since_7d)
-        .scalar()
-        or 0
-    )
-    mau = (
-        db.query(func.count(func.distinct(Job.user_id)))
-        .filter(Job.created_at >= since_30d)
-        .scalar()
-        or 0
-    )
+    dau = len(_active_user_ids_in_period(db, since_1d))
+    wau = len(_active_user_ids_in_period(db, since_7d))
+    mau = len(_active_user_ids_in_period(db, since_30d))
     stickiness_pct = round((dau / mau * 100) if mau else 0)
 
     funnel_actions = [
@@ -654,7 +887,35 @@ def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = 
     stars_sum = sum(int(p.get("stars", 0)) for p in pay_success_list)
     avg_stars_per_pay_success = round(stars_sum / total_pay_success, 1) if total_pay_success else 0.0
 
-    metrics = {
+    # Распределение пользователей по числу задач (Job) за окно — для графика Engagement
+    jobs_per_user_q = (
+        db.query(Job.user_id, func.count(Job.job_id).label("cnt"))
+        .filter(Job.created_at >= since_window, Job.user_id.isnot(None))
+        .group_by(Job.user_id)
+    )
+    dist_1 = dist_2_5 = dist_6_10 = dist_11_20 = dist_21_plus = 0
+    for _uid, cnt in jobs_per_user_q.all():
+        if cnt >= 21:
+            dist_21_plus += 1
+        elif cnt >= 11:
+            dist_11_20 += 1
+        elif cnt >= 6:
+            dist_6_10 += 1
+        elif cnt >= 2:
+            dist_2_5 += 1
+        else:
+            dist_1 += 1
+    jobs_per_user_distribution = {
+        "1": dist_1,
+        "2_5": dist_2_5,
+        "6_10": dist_6_10,
+        "11_20": dist_11_20,
+        "21_plus": dist_21_plus,
+    }
+
+    # Ответ плоский, чтобы фронт мог использовать productMetrics.dau без .metrics
+    return {
+        "window_days": window_days,
         "dau": dau,
         "wau": wau,
         "mau": mau,
@@ -664,8 +925,8 @@ def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = 
         "avg_stars_per_pay_success": avg_stars_per_pay_success,
         "trial_purchases_count": trial_purchases,
         "total_pay_success_count": total_pay_success,
+        "jobs_per_user_distribution": jobs_per_user_distribution,
     }
-    return {"window_days": window_days, "metrics": metrics}
 
 
 # ---------- Bank transfer ----------
@@ -1044,16 +1305,18 @@ def sessions_list(
 
 
 # ---------- Themes ----------
-THEME_EDIT_FIELDS = {"name", "emoji", "order_index", "enabled"}
+THEME_EDIT_FIELDS = {"name", "emoji", "order_index", "enabled", "target_audiences"}
 
 
 def _theme_to_item(theme: Theme) -> dict:
+    audiences = getattr(theme, "target_audiences", None)
     return {
         "id": theme.id,
         "name": theme.name,
         "emoji": theme.emoji or "",
         "order_index": theme.order_index,
         "enabled": theme.enabled,
+        "target_audiences": normalize_target_audiences(audiences),
     }
 
 
@@ -1073,6 +1336,13 @@ def admin_themes_get(theme_id: str, db: Session = Depends(get_db)):
     return _theme_to_item(theme)
 
 
+def _normalize_theme_target_audiences(value) -> list:
+    """Валидация: только women, men, couples; минимум один."""
+    normalized = normalize_target_audiences(value)
+    allowed = [x for x in normalized if x in AUDIENCE_CHOICES]
+    return allowed if allowed else ["women"]
+
+
 @router.post("/themes")
 def admin_themes_post(payload: dict = Body(...), db: Session = Depends(get_db)):
     svc = ThemeService(db)
@@ -1080,6 +1350,10 @@ def admin_themes_post(payload: dict = Body(...), db: Session = Depends(get_db)):
     data.setdefault("emoji", "")
     data.setdefault("order_index", 0)
     data.setdefault("enabled", True)
+    if "target_audiences" in data:
+        data["target_audiences"] = _normalize_theme_target_audiences(data["target_audiences"])
+    else:
+        data.setdefault("target_audiences", ["women"])
     themes = svc.list_all()
     if themes:
         data.setdefault("order_index", max(t.order_index for t in themes) + 1)
@@ -1094,6 +1368,8 @@ def admin_themes_put(theme_id: str, payload: dict = Body(...), db: Session = Dep
     if not theme:
         raise HTTPException(404, "Theme not found")
     data = {k: v for k, v in payload.items() if k in THEME_EDIT_FIELDS}
+    if "target_audiences" in data:
+        data["target_audiences"] = _normalize_theme_target_audiences(data["target_audiences"])
     if not data:
         return _theme_to_item(theme)
     svc.update(theme, data)
@@ -1127,8 +1403,8 @@ def admin_themes_delete(theme_id: str, db: Session = Depends(get_db)):
 TREND_EDIT_FIELDS = {
     "name", "emoji", "description", "system_prompt", "scene_prompt", "subject_prompt",
     "negative_prompt", "negative_scene", "composition_prompt", "subject_mode", "framing_hint", "style_preset",
-    "max_images", "enabled", "order_index", "theme_id", "prompt_sections", "prompt_model", "prompt_size",
-    "prompt_format", "prompt_temperature", "prompt_seed", "prompt_image_size_tier",
+    "max_images", "enabled", "order_index", "theme_id", "target_audiences",
+    "prompt_sections", "prompt_model", "prompt_size", "prompt_format", "prompt_temperature", "prompt_seed", "prompt_image_size_tier",
 }
 MAX_TREND_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 ALLOWED_TREND_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -1147,6 +1423,7 @@ def _trend_to_item(t: Trend) -> dict:
         "description": t.description,
         "enabled": t.enabled,
         "order_index": t.order_index,
+        "target_audiences": normalize_target_audiences(getattr(t, "target_audiences", None)),
         "has_example": example_path is not None,
         "prompt_config_source": "playground" if has_playground else "scene",
         "subject_mode": t.subject_mode or "face",
@@ -1173,6 +1450,7 @@ def _trend_to_detail(t: Trend) -> dict:
         "max_images": t.max_images,
         "enabled": t.enabled,
         "order_index": t.order_index,
+        "target_audiences": normalize_target_audiences(getattr(t, "target_audiences", None)),
         "prompt_sections": t.prompt_sections,
         "prompt_model": t.prompt_model,
         "prompt_size": t.prompt_size,
@@ -1197,6 +1475,67 @@ def admin_trends_list(db: Session = Depends(get_db)):
     return [_trend_to_item(t) for t in trends]
 
 
+@router.get("/trends/analytics")
+def admin_trends_analytics(
+    db: Session = Depends(get_db),
+    window_days: int = Query(30, ge=1, le=365),
+):
+    """Аналитика по всем трендам: сколько успешно сгенерировано, сколько с ошибкой/не доставлено."""
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    svc = TrendService(db)
+    all_trends = svc.list_all()
+    trend_ids = [t.id for t in all_trends]
+    # Job по trend_id за окно
+    job_stats = (
+        db.query(
+            Job.trend_id,
+            func.count(Job.job_id).label("total"),
+            func.sum(case((Job.status == "SUCCEEDED", 1), else_=0)).label("succeeded"),
+            func.sum(case((Job.status.in_(["FAILED", "ERROR"]), 1), else_=0)).label("failed"),
+        )
+        .filter(Job.trend_id.in_(trend_ids), Job.created_at >= since)
+        .group_by(Job.trend_id)
+        .all()
+    )
+    job_by_trend = {
+        r.trend_id: {"total": r.total or 0, "succeeded": r.succeeded or 0, "failed": r.failed or 0}
+        for r in job_stats
+    }
+    # Take по trend_id за окно
+    take_stats = (
+        db.query(
+            Take.trend_id,
+            func.count(Take.id).label("total"),
+            func.sum(case((Take.status.in_(["ready", "partial_fail"]), 1), else_=0)).label("succeeded"),
+            func.sum(case((Take.status == "failed", 1), else_=0)).label("failed"),
+        )
+        .filter(Take.trend_id.in_(trend_ids), Take.created_at >= since)
+        .group_by(Take.trend_id)
+        .all()
+    )
+    take_by_trend = {
+        r.trend_id: {"total": r.total or 0, "succeeded": r.succeeded or 0, "failed": r.failed or 0}
+        for r in take_stats
+    }
+    items = []
+    for t in all_trends:
+        j = job_by_trend.get(t.id, {"total": 0, "succeeded": 0, "failed": 0})
+        tk = take_by_trend.get(t.id, {"total": 0, "succeeded": 0, "failed": 0})
+        items.append({
+            "trend_id": t.id,
+            "name": t.name or t.id,
+            "emoji": t.emoji or "",
+            "theme_id": t.theme_id,
+            "jobs_total": j["total"],
+            "jobs_succeeded": j["succeeded"],
+            "jobs_failed": j["failed"],
+            "takes_total": tk["total"],
+            "takes_succeeded": tk["succeeded"],
+            "takes_failed": tk["failed"],
+        })
+    return {"window_days": window_days, "items": items}
+
+
 @router.get("/trends/{trend_id}")
 def admin_trends_get(trend_id: str, db: Session = Depends(get_db)):
     svc = TrendService(db)
@@ -1207,9 +1546,11 @@ def admin_trends_get(trend_id: str, db: Session = Depends(get_db)):
 
 
 def _normalize_trend_payload(data: dict) -> dict:
-    """Нормализуем theme_id: пустая строка или пустое значение → None."""
+    """Нормализуем theme_id и target_audiences."""
     if "theme_id" in data and (data["theme_id"] is None or data["theme_id"] == ""):
         data = {**data, "theme_id": None}
+    if "target_audiences" in data:
+        data["target_audiences"] = _normalize_theme_target_audiences(data["target_audiences"])
     return data
 
 
@@ -1331,7 +1672,7 @@ def admin_trends_playground_config(trend_id: str, db: Session = Depends(get_db))
     if not trend:
         raise HTTPException(404, "Trend not found")
     gs = GenerationPromptSettingsService(db)
-    effective = gs.get_effective()
+    effective = gs.get_effective(profile="preview")
     config = trend_to_playground_config(
         trend,
         default_model=effective.get("default_model", "gemini-2.5-flash-image"),
@@ -1406,6 +1747,7 @@ def audit_list(
     action: str | None = None,
     actor_type: str | None = None,
     entity_type: str | None = None,
+    audience: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     search: str | None = None,
@@ -1415,6 +1757,8 @@ def audit_list(
     q = db.query(AuditLog)
     if action:
         q = q.filter(AuditLog.action == action)
+    if audience and audience.strip() in ("women", "men", "couples"):
+        q = q.filter(AuditLog.payload["audience"].astext == audience.strip())
     if actor_type:
         q = q.filter(AuditLog.actor_type == actor_type)
     if entity_type:
@@ -1442,11 +1786,33 @@ def audit_list(
     total = q.count()
     q = q.order_by(AuditLog.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
     rows = q.all()
+
+    actor_ids = {r.actor_id for r in rows if r.actor_type == "user" and r.actor_id}
+    display_map: dict[str, str] = {}
+    if actor_ids:
+        users = (
+            db.query(
+                User.telegram_id,
+                User.telegram_username,
+                User.telegram_first_name,
+                User.telegram_last_name,
+            )
+            .filter(User.telegram_id.in_(actor_ids))
+            .all()
+        )
+        for u in users:
+            if u.telegram_username:
+                display_map[u.telegram_id] = f"@{u.telegram_username}"
+            else:
+                name = f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip()
+                display_map[u.telegram_id] = name or u.telegram_id
+
     items = [
         {
             "id": r.id,
             "actor_type": r.actor_type,
             "actor_id": r.actor_id,
+            "actor_display_name": display_map.get(r.actor_id) if r.actor_type == "user" and r.actor_id else None,
             "action": r.action,
             "entity_type": r.entity_type,
             "entity_id": r.entity_id,
@@ -1464,6 +1830,129 @@ def audit_stats(db: Session = Depends(get_db), window_hours: int = Query(24, ge=
     total = db.query(AuditLog).filter(AuditLog.created_at >= since).count()
     by_actor = db.query(AuditLog.actor_type, func.count(AuditLog.id)).filter(AuditLog.created_at >= since).group_by(AuditLog.actor_type).all()
     return {"total": total, "by_actor_type": dict(by_actor), "window_hours": window_hours}
+
+
+@router.get("/audit/analytics")
+def audit_analytics(
+    db: Session = Depends(get_db),
+    date_from: str | None = None,
+    date_to: str | None = None,
+    action: str | None = None,
+    actor_type: str | None = None,
+    entity_type: str | None = None,
+    audience: str | None = None,
+):
+    """Aggregations for audit log: events by day, by action, top actors (users)."""
+    q = db.query(AuditLog)
+    if action:
+        q = q.filter(AuditLog.action == action)
+    if actor_type:
+        q = q.filter(AuditLog.actor_type == actor_type)
+    if entity_type:
+        q = q.filter(AuditLog.entity_type == entity_type)
+    if audience and audience.strip() in ("women", "men", "couples"):
+        q = q.filter(AuditLog.payload["audience"].astext == audience.strip())
+    since: datetime | None = None
+    until: datetime | None = None
+    if date_from:
+        try:
+            since = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+            q = q.filter(AuditLog.created_at >= since)
+        except (ValueError, TypeError):
+            pass
+    if date_to:
+        try:
+            until = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+            q = q.filter(AuditLog.created_at <= until)
+        except (ValueError, TypeError):
+            pass
+
+    base_q = q
+
+    events_by_day = (
+        base_q.with_entities(
+            func.date_trunc("day", AuditLog.created_at).label("day"),
+            func.count(AuditLog.id).label("cnt"),
+        )
+        .group_by(func.date_trunc("day", AuditLog.created_at))
+        .order_by(func.date_trunc("day", AuditLog.created_at))
+        .all()
+    )
+    events_by_day_list = [
+        {"date": d.day.isoformat() if d.day else None, "count": d.cnt}
+        for d in events_by_day
+    ]
+
+    by_action_rows = (
+        base_q.with_entities(AuditLog.action, func.count(AuditLog.id))
+        .group_by(AuditLog.action)
+        .all()
+    )
+    by_action = {r[0]: r[1] for r in by_action_rows}
+
+    by_actor_type_rows = (
+        base_q.with_entities(AuditLog.actor_type, func.count(AuditLog.id))
+        .group_by(AuditLog.actor_type)
+        .all()
+    )
+    by_actor_type = dict(by_actor_type_rows)
+
+    top_actors_subq = (
+        db.query(AuditLog.actor_id, func.count(AuditLog.id).label("cnt"))
+        .filter(AuditLog.actor_type == "user", AuditLog.actor_id.isnot(None))
+    )
+    if since:
+        top_actors_subq = top_actors_subq.filter(AuditLog.created_at >= since)
+    if until:
+        top_actors_subq = top_actors_subq.filter(AuditLog.created_at <= until)
+    if action:
+        top_actors_subq = top_actors_subq.filter(AuditLog.action == action)
+    if entity_type:
+        top_actors_subq = top_actors_subq.filter(AuditLog.entity_type == entity_type)
+    if audience and audience.strip() in ("women", "men", "couples"):
+        top_actors_subq = top_actors_subq.filter(
+            AuditLog.payload["audience"].astext == audience.strip()
+        )
+    top_actors_subq = (
+        top_actors_subq.group_by(AuditLog.actor_id)
+        .order_by(func.count(AuditLog.id).desc())
+        .limit(20)
+        .all()
+    )
+    top_actor_ids = [r.actor_id for r in top_actors_subq]
+    display_map: dict[str, str] = {}
+    if top_actor_ids:
+        users = (
+            db.query(
+                User.telegram_id,
+                User.telegram_username,
+                User.telegram_first_name,
+                User.telegram_last_name,
+            )
+            .filter(User.telegram_id.in_(top_actor_ids))
+            .all()
+        )
+        for u in users:
+            if u.telegram_username:
+                display_map[u.telegram_id] = f"@{u.telegram_username}"
+            else:
+                name = f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip()
+                display_map[u.telegram_id] = name or u.telegram_id
+    top_actors = [
+        {
+            "actor_id": r.actor_id,
+            "actor_display_name": display_map.get(r.actor_id, r.actor_id),
+            "count": r.cnt,
+        }
+        for r in top_actors_subq
+    ]
+
+    return {
+        "events_by_day": events_by_day_list,
+        "by_action": by_action,
+        "by_actor_type": by_actor_type,
+        "top_actors": top_actors,
+    }
 
 
 # ---------- Broadcast ----------
@@ -1545,10 +2034,18 @@ def jobs_list(
     for j in jobs:
         u = users.get(j.user_id)
         t = trends.get(j.trend_id)
+        user_display_name = None
+        if u:
+            if u.telegram_username:
+                user_display_name = f"@{u.telegram_username}"
+            else:
+                name = f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip()
+                user_display_name = name or u.telegram_id
         items.append({
             "job_id": j.job_id,
             "user_id": j.user_id,
             "telegram_id": u.telegram_id if u else None,
+            "user_display_name": user_display_name,
             "trend_id": j.trend_id,
             "trend_name": t.name if t else None,
             "trend_emoji": t.emoji if t else None,
@@ -1558,6 +2055,161 @@ def jobs_list(
             "created_at": j.created_at.isoformat() if j.created_at else None,
         })
     return {"items": items, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
+
+
+@router.get("/jobs/analytics")
+def jobs_analytics(
+    db: Session = Depends(get_db),
+    hours: int | None = Query(None, ge=1, le=720),
+    date_from: str | None = None,
+    date_to: str | None = None,
+    trend_id: str | None = None,
+    status: str | None = None,
+):
+    """Aggregations for jobs: by day, by status, by trend, top users."""
+    q = db.query(Job)
+    if trend_id:
+        q = q.filter(Job.trend_id == trend_id)
+    if status:
+        q = q.filter(Job.status == status)
+    since: datetime | None = None
+    until: datetime | None = None
+    if hours is not None:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        q = q.filter(Job.created_at >= since)
+    if date_from:
+        try:
+            since = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+            q = q.filter(Job.created_at >= since)
+        except (ValueError, TypeError):
+            pass
+    if date_to:
+        try:
+            until = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+            q = q.filter(Job.created_at <= until)
+        except (ValueError, TypeError):
+            pass
+
+    base_q = q
+
+    jobs_by_day = (
+        base_q.with_entities(
+            func.date_trunc("day", Job.created_at).label("day"),
+            func.count(Job.job_id).label("cnt"),
+        )
+        .group_by(func.date_trunc("day", Job.created_at))
+        .order_by(func.date_trunc("day", Job.created_at))
+        .all()
+    )
+    by_date_counts = {}
+    for d in jobs_by_day:
+        if d.day:
+            key = d.day.date() if hasattr(d.day, "date") else d.day
+            by_date_counts[str(key)] = d.cnt
+    if since:
+        # Заполняем все дни в окне нулями, чтобы график «Задачи по дням» всегда имел точки
+        now_utc = datetime.now(timezone.utc)
+        start_date = since.date() if hasattr(since, "date") else since
+        end_date = (until.date() if until and hasattr(until, "date") else until) if until else now_utc.date()
+        jobs_by_day_list = []
+        d = start_date
+        while d <= end_date:
+            jobs_by_day_list.append({"date": str(d), "count": by_date_counts.get(str(d), 0)})
+            d = d + timedelta(days=1)
+        jobs_by_day_list.sort(key=lambda x: x["date"])
+    else:
+        jobs_by_day_list = [
+            {"date": str(d.day.date() if hasattr(d.day, "date") else d.day), "count": d.cnt}
+            for d in jobs_by_day
+            if d.day
+        ]
+        jobs_by_day_list.sort(key=lambda x: x["date"])
+
+    by_status_rows = (
+        base_q.with_entities(Job.status, func.count(Job.job_id))
+        .group_by(Job.status)
+        .all()
+    )
+    by_status = {r[0]: r[1] for r in by_status_rows}
+    # Чтобы график «По статусам» не был пустым при отсутствии задач — задаём нули для известных статусов
+    for st in ("CREATED", "RUNNING", "SUCCEEDED", "FAILED", "ERROR"):
+        if st not in by_status:
+            by_status[st] = 0
+
+    by_trend_rows = (
+        base_q.with_entities(Job.trend_id, func.count(Job.job_id).label("cnt"))
+        .group_by(Job.trend_id)
+        .order_by(func.count(Job.job_id).desc())
+        .limit(20)
+        .all()
+    )
+    trend_ids_analytics = [r.trend_id for r in by_trend_rows]
+    trends_map = {}
+    if trend_ids_analytics:
+        for t in db.query(Trend).filter(Trend.id.in_(trend_ids_analytics)).all():
+            trends_map[t.id] = {"name": t.name, "emoji": t.emoji}
+    by_trend = [
+        {
+            "trend_id": r.trend_id,
+            "trend_name": trends_map.get(r.trend_id, {}).get("name", r.trend_id),
+            "trend_emoji": trends_map.get(r.trend_id, {}).get("emoji"),
+            "count": r.cnt,
+        }
+        for r in by_trend_rows
+    ]
+
+    top_users_subq = (
+        db.query(Job.user_id, func.count(Job.job_id).label("cnt"))
+        .filter(Job.user_id.isnot(None))
+    )
+    if since:
+        top_users_subq = top_users_subq.filter(Job.created_at >= since)
+    if until:
+        top_users_subq = top_users_subq.filter(Job.created_at <= until)
+    if trend_id:
+        top_users_subq = top_users_subq.filter(Job.trend_id == trend_id)
+    if status:
+        top_users_subq = top_users_subq.filter(Job.status == status)
+    top_users_subq = (
+        top_users_subq.group_by(Job.user_id)
+        .order_by(func.count(Job.job_id).desc())
+        .limit(20)
+        .all()
+    )
+    user_ids_analytics = [r.user_id for r in top_users_subq]
+    users_map: dict[str, dict[str, Any]] = {}
+    if user_ids_analytics:
+        for u in (
+            db.query(
+                User.id,
+                User.telegram_id,
+                User.telegram_username,
+                User.telegram_first_name,
+                User.telegram_last_name,
+            )
+            .filter(User.id.in_(user_ids_analytics))
+            .all()
+        ):
+            disp = u.telegram_username and f"@{u.telegram_username}" or (
+                f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip() or u.telegram_id
+            )
+            users_map[u.id] = {"telegram_id": u.telegram_id, "user_display_name": disp}
+    top_users = [
+        {
+            "user_id": r.user_id,
+            "telegram_id": users_map.get(r.user_id, {}).get("telegram_id"),
+            "user_display_name": users_map.get(r.user_id, {}).get("user_display_name", r.user_id),
+            "count": r.cnt,
+        }
+        for r in top_users_subq
+    ]
+
+    return {
+        "jobs_by_day": jobs_by_day_list,
+        "by_status": by_status,
+        "by_trend": by_trend,
+        "top_users": top_users,
+    }
 
 
 @router.get("/jobs/{job_id}")

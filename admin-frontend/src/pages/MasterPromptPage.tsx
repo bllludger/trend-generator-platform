@@ -4,6 +4,7 @@ import {
   masterPromptService,
   transferPolicyService,
   type MasterPromptSettings,
+  type MasterPromptSettingsResponse,
   type TransferPolicySettings,
 } from '@/services/api'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -12,11 +13,11 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Loader2, Save, FileText, UserCog, TrendingUp } from 'lucide-react'
+import { Loader2, Save, FileText, UserCog, TrendingUp, Zap } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 
-const MASTER_BLOCK_MARKERS = ['[INPUT]', '[TASK]', '[IDENTITY TRANSFER]', '[SAFETY]'] as const
+const MASTER_BLOCK_MARKERS = ['[INPUT]', '[TASK]'] as const
 
 function masterBlocksToFullText(s: Partial<MasterPromptSettings>): string {
   const parts = [
@@ -24,27 +25,13 @@ function masterBlocksToFullText(s: Partial<MasterPromptSettings>): string {
     (s.prompt_input ?? '').trim(),
     '[TASK]',
     (s.prompt_task ?? '').trim(),
-    '[IDENTITY TRANSFER]',
-    (s.prompt_identity_transfer ?? '').trim(),
-    '[SAFETY]',
-    (s.safety_constraints ?? '').trim(),
   ]
   return parts.join('\n\n')
 }
 
-function parseMasterBlocksFullText(text: string): {
-  prompt_input: string
-  prompt_task: string
-  prompt_identity_transfer: string
-  safety_constraints: string
-} {
-  const result = {
-    prompt_input: '',
-    prompt_task: '',
-    prompt_identity_transfer: '',
-    safety_constraints: '',
-  }
-  const keys: (keyof typeof result)[] = ['prompt_input', 'prompt_task', 'prompt_identity_transfer', 'safety_constraints']
+function parseMasterBlocksFullText(text: string): { prompt_input: string; prompt_task: string } {
+  const result = { prompt_input: '', prompt_task: '' }
+  const keys: (keyof typeof result)[] = ['prompt_input', 'prompt_task']
   let currentKey: keyof typeof result | null = null
   const lines = text.split(/\r?\n/)
   for (let i = 0; i < lines.length; i++) {
@@ -76,27 +63,51 @@ export function MasterPromptPage() {
 
   const [masterForm, setMasterForm] = useState<Partial<MasterPromptSettings>>({})
   const [masterBlocksText, setMasterBlocksText] = useState('')
+  const [previewForm, setPreviewForm] = useState<Partial<MasterPromptSettings>>({})
+  const [releaseForm, setReleaseForm] = useState<Partial<MasterPromptSettings>>({})
   const [globalForm, setGlobalForm] = useState<Partial<TransferPolicySettings>>({})
   const [trendsForm, setTrendsForm] = useState<Partial<TransferPolicySettings>>({})
+  const [watermarkForm, setWatermarkForm] = useState<{
+    watermark_text: string
+    watermark_opacity: number
+    watermark_tile_spacing: number
+    take_preview_max_dim: number
+  }>({ watermark_text: '', watermark_opacity: 60, watermark_tile_spacing: 200, take_preview_max_dim: 800 })
 
   useEffect(() => {
-    if (masterSettings) {
-      setMasterForm(masterSettings)
-      setMasterBlocksText(masterBlocksToFullText(masterSettings))
+    if (masterSettings?.preview) {
+      setMasterForm(masterSettings.preview)
+      setMasterBlocksText(masterBlocksToFullText(masterSettings.preview))
     }
-  }, [masterSettings])
+  }, [masterSettings?.preview])
+  useEffect(() => {
+    if (masterSettings?.preview) setPreviewForm(masterSettings.preview)
+  }, [masterSettings?.preview])
+  useEffect(() => {
+    if (masterSettings?.release) setReleaseForm(masterSettings.release)
+  }, [masterSettings?.release])
   useEffect(() => {
     if (transferSettings?.global) setGlobalForm(transferSettings.global)
   }, [transferSettings?.global])
   useEffect(() => {
     if (transferSettings?.trends) setTrendsForm(transferSettings.trends)
   }, [transferSettings?.trends])
+  useEffect(() => {
+    if (masterSettings == null) return
+    setWatermarkForm((prev) => ({
+      ...prev,
+      watermark_text: masterSettings.watermark_text ?? '',
+      watermark_opacity: masterSettings.watermark_opacity ?? 60,
+      watermark_tile_spacing: masterSettings.watermark_tile_spacing ?? 200,
+      take_preview_max_dim: masterSettings.take_preview_max_dim ?? 800,
+    }))
+  }, [masterSettings?.watermark_text, masterSettings?.watermark_opacity, masterSettings?.watermark_tile_spacing, masterSettings?.take_preview_max_dim])
 
   const masterMutation = useMutation({
-    mutationFn: (payload: Partial<MasterPromptSettings>) => masterPromptService.updateSettings(payload),
+    mutationFn: masterPromptService.updateSettings,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['master-prompt-settings'] })
-      toast.success('Системный промпт сохранён')
+      toast.success('Настройки сохранены')
     },
     onError: (err: unknown) => {
       const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail ?? (err as Error).message
@@ -120,14 +131,24 @@ export function MasterPromptPage() {
     e.preventDefault()
     const parsed = parseMasterBlocksFullText(masterBlocksText)
     masterMutation.mutate({
-      ...masterSettings,
-      ...masterForm,
-      ...parsed,
-      prompt_input_enabled: true,
-      prompt_task_enabled: true,
-      prompt_identity_transfer_enabled: true,
-      safety_constraints_enabled: true,
+      preview: {
+        ...masterSettings?.preview,
+        ...masterForm,
+        ...parsed,
+        prompt_input_enabled: true,
+        prompt_task_enabled: true,
+        prompt_identity_transfer_enabled: false,
+        safety_constraints_enabled: false,
+      },
     })
+  }
+  const handlePreviewSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    masterMutation.mutate({ preview: { ...masterSettings?.preview, ...previewForm } })
+  }
+  const handleReleaseSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    masterMutation.mutate({ release: { ...masterSettings?.release, ...releaseForm } })
   }
   const handleGlobalSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -137,9 +158,19 @@ export function MasterPromptPage() {
     e.preventDefault()
     transferMutation.mutate({ trends: { ...transferSettings?.trends, ...trendsForm } })
   }
+  const handleWatermarkSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    masterMutation.mutate({
+      watermark_text: watermarkForm.watermark_text.trim() || null,
+      watermark_opacity: watermarkForm.watermark_opacity,
+      watermark_tile_spacing: watermarkForm.watermark_tile_spacing,
+      take_preview_max_dim: watermarkForm.take_preview_max_dim,
+    })
+  }
 
   const isLoading = masterLoading || transferLoading
-  if (isLoading || !masterSettings || !transferSettings) {
+  const masterData = masterSettings as MasterPromptSettingsResponse | undefined
+  if (isLoading || !masterData?.preview || !masterData?.release || !transferSettings) {
     return (
       <div className="flex items-center justify-center py-12">
         <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -220,9 +251,102 @@ export function MasterPromptPage() {
     )
   }
 
-  const masterCurrent = { ...masterSettings, ...masterForm }
   const globalCurrent = { ...transferSettings.global, ...globalForm }
   const trendsCurrent = { ...transferSettings.trends, ...trendsForm }
+
+  const GLOBAL_MODEL_OPTIONS = [
+    { value: 'gemini-2.5-flash-image', label: 'gemini-2.5-flash-image' },
+    { value: 'gemini-3-pro-image-preview', label: 'gemini-3-pro-image-preview' },
+    { value: 'gemini-3.1-flash-image-preview', label: 'gemini-3.1-flash-image-preview (Nano Banana 2)' },
+  ] as const
+
+  const renderGlobalDefaultsForm = (
+    _profile: 'preview' | 'release',
+    current: Partial<MasterPromptSettings>,
+    setForm: React.Dispatch<React.SetStateAction<Partial<MasterPromptSettings>>>,
+    onSubmit: (e: React.FormEvent) => void,
+    title: string,
+    description: string
+  ) => (
+    <form onSubmit={onSubmit}>
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">{title}</CardTitle>
+          <p className="text-sm text-muted-foreground">{description}</p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div className="grid gap-2">
+              <Label>default_model</Label>
+              <select
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                value={current.default_model ?? 'gemini-2.5-flash-image'}
+                onChange={(e) => setForm((prev) => ({ ...prev, default_model: e.target.value }))}
+              >
+                {GLOBAL_MODEL_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="grid gap-2">
+              <Label>default_size</Label>
+              <Input
+                value={current.default_size ?? ''}
+                onChange={(e) => setForm((prev) => ({ ...prev, default_size: e.target.value }))}
+                placeholder="1024x1024"
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label>default_format</Label>
+              <Input
+                value={current.default_format ?? ''}
+                onChange={(e) => setForm((prev) => ({ ...prev, default_format: e.target.value }))}
+                placeholder="png"
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label>default_temperature</Label>
+              <Input
+                type="number"
+                step="0.1"
+                min={0}
+                max={2}
+                value={current.default_temperature ?? 0.7}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, default_temperature: parseFloat(e.target.value) || 0.7 }))
+                }
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label>default_image_size_tier (качество)</Label>
+              <select
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                value={current.default_image_size_tier ?? '4K'}
+                onChange={(e) => setForm((prev) => ({ ...prev, default_image_size_tier: e.target.value }))}
+              >
+                <option value="1K">1K</option>
+                <option value="2K">2K</option>
+                <option value="4K">4K (макс. качество)</option>
+              </select>
+              <p className="text-xs text-muted-foreground">Для «На релиз» рекомендуется 4K — все текущие модели поддерживают.</p>
+            </div>
+            <div className="grid gap-2">
+              <Label>default_aspect_ratio</Label>
+              <Input
+                value={current.default_aspect_ratio ?? ''}
+                onChange={(e) => setForm((prev) => ({ ...prev, default_aspect_ratio: e.target.value }))}
+                placeholder="1:1"
+              />
+            </div>
+          </div>
+          <Button type="submit" disabled={masterMutation.isPending}>
+            {masterMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            Сохранить
+          </Button>
+        </CardContent>
+      </Card>
+    </form>
+  )
 
   return (
     <div className="space-y-6">
@@ -238,6 +362,98 @@ export function MasterPromptPage() {
           <Link to="/copy-style" className="underline text-primary">Сделать такую же</Link>.
         </p>
       </div>
+
+      {/* Глобальная конфигурация модели: два блока Превью / На релиз. Весь трафик кроме Playground идёт через выбранную модель и профиль «На релиз». */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Zap className="h-5 w-5 text-muted-foreground" />
+            <CardTitle className="text-lg">Глобальная конфигурация модели</CardTitle>
+          </div>
+          <p className="text-sm text-muted-foreground mt-1">
+            Выбор глобальной модели из трёх вариантов; весь трафик (бот, тренды, Copy style), кроме Playground, идёт через выбранную модель и настройки блока «На релиз». Провайдер (Gemini / другой) задаётся в .env (IMAGE_PROVIDER).
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Параметры вотермарка и превью 3 вариантов — все редактируемые */}
+          <form onSubmit={handleWatermarkSubmit} className="rounded-md border border-border bg-muted/30 p-4 space-y-4">
+            <p className="text-sm font-medium">Вотермарк и качество превью</p>
+            <p className="text-xs text-muted-foreground">
+              Текст вотермарка: если пусто — берётся из .env <code className="rounded bg-muted px-1">WATERMARK_TEXT</code>. Прозрачность и шаг сетки задаются здесь. Макс. сторона превью влияет на качество картинки при показе 3 вариантов (Take): больше значение — меньше даунскейл, выше качество.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="grid gap-2">
+                <Label htmlFor="watermark_text">Текст вотермарка</Label>
+                <Input
+                  id="watermark_text"
+                  value={watermarkForm.watermark_text}
+                  onChange={(e) => setWatermarkForm((p) => ({ ...p, watermark_text: e.target.value }))}
+                  placeholder="пусто = из .env"
+                />
+                {masterData.watermark_text_effective != null && masterData.watermark_text == null && (
+                  <p className="text-xs text-muted-foreground">Сейчас: {masterData.watermark_text_effective}</p>
+                )}
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="watermark_opacity">Прозрачность (0–255)</Label>
+                <Input
+                  id="watermark_opacity"
+                  type="number"
+                  min={0}
+                  max={255}
+                  value={watermarkForm.watermark_opacity}
+                  onChange={(e) => setWatermarkForm((p) => ({ ...p, watermark_opacity: Number(e.target.value) || 60 }))}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="watermark_tile_spacing">Шаг сетки (px)</Label>
+                <Input
+                  id="watermark_tile_spacing"
+                  type="number"
+                  min={50}
+                  max={500}
+                  value={watermarkForm.watermark_tile_spacing}
+                  onChange={(e) => setWatermarkForm((p) => ({ ...p, watermark_tile_spacing: Number(e.target.value) || 200 }))}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="take_preview_max_dim">Макс. сторона превью (3 варианта)</Label>
+                <Input
+                  id="take_preview_max_dim"
+                  type="number"
+                  min={400}
+                  max={2048}
+                  value={watermarkForm.take_preview_max_dim}
+                  onChange={(e) => setWatermarkForm((p) => ({ ...p, take_preview_max_dim: Number(e.target.value) || 800 }))}
+                />
+                <p className="text-xs text-muted-foreground">800 = меньше размер; 1024+ = выше качество превью</p>
+              </div>
+            </div>
+            <Button type="submit" disabled={masterMutation.isPending}>
+              {masterMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              Сохранить вотермарк и превью
+            </Button>
+          </form>
+          <div className="grid md:grid-cols-2 gap-6 pt-2 border-t">
+            {renderGlobalDefaultsForm(
+              'preview',
+              { ...masterData.preview, ...previewForm },
+              setPreviewForm,
+              handlePreviewSubmit,
+              'Превью',
+              'Настройки для профиля «Превью» (Playground и др.). Для качества как на проде задайте те же модель, размер и tier, что и в блоке «На релиз».'
+            )}
+            {renderGlobalDefaultsForm(
+              'release',
+              { ...masterData.release, ...releaseForm },
+              setReleaseForm,
+              handleReleaseSubmit,
+              'На релиз',
+              'Качество и параметры для всего трафика (бот, тренды, Copy style). Для максимального качества выставьте default_image_size_tier = 4K и нужный default_size.'
+            )}
+          </div>
+        </CardContent>
+      </Card>
 
       <Tabs defaultValue="system" className="w-full">
         <TabsList className="grid w-full grid-cols-3">
@@ -257,85 +473,24 @@ export function MasterPromptPage() {
 
         <TabsContent value="system" className="space-y-4 mt-4">
           <p className="text-sm text-muted-foreground">
-            Блоки [INPUT], [TASK], [IDENTITY TRANSFER], [SAFETY] (все опциональны) и дефолты модели. Для трендов [IDENTITY], [COMPOSITION], [AVOID] берутся из вкладки «Перенос (для трендов)».
+            Блоки [INPUT] и [TASK] (опционально). Дефолты модели задаются выше в блоках «Превью» и «На релиз». Для трендов [IDENTITY], [COMPOSITION], [AVOID] — вкладка «Перенос (для трендов)».
           </p>
           <form onSubmit={handleMasterSubmit}>
             <Card>
               <CardHeader>
-                <CardTitle className="text-base">Блоки и дефолты</CardTitle>
+                <CardTitle className="text-base">Блоки промпта</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="grid gap-2">
-                  <Label htmlFor="master-blocks">Блоки [INPUT], [TASK], [IDENTITY TRANSFER], [SAFETY] (опционально)</Label>
+                  <Label htmlFor="master-blocks">Блоки [INPUT] и [TASK] (опционально)</Label>
                   <Textarea
                     id="master-blocks"
-                    rows={16}
+                    rows={12}
                     className="font-mono text-sm"
                     value={masterBlocksText}
                     onChange={(e) => setMasterBlocksText(e.target.value)}
-                    placeholder={'[INPUT]\n\n[TASK]\n\n[IDENTITY TRANSFER]\n\n[SAFETY]'}
+                    placeholder={'[INPUT]\n\n[TASK]'}
                   />
-                </div>
-                <div className="grid grid-cols-2 gap-4 pt-2 border-t">
-                  <div className="grid gap-2">
-                    <Label>default_model</Label>
-                    <select
-                      className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      value={masterCurrent.default_model ?? 'gemini-2.5-flash-image'}
-                      onChange={(e) => setMasterForm((prev) => ({ ...prev, default_model: e.target.value }))}
-                    >
-                      <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
-                      <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
-                      <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview (Nano Banana 2)</option>
-                    </select>
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>default_size</Label>
-                    <Input
-                      value={masterCurrent.default_size ?? ''}
-                      onChange={(e) => setMasterForm((prev) => ({ ...prev, default_size: e.target.value }))}
-                    />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>default_format</Label>
-                    <Input
-                      value={masterCurrent.default_format ?? ''}
-                      onChange={(e) => setMasterForm((prev) => ({ ...prev, default_format: e.target.value }))}
-                    />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>default_temperature</Label>
-                    <Input
-                      type="number"
-                      step="0.1"
-                      min={0}
-                      max={2}
-                      value={masterCurrent.default_temperature ?? 0.7}
-                      onChange={(e) =>
-                        setMasterForm((prev) => ({ ...prev, default_temperature: parseFloat(e.target.value) || 0.7 }))
-                      }
-                    />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>default_image_size_tier</Label>
-                    <Input
-                      value={masterCurrent.default_image_size_tier ?? ''}
-                      onChange={(e) =>
-                        setMasterForm((prev) => ({ ...prev, default_image_size_tier: e.target.value }))
-                      }
-                      placeholder="1K"
-                    />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>default_aspect_ratio</Label>
-                    <Input
-                      value={masterCurrent.default_aspect_ratio ?? ''}
-                      onChange={(e) =>
-                        setMasterForm((prev) => ({ ...prev, default_aspect_ratio: e.target.value }))
-                      }
-                      placeholder="1:1"
-                    />
-                  </div>
                 </div>
                 <Button type="submit" disabled={masterMutation.isPending}>
                   {masterMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}

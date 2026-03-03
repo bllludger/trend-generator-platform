@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 
+from app.constants import audience_in_target_audiences
 from app.models.theme import Theme
 
 
@@ -9,6 +10,11 @@ class ThemeService:
 
     def list_all(self) -> list[Theme]:
         return self.db.query(Theme).order_by(Theme.order_index.asc()).all()
+
+    def list_for_audience(self, audience: str) -> list[Theme]:
+        """Тематики, у которых target_audiences содержит audience (для бота)."""
+        themes = self.list_all()
+        return [t for t in themes if audience_in_target_audiences(audience, getattr(t, "target_audiences", None))]
 
     def get(self, theme_id: str) -> Theme | None:
         return self.db.query(Theme).filter(Theme.id == theme_id).one_or_none()

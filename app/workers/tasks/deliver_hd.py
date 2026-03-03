@@ -15,6 +15,7 @@ from app.models.pack import Pack
 from app.models.session import Session
 from app.models.user import User
 from app.services.audit.service import AuditService
+from app.services.balance_tariffs import _pack_outcome_label
 from app.services.compensations.service import CompensationService
 from app.services.favorites.service import FavoriteService
 from app.services.hd_balance.service import HDBalanceService
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _try_upsell_after_hd(db, fav, chat_id: str, telegram: TelegramClient) -> None:
-    """Show upsell after the last HD in a session is delivered. Trial: «Попробовал? Перейди на Avatar или Dating. 99⭐ уже учтены»."""
+    """Show upsell after the last 4K in a session is delivered. Trial: upsell to Neo Start/Pro."""
     try:
         if not fav.session_id:
             return
@@ -46,23 +47,24 @@ def _try_upsell_after_hd(db, fav, chat_id: str, telegram: TelegramClient) -> Non
 
         pack = db.query(Pack).filter(Pack.id == session.pack_id).one_or_none()
 
-        # Авто-апсейл после Trial: «Попробовал? Перейди на Avatar или Dating. 99⭐ уже учтены»
         if pack and getattr(pack, "is_trial", False):
             trial_credit = 99
-            avatar_pack = db.query(Pack).filter(Pack.id == "avatar_pack", Pack.enabled.is_(True)).one_or_none()
-            dating_pack = db.query(Pack).filter(Pack.id == "dating_pack", Pack.enabled.is_(True)).one_or_none()
+            neo_start = db.query(Pack).filter(Pack.id == "neo_start", Pack.enabled.is_(True)).one_or_none()
+            neo_pro = db.query(Pack).filter(Pack.id == "neo_pro", Pack.enabled.is_(True)).one_or_none()
             buttons = []
-            if avatar_pack and (getattr(avatar_pack, "pack_subtype", "standalone") != "collection" or getattr(avatar_pack, "playlist", None)):
-                topay = max(0, avatar_pack.stars_price - trial_credit)
-                buttons.append([{"text": f"{avatar_pack.emoji} {avatar_pack.name} — доплата {topay}⭐", "callback_data": "paywall:avatar_pack"}])
-            if dating_pack and (getattr(dating_pack, "pack_subtype", "standalone") != "collection" or getattr(dating_pack, "playlist", None)):
-                topay = max(0, dating_pack.stars_price - trial_credit)
-                buttons.append([{"text": f"{dating_pack.emoji} {dating_pack.name} — доплата {topay}⭐", "callback_data": "paywall:dating_pack"}])
+            if neo_start:
+                topay = max(0, neo_start.stars_price - trial_credit)
+                outcome = _pack_outcome_label(neo_start)
+                buttons.append([{"text": f"{neo_start.emoji} {neo_start.name} ({outcome}) — доплата {topay}⭐", "callback_data": "paywall:neo_start"}])
+            if neo_pro:
+                topay = max(0, neo_pro.stars_price - trial_credit)
+                outcome = _pack_outcome_label(neo_pro)
+                buttons.append([{"text": f"{neo_pro.emoji} {neo_pro.name} ({outcome}) — доплата {topay}⭐", "callback_data": "paywall:neo_pro"}])
             if buttons:
                 keyboard = {"inline_keyboard": buttons}
                 telegram.send_message(
                     chat_id,
-                    "Попробовал? Перейди на Avatar или Dating.\n99⭐ уже учтены.",
+                    "Попробовал? Перейди на Neo Start или Neo Pro.\n99⭐ уже учтены.",
                     reply_markup=keyboard,
                 )
             return
@@ -79,7 +81,8 @@ def _try_upsell_after_hd(db, fav, chat_id: str, telegram: TelegramClient) -> Non
             for up in upsell_packs:
                 if getattr(up, "pack_subtype", "standalone") == "collection" and not getattr(up, "playlist", None):
                     continue
-                label = f"{up.emoji} {up.collection_label or up.name} — {up.stars_price}⭐"
+                outcome = _pack_outcome_label(up)
+                label = f"{up.emoji} {up.collection_label or up.name}: {outcome} — {up.stars_price}⭐"
                 buttons.append([{"text": label, "callback_data": f"paywall:{up.id}"}])
 
         if not buttons:
@@ -90,15 +93,20 @@ def _try_upsell_after_hd(db, fav, chat_id: str, telegram: TelegramClient) -> Non
                 .first()
             )
             if creator:
-                buttons.append([{"text": f"{creator.emoji} {creator.name} — {creator.stars_price}⭐", "callback_data": f"paywall:{creator.id}"}])
+                outcome = _pack_outcome_label(creator)
+                buttons.append([{"text": f"{creator.emoji} {creator.name}: {outcome} — {creator.stars_price}⭐", "callback_data": f"paywall:{creator.id}"}])
 
-        if buttons:
-            keyboard = {"inline_keyboard": buttons}
-            telegram.send_message(
-                chat_id,
-                "🎉 Все HD доставлены! Хотите попробовать ещё?",
-                reply_markup=keyboard,
-            )
+        # Кнопки навигации: К трендам (в меню) и Мой профиль (баланс)
+        buttons.append([
+            {"text": "📋 В меню", "callback_data": "nav:menu"},
+            {"text": "👤 Мой профиль", "callback_data": "nav:profile"},
+        ])
+        keyboard = {"inline_keyboard": buttons}
+        telegram.send_message(
+            chat_id,
+            "🎉 Все 4K доставлены! Хотите попробовать ещё?",
+            reply_markup=keyboard,
+        )
     except Exception:
         logger.warning("upsell_after_hd_failed", extra={"favorite_id": fav.id})
 
@@ -138,19 +146,28 @@ def deliver_hd(
         fav = fav_svc.get_favorite(favorite_id)
         if not fav:
             logger.error("deliver_hd_fav_not_found", extra={"favorite_id": favorite_id})
+            if status_chat_id:
+                telegram.send_message(status_chat_id, "❌ Избранное не найдено.")
             return {"ok": False, "error": "favorite_not_found"}
 
         if fav.hd_status == "delivered":
             logger.info("deliver_hd_already_delivered", extra={"favorite_id": favorite_id})
             if status_chat_id and fav.hd_path and os.path.isfile(fav.hd_path):
                 try:
-                    telegram.send_document(status_chat_id, fav.hd_path, caption="🖼 HD версия (повтор)")
+                    telegram.send_document(
+                        status_chat_id,
+                        fav.hd_path,
+                        caption="🖼 4K версия (повтор)",
+                        filename="Изображение_4K.png",
+                    )
                 except Exception:
                     pass
             return {"ok": True, "already_delivered": True}
 
         if not fav_svc.mark_rendering(favorite_id):
             logger.info("deliver_hd_already_rendering", extra={"favorite_id": favorite_id})
+            if status_chat_id:
+                telegram.send_message(status_chat_id, "⏳ Эта 4K уже в обработке.")
             return {"ok": False, "error": "already_rendering"}
 
         if not fav.original_path or not os.path.isfile(fav.original_path):
@@ -160,13 +177,15 @@ def deliver_hd(
             comp_svc.auto_compensate_on_fail(favorite_id)
             db.commit()
             if status_chat_id:
-                telegram.send_message(status_chat_id, "❌ Оригинал не найден — кредит HD возвращён.")
+                telegram.send_message(status_chat_id, "❌ Оригинал не найден — кредит 4K возвращён.")
             return {"ok": False, "error": "original_missing"}
 
         user = db.query(User).filter(User.id == fav.user_id).one_or_none()
         if not user:
             fav_svc.reset_hd_status(favorite_id)
             db.commit()
+            if status_chat_id:
+                telegram.send_message(status_chat_id, "❌ Ошибка. Попробуйте ещё раз.")
             return {"ok": False, "error": "user_not_found"}
 
         out_dir = os.path.join(settings.storage_base_path, "outputs")
@@ -182,7 +201,7 @@ def deliver_hd(
             comp_svc.auto_compensate_on_fail(favorite_id)
             db.commit()
             if status_chat_id:
-                telegram.send_message(status_chat_id, "❌ Ошибка при создании HD — кредит HD возвращён.")
+                telegram.send_message(status_chat_id, "❌ Ошибка при создании 4K — кредит 4K возвращён.")
             return {"ok": False, "error": "upscale_failed"}
 
         if not hd_svc.spend(user, 1):
@@ -194,7 +213,7 @@ def deliver_hd(
                 pass
             db.commit()
             if status_chat_id:
-                telegram.send_message(status_chat_id, "❌ Недостаточно HD на балансе.")
+                telegram.send_message(status_chat_id, "❌ Недостаточно 4K на балансе.")
             return {"ok": False, "error": "insufficient_hd_balance"}
 
         fav_svc.mark_hd_delivered(favorite_id, hd_path)
@@ -224,10 +243,15 @@ def deliver_hd(
                 except Exception:
                     pass
             try:
-                telegram.send_document(status_chat_id, hd_path, caption="🖼 HD версия готова!")
+                telegram.send_document(
+                    status_chat_id,
+                    hd_path,
+                    caption="🖼 4K версия готова!",
+                    filename="Изображение_4K.png",
+                )
             except Exception as e:
                 logger.exception("deliver_hd_send_failed", extra={"favorite_id": favorite_id})
-                telegram.send_message(status_chat_id, f"✅ HD готова, но не удалось отправить: {e}")
+                telegram.send_message(status_chat_id, f"✅ 4K готова, но не удалось отправить: {e}")
 
             _try_upsell_after_hd(db, fav, status_chat_id, telegram)
 

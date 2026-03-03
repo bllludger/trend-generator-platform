@@ -14,12 +14,18 @@ export interface User {
   last_active?: string
 }
 
+/** Целевая аудитория: women | men | couples */
+export const AUDIENCE_VALUES = ['women', 'men', 'couples'] as const
+export type AudienceValue = (typeof AUDIENCE_VALUES)[number]
+
 export interface Theme {
   id: string
   name: string
   emoji: string
   order_index: number
   enabled: boolean
+  /** В каких ЦА показывать тематику (по умолчанию ['women']) */
+  target_audiences?: string[]
 }
 
 /** Секция промпта (Playground 1:1) */
@@ -63,6 +69,8 @@ export interface Trend {
   /** Источник конфига промпта: playground (секции) или scene (сценарный промпт) */
   prompt_config_source?: 'playground' | 'scene'
   prompt_temperature?: number | null
+  /** В каких ЦА показывать тренд (по умолчанию ['women']) */
+  target_audiences?: string[]
 }
 
 export interface Job {

@@ -1,5 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { envSettingsService, appSettingsService, type EnvItem } from '@/services/api'
+import { useQuery } from '@tanstack/react-query'
+import { envSettingsService, type EnvItem } from '@/services/api'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import {
   Table,
@@ -11,31 +11,14 @@ import {
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Label } from '@/components/ui/label'
-import { Settings, Lock, FileCode, Zap } from 'lucide-react'
-import { toast } from 'sonner'
+import { Settings, Lock, FileCode } from 'lucide-react'
+import { Link } from 'react-router-dom'
 
 export function SettingsPage() {
-  const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
     queryKey: ['env-settings'],
     queryFn: () => envSettingsService.getEnv(),
   })
-  const { data: appSettings, isLoading: appSettingsLoading } = useQuery({
-    queryKey: ['app-settings'],
-    queryFn: () => appSettingsService.getSettings(),
-  })
-  const updateAppMutation = useMutation({
-    mutationFn: (payload: { use_nano_banana_pro: boolean }) => appSettingsService.updateSettings(payload),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['app-settings'] })
-      toast.success('Настройки сохранены')
-    },
-    onError: () => toast.error('Ошибка при сохранении'),
-  })
-  const handleNanoBananaToggle = (checked: boolean) => {
-    updateAppMutation.mutate({ use_nano_banana_pro: checked })
-  }
 
   const items: EnvItem[] = data?.items ?? []
   const byCategory = items.reduce<Record<string, EnvItem[]>>((acc: Record<string, EnvItem[]>, it: EnvItem) => {
@@ -63,45 +46,9 @@ export function SettingsPage() {
         </div>
       )}
 
-      {/* Глобальные переключатели из админки */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center gap-2">
-            <Zap className="h-5 w-5 text-muted-foreground" />
-            <h2 className="text-lg font-semibold">Глобальные правила генерации</h2>
-          </div>
-          <p className="text-sm text-muted-foreground mt-1">
-            Переключатели применяются ко всем генерациям без перезапуска сервисов.
-          </p>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {appSettingsLoading ? (
-            <Skeleton className="h-10 w-48" />
-          ) : (
-            <div className="flex items-center gap-3">
-              <input
-                type="checkbox"
-                id="use_nano_banana_pro"
-                checked={appSettings?.use_nano_banana_pro ?? false}
-                onChange={(e) => handleNanoBananaToggle(e.target.checked)}
-                disabled={updateAppMutation.isPending}
-                className="h-4 w-4 rounded border-input"
-              />
-              <Label htmlFor="use_nano_banana_pro" className="cursor-pointer font-medium">
-                Использовать Nano Banana Pro (Gemini)
-              </Label>
-            </div>
-          )}
-          <p className="text-xs text-muted-foreground">
-            Включено: все запросы идут в провайдер Gemini (Nano Banana). Выключено: используется провайдер из .env (<code className="rounded bg-muted px-1">image_provider</code>).
-          </p>
-          {appSettings?.updated_at && (
-            <p className="text-xs text-muted-foreground">
-              Обновлено: {new Date(appSettings.updated_at).toLocaleString('ru-RU')}
-            </p>
-          )}
-        </CardContent>
-      </Card>
+      <p className="text-sm text-muted-foreground">
+        Глобальный выбор модели и дефолты генерации — в разделе <Link to="/master-prompt" className="underline text-primary">Мастер промпт</Link> (блок «Глобальная конфигурация модели»).
+      </p>
 
       {isLoading ? (
         <Card>
@@ -165,7 +112,7 @@ export function SettingsPage() {
       <Card className="border-amber-500/50 bg-amber-500/5">
         <CardContent className="p-4">
           <p className="text-sm text-muted-foreground">
-            <strong>Ограничения:</strong> изменение значений возможно только через файл <code className="rounded bg-muted px-1">.env</code> на сервере и перезапуск сервисов. 
+            <strong>Ограничения:</strong> изменение значений возможно только через файл <code className="rounded bg-muted px-1">.env</code> на сервере и перезапуск сервисов.
             Лимиты загрузки (<code>max_file_size_mb</code>), форматы (<code>allowed_image_extensions</code>), таймауты и лимиты входа задаются здесь.
           </p>
         </CardContent>

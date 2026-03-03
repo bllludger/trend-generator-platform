@@ -83,6 +83,7 @@ const STATUS_LABELS: Record<string, string> = {
   RUNNING: 'В работе',
   SUCCEEDED: 'Успешно',
   FAILED: 'Ошибка',
+  ERROR: 'Ошибка',
 }
 const STATUS_COLORS: Record<string, string> = {
   CREATED: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
@@ -98,6 +99,10 @@ type TrendAnalyticsItem = {
   jobs_window?: number
   succeeded_window?: number
   failed_window?: number
+  takes_window?: number
+  takes_succeeded_window?: number
+  takes_failed_window?: number
+  chosen_window?: number
 }
 
 type DashboardData = {
@@ -109,22 +114,33 @@ type DashboardData = {
   succeeded?: number
   jobs_by_status?: Record<string, number>
   trend_analytics_window?: TrendAnalyticsItem[]
+  variants_chosen_by_trend?: Record<string, number>
 }
+
+const DASHBOARD_HISTORY_DAYS = 14
+const DASHBOARD_STATS_HOURS = 24
 
 export function DashboardPage() {
   const { data, isLoading, dataUpdatedAt } = useQuery<DashboardData>({
-    queryKey: ['telemetry', 24],
-    queryFn: () => telemetryService.getDashboard(24) as Promise<DashboardData>,
+    queryKey: ['telemetry', DASHBOARD_STATS_HOURS],
+    queryFn: () => telemetryService.getDashboard(DASHBOARD_STATS_HOURS) as Promise<DashboardData>,
     refetchInterval: 30000,
   })
 
-  const { data: historyData } = useQuery({
-    queryKey: ['telemetry-history', 7],
-    queryFn: () => telemetryService.getHistory(7) as Promise<{ history?: Array<{ date: string; jobs_total?: number; jobs_succeeded?: number; jobs_failed?: number }> }>,
+  const { data: data14d } = useQuery<DashboardData>({
+    queryKey: ['telemetry', DASHBOARD_HISTORY_DAYS * 24],
+    queryFn: () => telemetryService.getDashboard(DASHBOARD_HISTORY_DAYS * 24) as Promise<DashboardData>,
     refetchInterval: 60000,
   })
 
-  const succeededCount = data?.jobs_by_status?.SUCCEEDED ?? 0
+  const { data: historyData } = useQuery({
+    queryKey: ['telemetry-history', DASHBOARD_HISTORY_DAYS],
+    queryFn: () => telemetryService.getHistory(DASHBOARD_HISTORY_DAYS) as Promise<{ history?: Array<{ date: string; jobs_total?: number; jobs_succeeded?: number; jobs_failed?: number }> }>,
+    refetchInterval: 60000,
+  })
+
+  const jobsByStatus = data14d?.jobs_by_status ?? data?.jobs_by_status ?? {}
+  const succeededCount = jobsByStatus.SUCCEEDED ?? 0
   const statsWithValues = STAT_CARDS.map((card) => ({
     ...card,
     value:
@@ -132,11 +148,14 @@ export function DashboardPage() {
         ? succeededCount
         : (data?.[card.key] as number | undefined) ?? 0,
   }))
-
-  const trendList = (data?.trend_analytics_window ?? [])
-    .filter((t) => (t.jobs_window ?? 0) > 0)
+  const trendList = (data14d?.trend_analytics_window ?? data?.trend_analytics_window ?? [])
+    .filter(
+      (t) =>
+        (t.jobs_window ?? 0) > 0 ||
+        (t.takes_window ?? 0) > 0 ||
+        (t.chosen_window ?? 0) > 0
+    )
     .slice(0, 10)
-  const jobsByStatus = data?.jobs_by_status ?? {}
   const chartData =
     historyData?.history?.map((d: { date: string; jobs_total?: number; jobs_succeeded?: number; jobs_failed?: number }) => ({
       date: d.date,
@@ -166,7 +185,7 @@ export function DashboardPage() {
             Панель управления
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Статистика за последние 24 часа
+            Статистика: 24 ч — сводка, 14 д — график и тренды
             {dataUpdatedAt && (
               <span className="ml-2 text-muted-foreground/80">
                 · обновлено {format(new Date(dataUpdatedAt), 'HH:mm', { locale: ru })}
@@ -220,7 +239,7 @@ export function DashboardPage() {
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-2 text-base">
               <BarChart3 className="h-4 w-4 text-muted-foreground" />
-              Задачи за 7 дней
+              Задачи за 14 дней
             </CardTitle>
           </CardHeader>
           <CardContent className="pt-0">
@@ -277,7 +296,7 @@ export function DashboardPage() {
         {/* Status badges */}
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-base">Статусы задач</CardTitle>
+            <CardTitle className="text-base">Статусы задач (14 д)</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex flex-wrap gap-2">
@@ -307,16 +326,26 @@ export function DashboardPage() {
         <CardHeader className="pb-2">
           <CardTitle className="flex items-center gap-2 text-base">
             <Sparkles className="h-4 w-4 text-muted-foreground" />
-            Топ трендов за 24 ч
+            Топ трендов за 14 д
           </CardTitle>
         </CardHeader>
         <CardContent>
           {trendList.length > 0 ? (
             <ul className="space-y-3">
               {trendList.map((trend: TrendAnalyticsItem) => {
-                const total = trend.jobs_window || 0
-                const succeeded = trend.succeeded_window || 0
+                const jobs = trend.jobs_window ?? 0
+                const takes = trend.takes_window ?? 0
+                const total = jobs + takes
+                const succeeded =
+                  (trend.succeeded_window ?? 0) + (trend.takes_succeeded_window ?? 0)
+                const failed = (trend.failed_window ?? 0) + (trend.takes_failed_window ?? 0)
                 const successRate = total > 0 ? Math.round((succeeded / total) * 100) : 0
+                const parts: string[] = []
+                if (jobs > 0) parts.push(`${jobs} задач`)
+                if (takes > 0) parts.push(`${takes} снимков`)
+                if ((trend.chosen_window ?? 0) > 0)
+                  parts.push(`${trend.chosen_window} выбрано картинок`)
+                const subtitle = parts.length > 0 ? parts.join(' · ') : '—'
                 return (
                   <li
                     key={trend.trend_id}
@@ -327,7 +356,9 @@ export function DashboardPage() {
                       <div className="min-w-0">
                         <p className="truncate font-medium text-foreground">{trend.name}</p>
                         <p className="text-xs text-muted-foreground">
-                          {total} задач · {successRate}% успешность
+                          {subtitle}
+                          {' · '}
+                          {successRate}% успешность
                         </p>
                       </div>
                     </div>
@@ -340,14 +371,14 @@ export function DashboardPage() {
                       </div>
                       <div
                         className="text-right"
-                        title="Успешных / с ошибками за 24 ч"
+                        title="Успешных / с ошибками за период"
                       >
                         <span className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">
                           +{succeeded}
                         </span>
-                        {(trend.failed_window ?? 0) > 0 && (
+                        {failed > 0 && (
                           <span className="ml-1 text-xs text-red-600 dark:text-red-400">
-                            −{trend.failed_window ?? 0}
+                            −{failed}
                           </span>
                         )}
                       </div>

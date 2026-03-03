@@ -99,11 +99,39 @@ export interface MasterPromptSettings {
   updated_at?: string | null
 }
 
+/** Ответ GET /admin/settings/master-prompt: два профиля + вотермарк и превью (редактируемые в админке). */
+export interface MasterPromptSettingsResponse {
+  preview: MasterPromptSettings
+  release: MasterPromptSettings
+  use_nano_banana_pro?: boolean
+  /** Текст из БД; пусто = использовать .env WATERMARK_TEXT */
+  watermark_text?: string | null
+  /** Эффективный текст для отображения (БД или .env) */
+  watermark_text_effective?: string
+  watermark_opacity?: number
+  watermark_tile_spacing?: number
+  /** Макс. сторона превью для 3 вариантов Take (даунскейл перед вотермарком); больше = выше качество превью */
+  take_preview_max_dim?: number
+}
+
+/** Payload для PUT: либо по профилям, либо плоский; вотермарк и превью — отдельные ключи. */
+export type MasterPromptUpdatePayload =
+  | {
+      preview?: Partial<MasterPromptSettings>
+      release?: Partial<MasterPromptSettings>
+      use_nano_banana_pro?: boolean
+      watermark_text?: string | null
+      watermark_opacity?: number
+      watermark_tile_spacing?: number
+      take_preview_max_dim?: number
+    }
+  | Partial<MasterPromptSettings>
+
 export const masterPromptService = {
   getSettings: () =>
-    api.get<MasterPromptSettings>('/admin/settings/master-prompt').then((r) => r.data),
-  updateSettings: (payload: Partial<MasterPromptSettings>) =>
-    api.put<MasterPromptSettings>('/admin/settings/master-prompt', payload).then((r) => r.data),
+    api.get<MasterPromptSettingsResponse>('/admin/settings/master-prompt').then((r) => r.data),
+  updateSettings: (payload: MasterPromptUpdatePayload) =>
+    api.put<MasterPromptSettingsResponse>('/admin/settings/master-prompt', payload).then((r) => r.data),
 }
 
 // ─── Env / App settings ─────────────────────────────────────────────────────
@@ -157,6 +185,19 @@ export const telegramMessagesService = {
 }
 
 // ─── Telemetry ─────────────────────────────────────────────────────────────
+export interface TelemetryErrorsByDay {
+  date: string
+  jobs_failed: number
+  takes_failed: number
+  total: number
+}
+export interface TelemetryErrorsResponse {
+  window_days: number
+  jobs_failed_by_error: Record<string, number>
+  takes_failed_by_error: Record<string, number>
+  combined: Record<string, number>
+  errors_by_day?: TelemetryErrorsByDay[]
+}
 export const telemetryService = {
   getDashboard: (windowHours?: number) =>
     api.get('/admin/telemetry', { params: { window_hours: windowHours } }).then((r) => r.data),
@@ -168,6 +209,10 @@ export const telemetryService = {
     api.get('/admin/telemetry/history', { params: { window_days: windowDays } }).then((r) => r.data),
   getProductMetrics: (windowDays?: number) =>
     api.get('/admin/telemetry/product-metrics', { params: { window_days: windowDays } }).then((r) => r.data),
+  getErrors: (windowDays?: number) =>
+    api
+      .get('/admin/telemetry/errors', { params: { window_days: windowDays } })
+      .then((r) => r.data as TelemetryErrorsResponse),
 }
 
 // ─── Bank transfer ─────────────────────────────────────────────────────────
@@ -291,9 +336,9 @@ export const packsService = {
 export const themesService = {
   list: () => api.get<Theme[]>('/admin/themes').then((r) => r.data),
   get: (id: string) => api.get<Theme>(`/admin/themes/${id}`).then((r) => r.data),
-  create: (data: Partial<Pick<Theme, 'name' | 'emoji' | 'order_index' | 'enabled'>>) =>
+  create: (data: Partial<Pick<Theme, 'name' | 'emoji' | 'order_index' | 'enabled' | 'target_audiences'>>) =>
     api.post<Theme>('/admin/themes', data).then((r) => r.data),
-  update: (id: string, data: Partial<Pick<Theme, 'name' | 'emoji' | 'order_index' | 'enabled'>>) =>
+  update: (id: string, data: Partial<Pick<Theme, 'name' | 'emoji' | 'order_index' | 'enabled' | 'target_audiences'>>) =>
     api.put<Theme>(`/admin/themes/${id}`, data).then((r) => r.data),
   delete: (id: string) => api.delete(`/admin/themes/${id}`).then((r) => r.data),
   moveOrder: (id: string, direction: 'up' | 'down') =>
@@ -322,10 +367,31 @@ export type TrendUpdatePayload = Partial<{
   prompt_size: string | null
   prompt_format: string | null
   prompt_temperature: number | null
+  target_audiences: string[]
 }>
+
+export interface TrendAnalyticsItem {
+  trend_id: string
+  name: string
+  emoji: string
+  theme_id: string | null
+  jobs_total: number
+  jobs_succeeded: number
+  jobs_failed: number
+  takes_total: number
+  takes_succeeded: number
+  takes_failed: number
+}
+
+export interface TrendAnalyticsResponse {
+  window_days: number
+  items: TrendAnalyticsItem[]
+}
 
 export const trendsService = {
   list: () => api.get<Trend[]>('/admin/trends').then((r) => r.data),
+  getAnalytics: (windowDays = 30) =>
+    api.get<TrendAnalyticsResponse>('/admin/trends/analytics', { params: { window_days: windowDays } }).then((r) => r.data),
   get: (id: string) => api.get<Trend>(`/admin/trends/${id}`).then((r) => r.data),
   update: (id: string, data: TrendUpdatePayload) =>
     api.put<Trend>(`/admin/trends/${id}`, data).then((r) => r.data),
@@ -357,11 +423,27 @@ export interface AuditStats {
   by_actor_type?: Record<string, number>
 }
 
+export interface AuditAnalytics {
+  events_by_day: Array<{ date: string | null; count: number }>
+  by_action: Record<string, number>
+  by_actor_type: Record<string, number>
+  top_actors: Array<{ actor_id: string; actor_display_name: string; count: number }>
+}
+
 export const auditService = {
   list: (params: { action?: string; page?: number; page_size?: number; [key: string]: unknown }) =>
     api.get<{ items: unknown[]; total: number; page?: number; pages?: number }>('/admin/audit', { params }).then((r) => r.data),
   getStats: (windowHours: number) =>
     api.get<AuditStats>('/admin/audit/stats', { params: { window_hours: windowHours } }).then((r) => r.data),
+  getAnalytics: (params: {
+    date_from?: string
+    date_to?: string
+    action?: string
+    actor_type?: string
+    entity_type?: string
+    audience?: string
+  }) =>
+    api.get<AuditAnalytics>('/admin/audit/analytics', { params }).then((r) => r.data),
 }
 
 // ─── Broadcast ─────────────────────────────────────────────────────────────
@@ -392,11 +474,20 @@ export interface JobsStats {
   hours: number
 }
 
+export interface JobsAnalytics {
+  jobs_by_day: Array<{ date: string | null; count: number }>
+  by_status: Record<string, number>
+  by_trend: Array<{ trend_id: string; trend_name: string; trend_emoji?: string; count: number }>
+  top_users: Array<{ user_id: string; telegram_id?: string; user_display_name: string; count: number }>
+}
+
 export const jobsService = {
   list: (params: JobsListParams) =>
     api.get('/admin/jobs', { params }).then((r) => r.data),
   stats: (hours: number) =>
     api.get<JobsStats>('/admin/jobs/stats', { params: { hours } }).then((r) => r.data),
+  getAnalytics: (params: { hours?: number; date_from?: string; date_to?: string; trend_id?: string; status?: string }) =>
+    api.get<JobsAnalytics>('/admin/jobs/analytics', { params }).then((r) => r.data),
   get: (jobId: string) => api.get(`/admin/jobs/${jobId}`).then((r) => r.data),
 }
 

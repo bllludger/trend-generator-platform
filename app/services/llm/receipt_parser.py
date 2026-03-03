@@ -55,6 +55,9 @@ _AMOUNT_RE = re.compile(AMOUNT_REGEX_PATTERN)
 # Карта получателя: форматы 220424******5005, 2204 24** **** 5005, 2204****5005 и т.п.
 CARD_REGEX_PATTERN = r"(\d{4})\d{0,2}\s*\*{2,}\s*(\d{4})"
 _CARD_RE = re.compile(CARD_REGEX_PATTERN)
+# Только последние 4 цифры (Сбер и др.: ".. 5005", "**** 5005", "5005")
+CARD_LAST4_ONLY_PATTERN = r"(?:\.\.|[\s*]*)\s*(\d{4})\b"
+_CARD_LAST4_RE = re.compile(CARD_LAST4_ONLY_PATTERN)
 
 # Дата/время перевода: ДД.ММ.ГГГГ ЧЧ:ММ(:СС)
 RECEIPT_DT_REGEX_PATTERN = r"(\d{2})[./](\d{2})[./](\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?"
@@ -90,12 +93,19 @@ def _parse_amount_from_text(text: str) -> float | None:
 
 
 def _parse_card_from_text(text: str) -> tuple[str | None, str | None]:
-    """Извлечь first4 и last4 цифры карты получателя из текста."""
+    """Извлечь first4 и last4 цифры карты получателя из текста.
+    Поддерживает полный формат (220424******5005) и только последние 4 цифры (.. 5005, 5005)."""
     if not text or "NOT_FOUND" in text.upper():
         return None, None
     m = _CARD_RE.search(text)
     if m:
         return m.group(1), m.group(2)
+    m_last4 = _CARD_LAST4_RE.search(text)
+    if m_last4:
+        return None, m_last4.group(1)
+    digits_only = "".join(c for c in text if c.isdigit())
+    if len(digits_only) == 4:
+        return None, digits_only
     return None, None
 
 

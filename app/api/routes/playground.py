@@ -112,7 +112,7 @@ def _build_prompt_from_config(config: PlaygroundPromptConfig) -> str:
 def _build_full_prompt_for_playground(db: Session, config: PlaygroundPromptConfig) -> str:
     """Build prompt with master blocks ([INPUT], [TASK], [IDENTITY TRANSFER]) + sections + [SAFETY] for Playground test."""
     svc = GenerationPromptSettingsService(db)
-    effective = svc.get_effective()
+    effective = svc.get_effective(profile="preview")
     blocks = []
     prompt_input = (effective.get("prompt_input") or "").strip()
     if prompt_input:
@@ -288,9 +288,9 @@ async def get_playground_config(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Default playground config (model, temperature, format, sections, variables)."""
+    """Default playground config (model, temperature, format, sections, variables). Playground uses preview profile, not release."""
     svc = GenerationPromptSettingsService(db)
-    effective = svc.get_effective()
+    effective = svc.get_effective(profile="preview")
     sections = [
         PlaygroundSection(id="1", label="Scene", content="", enabled=True, order=0),
         PlaygroundSection(id="2", label="Style", content="", enabled=True, order=1),

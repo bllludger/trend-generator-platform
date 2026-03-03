@@ -371,6 +371,15 @@ fi
 if [ -f migrations/045_trend_composition_prompt.sql ]; then
     $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/045_trend_composition_prompt.sql 2>/dev/null || true
 fi
+if [ -f migrations/046_generation_prompt_release_profile.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/046_generation_prompt_release_profile.sql 2>/dev/null || true
+fi
+if [ -f migrations/047_app_settings_watermark_preview.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/047_app_settings_watermark_preview.sql 2>/dev/null || true
+fi
+if [ -f migrations/048_theme_trend_target_audiences.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/048_theme_trend_target_audiences.sql 2>/dev/null || true
+fi
 # Роль postgres: создать или обновить пароль (внешние клиенты/IDE часто подключаются как postgres → убираем FATAL в логах)
 if ! $COMPOSE_CMD exec -T db psql -U trends -d trends -c "
 DO \$\$

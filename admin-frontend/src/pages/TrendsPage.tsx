@@ -37,8 +37,22 @@ import { parseFullTrendPrompt, buildFullTrendPrompt } from '@/utils/trendPromptP
 import { cn } from '@/lib/utils'
 
 import type { Theme, Trend } from '@/types'
+import { AUDIENCE_VALUES } from '@/types'
 
 const DROPPABLE_ID_NONE = 'no-theme'
+
+/** Подписи ЦА для UI */
+const AUDIENCE_LABELS: Record<string, string> = {
+  women: 'Женщины',
+  men: 'Мужчины',
+  couples: 'Пары',
+}
+
+function formatAudienceLabel(target_audiences: string[] | undefined): string {
+  const list = (target_audiences ?? []).filter(Boolean)
+  if (list.length === 0) return 'Женщины'
+  return list.map((a) => AUDIENCE_LABELS[a] ?? a).join(' + ')
+}
 
 const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp']
 
@@ -204,6 +218,7 @@ export function TrendsPage() {
     system_prompt: string
     subject_prompt: string
     negative_prompt: string
+    target_audiences: string[]
   }>({
     name: '',
     description: '',
@@ -222,6 +237,7 @@ export function TrendsPage() {
     system_prompt: '',
     subject_prompt: '',
     negative_prompt: '',
+    target_audiences: ['women'],
   })
   const exampleFileInputRef = useRef<HTMLInputElement>(null)
   const [uploadProgress, setUploadProgress] = useState<number | null>(null)
@@ -232,7 +248,7 @@ export function TrendsPage() {
 
   const [editingTheme, setEditingTheme] = useState<Theme | null>(null)
   const [isCreatingTheme, setIsCreatingTheme] = useState(false)
-  const [themeFormData, setThemeFormData] = useState({ name: '', emoji: '' })
+  const [themeFormData, setThemeFormData] = useState({ name: '', emoji: '', target_audiences: ['women'] as string[] })
   const [trendFormTab, setTrendFormTab] = useState('basic')
   const [fullPromptText, setFullPromptText] = useState('')
   const [showSceneError, setShowSceneError] = useState(false)
@@ -312,12 +328,12 @@ export function TrendsPage() {
   })
 
   const themeCreateMutation = useMutation({
-    mutationFn: (data: { name: string; emoji: string }) => themesService.create(data),
+    mutationFn: (data: { name: string; emoji: string; target_audiences?: string[] }) => themesService.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['themes'] })
       toast.success('Тематика создана')
       setIsCreatingTheme(false)
-      setThemeFormData({ name: '', emoji: '' })
+      setThemeFormData({ name: '', emoji: '', target_audiences: ['women'] })
     },
     onError: (err: unknown) => {
       toast.error(getErrorMessage(err as ApiErrorShape, 'Ошибка при создании тематики'))
@@ -325,7 +341,7 @@ export function TrendsPage() {
   })
 
   const themeUpdateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: { name: string; emoji: string } }) =>
+    mutationFn: ({ id, data }: { id: string; data: { name: string; emoji: string; target_audiences?: string[] } }) =>
       themesService.update(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['themes'] })
@@ -496,6 +512,7 @@ export function TrendsPage() {
       system_prompt: '',
       subject_prompt: '',
       negative_prompt: '',
+      target_audiences: ['women'],
     })
     setFullPromptText('')
     setShowSceneError(false)
@@ -551,6 +568,7 @@ export function TrendsPage() {
       system_prompt: full.system_prompt || '',
       subject_prompt: full.subject_prompt || '',
       negative_prompt: full.negative_prompt || '',
+      target_audiences: Array.isArray(full.target_audiences) && full.target_audiences.length > 0 ? full.target_audiences : ['women'],
     })
     setFullPromptText(buildFullTrendPrompt(
       (full.scene_prompt as string) || '',
@@ -641,6 +659,7 @@ export function TrendsPage() {
       system_prompt: formData.system_prompt,
       subject_prompt: formData.subject_prompt,
       negative_prompt: formData.negative_prompt,
+      target_audiences: (formData.target_audiences?.length ? formData.target_audiences : ['women']) as string[],
     }
 
     if (editingTrend) {
@@ -680,7 +699,7 @@ export function TrendsPage() {
           </p>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={() => { setIsCreatingTheme(true); setThemeFormData({ name: '', emoji: '' }) }}>
+          <Button variant="outline" onClick={() => { setIsCreatingTheme(true); setThemeFormData({ name: '', emoji: '', target_audiences: ['women'] }) }}>
             <FolderPlus className="h-4 w-4 mr-2" />
             Создать тематику
           </Button>
@@ -716,6 +735,7 @@ export function TrendsPage() {
           <div className="space-y-8">
             {groupedByTheme.map(({ theme, trends: groupTrends }) => {
               const themeLabel = theme ? `${theme.emoji || ''} ${theme.name}`.trim() || theme.name : 'Без тематики'
+              const themeAudienceLabel = theme ? formatAudienceLabel(theme.target_audiences) : null
               const themeIndex = theme ? themes.findIndex((t) => t.id === theme.id) : -1
               const canThemeMoveUp = theme != null && themeIndex > 0
               const canThemeMoveDown = theme != null && themeIndex >= 0 && themeIndex < themes.length - 1
@@ -724,6 +744,11 @@ export function TrendsPage() {
                 <DroppableSection key={droppableId} id={droppableId} className="space-y-3">
                   <div className="flex flex-wrap items-center gap-2 border-b pb-2">
                     <h2 className="text-xl font-semibold">{themeLabel}</h2>
+                    {themeAudienceLabel && (
+                      <Badge variant="outline" className="font-normal">
+                        ЦА: {themeAudienceLabel}
+                      </Badge>
+                    )}
                     {theme != null && (
                       <>
                         <div className="flex items-center rounded-md border border-input">
@@ -820,6 +845,8 @@ export function TrendsPage() {
                                       <p className="text-xs text-muted-foreground mt-1">
                                         Порядок: {trend.order_index}
                                         {trend.has_example && ' · Есть пример'}
+                                        {' · ЦА: '}
+                                        {formatAudienceLabel(trend.target_audiences)}
                                       </p>
                                     </div>
                                   </div>
@@ -986,6 +1013,34 @@ export function TrendsPage() {
                     rows={2}
                     aria-describedby="description-hint"
                   />
+                </div>
+                <div className="grid gap-2">
+                  <Label>Использовать в ЦА</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Тренд отображается только в выбранных потоках (Женщина / Мужчина / Пара).
+                  </p>
+                  <div className="flex flex-wrap gap-4">
+                    {AUDIENCE_VALUES.map((value) => {
+                      const arr = formData.target_audiences ?? ['women']
+                      const checked = arr.includes(value)
+                      const toggle = () => {
+                        let next: string[]
+                        if (checked) {
+                          next = arr.filter((a) => a !== value)
+                          if (next.length === 0) next = ['women']
+                        } else {
+                          next = [...arr, value]
+                        }
+                        setFormData({ ...formData, target_audiences: next })
+                      }
+                      return (
+                        <label key={value} className="flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" checked={checked} onChange={toggle} className="rounded" />
+                          <span>{AUDIENCE_LABELS[value] ?? value}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
                 </div>
               </fieldset>
 
@@ -1270,6 +1325,35 @@ export function TrendsPage() {
                 className="text-2xl"
               />
             </div>
+            <div className="grid gap-2">
+              <Label>Использовать в ЦА</Label>
+              <p className="text-xs text-muted-foreground">
+                Тематика отображается только в выбранных потоках (Женщина / Мужчина / Пара).
+              </p>
+              <div className="flex flex-wrap gap-4">
+                {AUDIENCE_VALUES.map((value) => {
+                  const arr = editingTheme ? (editingTheme.target_audiences ?? ['women']) : themeFormData.target_audiences
+                  const checked = arr.includes(value)
+                  const toggle = () => {
+                    let next: string[]
+                    if (checked) {
+                      next = arr.filter((a) => a !== value)
+                      if (next.length === 0) next = ['women']
+                    } else {
+                      next = [...arr, value]
+                    }
+                    if (editingTheme) setEditingTheme({ ...editingTheme, target_audiences: next })
+                    else setThemeFormData((prev) => ({ ...prev, target_audiences: next }))
+                  }
+                  return (
+                    <label key={value} className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={checked} onChange={toggle} className="rounded" />
+                      <span>{AUDIENCE_LABELS[value] ?? value}</span>
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
           </div>
           <DialogFooter>
             <Button
@@ -1301,6 +1385,7 @@ export function TrendsPage() {
                       data: {
                         name: editingTheme.name,
                         emoji: editingTheme.emoji || '',
+                        target_audiences: editingTheme.target_audiences?.length ? editingTheme.target_audiences : ['women'],
                       },
                     })
                   }
@@ -1315,6 +1400,7 @@ export function TrendsPage() {
                   themeCreateMutation.mutate({
                     name: themeFormData.name.trim(),
                     emoji: themeFormData.emoji.trim() || '',
+                    target_audiences: themeFormData.target_audiences?.length ? themeFormData.target_audiences : ['women'],
                   })
                 }
                 disabled={themeCreateMutation.isPending || !themeFormData.name.trim()}

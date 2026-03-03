@@ -424,7 +424,7 @@ export function PacksPage() {
                         const ids = val.split(',').map(s => s.trim()).filter(Boolean)
                         setForm((f) => ({ ...f, upsell_pack_ids: ids.length > 0 ? ids : undefined }))
                       }}
-                      placeholder="dating_pack_2, avatar_pack_2"
+                      placeholder="neo_start, neo_pro"
                     />
                   </div>
                 </div>
@@ -613,7 +613,7 @@ export function PacksPage() {
                       const ids = e.target.value.split(',').map(s => s.trim()).filter(Boolean)
                       setForm((f) => ({ ...f, upsell_pack_ids: ids.length > 0 ? ids : undefined }))
                     }}
-                    placeholder="dating_pack_2"
+                    placeholder="neo_start, neo_pro"
                   />
                 </div>
               </div>

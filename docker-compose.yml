@@ -44,6 +44,7 @@ services:
       - ./migrations:/app/migrations
       - ./prompts:/app/prompts
       - ./data/generated_images:/data/generated_images
+      - ./image:/app/image
     depends_on:
       db:
         condition: service_healthy
@@ -74,6 +75,7 @@ services:
       - ./prompts:/app/prompts
       - ./data/generated_images:/data/generated_images
       - ./data/trend_examples:/app/data/trend_examples
+      - ./image:/app/image
     depends_on:
       db:
         condition: service_healthy

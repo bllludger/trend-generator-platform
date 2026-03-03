@@ -410,16 +410,17 @@ export default function PromptPlaygroundPage() {
     
     const parts: any[] = []
     
-    // Full prompt: master blocks ([INPUT], [TASK], [IDENTITY TRANSFER]) + sections + [SAFETY]
+    // Full prompt: master blocks ([INPUT], [TASK], [IDENTITY TRANSFER]) + sections + [SAFETY]. Playground использует блоки из профиля preview.
+    const master = (masterSettings as { preview?: { prompt_input?: string; prompt_input_enabled?: boolean; prompt_task?: string; prompt_task_enabled?: boolean; prompt_identity_transfer?: string; prompt_identity_transfer_enabled?: boolean; safety_constraints?: string; safety_constraints_enabled?: boolean } })?.preview
     const textBlocks: string[] = []
-    if (masterSettings?.prompt_input_enabled !== false && masterSettings?.prompt_input?.trim()) {
-      textBlocks.push('[INPUT]\n' + masterSettings.prompt_input.trim())
+    if (master?.prompt_input_enabled !== false && master?.prompt_input?.trim()) {
+      textBlocks.push('[INPUT]\n' + master.prompt_input.trim())
     }
-    if (masterSettings?.prompt_task_enabled !== false && masterSettings?.prompt_task?.trim()) {
-      textBlocks.push('[TASK]\n' + masterSettings.prompt_task.trim())
+    if (master?.prompt_task_enabled !== false && master?.prompt_task?.trim()) {
+      textBlocks.push('[TASK]\n' + master.prompt_task.trim())
     }
-    if (masterSettings?.prompt_identity_transfer_enabled !== false && masterSettings?.prompt_identity_transfer?.trim()) {
-      textBlocks.push('[IDENTITY TRANSFER]\n' + masterSettings.prompt_identity_transfer.trim())
+    if (master?.prompt_identity_transfer_enabled !== false && master?.prompt_identity_transfer?.trim()) {
+      textBlocks.push('[IDENTITY TRANSFER]\n' + master.prompt_identity_transfer.trim())
     }
     const parsed = parseFullTrendPrompt(fullPromptText)
     let scene = (parsed.scene || '').trim()
@@ -444,8 +445,8 @@ export default function PromptPlaygroundPage() {
     } else if (fullPromptText.trim()) {
       textBlocks.push(fullPromptText.trim())
     }
-    const safetyText = (masterSettings?.safety_constraints ?? '').trim()
-    if (masterSettings?.safety_constraints_enabled !== false && safetyText) {
+    const safetyText = (master?.safety_constraints ?? '').trim()
+    if (master?.safety_constraints_enabled !== false && safetyText) {
       textBlocks.push('[SAFETY]\n' + safetyText)
     }
     const promptText = textBlocks.join('\n\n')

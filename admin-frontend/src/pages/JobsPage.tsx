@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { jobsService, trendsService } from '@/services/api'
-import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { jobsService, trendsService, type JobsAnalytics } from '@/services/api'
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -26,6 +26,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Pagination } from '@/components/Pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { formatDate, formatNumber } from '@/lib/utils'
@@ -39,7 +40,21 @@ import {
   AlertCircle,
   Clock,
   ListTodo,
+  Radio,
+  User,
+  BarChart3,
 } from 'lucide-react'
+import {
+  AreaChart,
+  Area,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from 'recharts'
 import { useState } from 'react'
 
 const PERIOD_OPTIONS = [
@@ -50,10 +65,12 @@ const PERIOD_OPTIONS = [
 ]
 
 const PAGE_SIZES = [20, 50, 100]
+const LIVE_REFETCH_INTERVAL_MS = 15_000
 
 type JobItem = {
   job_id: string
   telegram_id?: string
+  user_display_name?: string
   trend_id: string
   trend_name?: string
   trend_emoji?: string
@@ -90,10 +107,11 @@ export function JobsPage() {
   const [trendId, setTrendId] = useState('')
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [errorDetailJob, setErrorDetailJob] = useState<JobItem | null>(null)
+  const [liveEnabled, setLiveEnabled] = useState(false)
 
   const hours = PERIOD_OPTIONS.find((p) => p.value === period)?.hours ?? null
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, dataUpdatedAt } = useQuery({
     queryKey: ['jobs', page, pageSize, status, search, trendId, hours],
     queryFn: () =>
       jobsService.list({
@@ -104,18 +122,40 @@ export function JobsPage() {
         trend_id: trendId || undefined,
         hours: hours ?? undefined,
       }),
+    refetchInterval: liveEnabled ? LIVE_REFETCH_INTERVAL_MS : false,
   })
 
   const { data: stats } = useQuery({
     queryKey: ['jobs-stats', hours],
     queryFn: () => jobsService.stats(hours ?? 24),
     enabled: hours != null,
+    refetchInterval: liveEnabled ? LIVE_REFETCH_INTERVAL_MS : false,
   })
 
   const { data: trendsData } = useQuery({
     queryKey: ['trends-list-for-jobs'],
     queryFn: () => trendsService.list(),
   })
+
+  const analyticsHours = hours ?? 720
+  const { data: analytics } = useQuery<JobsAnalytics>({
+    queryKey: ['jobs-analytics', analyticsHours, trendId, status],
+    queryFn: () =>
+      jobsService.getAnalytics({
+        hours: analyticsHours,
+        trend_id: trendId || undefined,
+        status: status || undefined,
+      }),
+  })
+
+  const jobsByDayChart = (analytics?.jobs_by_day ?? []).map((d) => ({
+    date: d.date ? d.date.slice(0, 10) : '',
+    count: d.count,
+  }))
+  const byStatusChart = Object.entries(analytics?.by_status ?? {}).map(([name, count]) => ({
+    name,
+    count,
+  }))
 
   const handleStatusChange = (value: string) => {
     setStatus(value === 'all' ? '' : value)
@@ -199,6 +239,13 @@ export function JobsPage() {
         </div>
       )}
 
+      <Tabs defaultValue="journal" className="space-y-4">
+        <TabsList className="grid w-full max-w-[280px] grid-cols-2">
+          <TabsTrigger value="journal">Журнал</TabsTrigger>
+          <TabsTrigger value="analytics">Аналитика</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="journal" className="space-y-4">
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-center gap-3">
@@ -230,6 +277,17 @@ export function JobsPage() {
                 ))}
               </SelectContent>
             </Select>
+
+            <Button
+              type="button"
+              variant={liveEnabled ? 'default' : 'outline'}
+              size="sm"
+              className="gap-1.5"
+              onClick={() => setLiveEnabled((v) => !v)}
+            >
+              <Radio className={`h-4 w-4 ${liveEnabled ? 'animate-pulse' : ''}`} />
+              Live
+            </Button>
 
             <Select value={trendId || 'all'} onValueChange={(v) => { setTrendId(v === 'all' ? '' : v); setPage(1) }}>
               <SelectTrigger className="w-48">
@@ -288,21 +346,25 @@ export function JobsPage() {
             </div>
           ) : (
             <>
-              <p className="mb-3 text-xs text-muted-foreground">
-                Показано {formatNumber(from)}–{formatNumber(to)} из {formatNumber(total)}
-              </p>
+              <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>Показано {formatNumber(from)}–{formatNumber(to)} из {formatNumber(total)}</span>
+                <span>Время в вашей таймзоне</span>
+                {liveEnabled && dataUpdatedAt > 0 && (
+                  <span>Обновлено: {new Date(dataUpdatedAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                )}
+              </div>
               <div className="overflow-x-auto rounded-lg border border-border">
                 <Table>
                   <TableHeader>
                     <TableRow className="hover:bg-transparent">
                       <TableHead className="w-10"> </TableHead>
                       <TableHead className="font-mono">ID</TableHead>
-                      <TableHead>Telegram ID</TableHead>
+                      <TableHead>Пользователь</TableHead>
                       <TableHead>Тренд</TableHead>
                       <TableHead>Статус</TableHead>
                       <TableHead>Токены</TableHead>
                       <TableHead>Ошибка</TableHead>
-                      <TableHead>Создана</TableHead>
+                      <TableHead title="Время в вашей таймзоне">Создана</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -326,7 +388,18 @@ export function JobsPage() {
                         <TableCell className="font-mono text-xs">
                           {job.job_id.substring(0, 8)}…
                         </TableCell>
-                        <TableCell className="font-mono">{job.telegram_id || '—'}</TableCell>
+                        <TableCell>
+                          {job.user_display_name ? (
+                            <div>
+                              <span className="font-medium">{job.user_display_name}</span>
+                              {job.telegram_id && (
+                                <div className="text-xs text-muted-foreground font-mono">{job.telegram_id}</div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="font-mono">{job.telegram_id || '—'}</span>
+                          )}
+                        </TableCell>
                         <TableCell>
                           <Link
                             to="/trends"
@@ -374,6 +447,166 @@ export function JobsPage() {
           )}
         </CardContent>
       </Card>
+        </TabsContent>
+
+        <TabsContent value="analytics" className="space-y-6">
+          <div className="grid gap-6 lg:grid-cols-2">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <TrendingUp className="h-5 w-5" />
+                  Задачи по дням
+                </CardTitle>
+                <CardDescription>Количество задач за период</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[280px]">
+                  {jobsByDayChart.length > 0 ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={jobsByDayChart}>
+                        <defs>
+                          <linearGradient id="jobsByDayGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8} />
+                            <stop offset="95%" stopColor="#3b82f6" stopOpacity={0.1} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                        <XAxis dataKey="date" tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                        <YAxis tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: 'hsl(var(--background))',
+                            border: '1px solid hsl(var(--border))',
+                            borderRadius: '8px',
+                          }}
+                          formatter={(value: number) => [value, 'Задач']}
+                          labelFormatter={(label) => (label ? `Дата: ${label}` : '')}
+                        />
+                        <Area
+                          type="monotone"
+                          dataKey="count"
+                          stroke="#3b82f6"
+                          fill="url(#jobsByDayGrad)"
+                          name="Задач"
+                          strokeWidth={2}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-muted-foreground">Нет данных за период</div>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <BarChart3 className="h-5 w-5" />
+                  По статусам
+                </CardTitle>
+                <CardDescription>Разбивка по статусу задачи</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[280px]">
+                  {byStatusChart.length > 0 ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={byStatusChart} margin={{ left: 4, right: 16 }}>
+                        <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                        <XAxis dataKey="name" tick={{ fontSize: 10 }} className="text-muted-foreground" />
+                        <YAxis tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: 'hsl(var(--background))',
+                            border: '1px solid hsl(var(--border))',
+                            borderRadius: '8px',
+                          }}
+                          formatter={(value: number) => [value, 'Задач']}
+                        />
+                        <Bar dataKey="count" fill="#3b82f6" radius={[4, 4, 0, 0]} name="Задач" />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-muted-foreground">Нет данных за период</div>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <TrendingUp className="h-5 w-5" />
+                Топ трендов по задачам
+              </CardTitle>
+              <CardDescription>До 20 трендов с наибольшим числом задач</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {(analytics?.by_trend?.length ?? 0) > 0 ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-12">#</TableHead>
+                      <TableHead>Тренд</TableHead>
+                      <TableHead className="text-right w-24">Задач</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {analytics!.by_trend.map((t, i) => (
+                      <TableRow key={t.trend_id}>
+                        <TableCell className="text-muted-foreground text-sm">{i + 1}</TableCell>
+                        <TableCell>
+                          {t.trend_emoji ? `${t.trend_emoji} ` : ''}{t.trend_name || t.trend_id}
+                        </TableCell>
+                        <TableCell className="text-right">{t.count}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <p className="py-8 text-center text-muted-foreground">Нет данных за период</p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <User className="h-5 w-5" />
+                Топ пользователей по задачам
+              </CardTitle>
+              <CardDescription>До 20 пользователей с наибольшим числом задач за период</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {(analytics?.top_users?.length ?? 0) > 0 ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-12">#</TableHead>
+                      <TableHead>Пользователь</TableHead>
+                      <TableHead className="font-mono text-xs w-24">Telegram ID</TableHead>
+                      <TableHead className="text-right w-24">Задач</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {analytics!.top_users.map((u, i) => (
+                      <TableRow key={u.user_id}>
+                        <TableCell className="text-muted-foreground text-sm">{i + 1}</TableCell>
+                        <TableCell className="font-medium">{u.user_display_name || u.telegram_id || u.user_id}</TableCell>
+                        <TableCell className="font-mono text-xs text-muted-foreground">{u.telegram_id ?? '—'}</TableCell>
+                        <TableCell className="text-right">{u.count}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <p className="py-8 text-center text-muted-foreground">Нет данных за период</p>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
 
       <Dialog open={!!errorDetailJob} onOpenChange={() => setErrorDetailJob(null)}>
         <DialogContent>

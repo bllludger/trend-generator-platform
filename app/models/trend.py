@@ -28,6 +28,7 @@ class Trend(Base):
     max_images = Column(Integer, nullable=False, default=1)
     enabled = Column(Boolean, nullable=False, default=True)
     order_index = Column(Integer, nullable=False, default=0)
+    target_audiences = Column(JSONB, nullable=False, default=lambda: ["women"])  # в каких ЦА показывать: women, men, couples
     example_image_path = Column(String, nullable=True)  # путь к примеру результата (показ в боте и админке)
     style_reference_image_path = Column(String, nullable=True)  # референс стиля для Gemini (IMAGE_2), копировать освещение/композицию
     # Playground 1:1: когда заданы — воркер собирает промпт из секций вместо build_final_prompt_payload

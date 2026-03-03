@@ -17,6 +17,7 @@ import {
   Receipt,
   TrendingUp,
   Gift,
+  PieChart,
 } from 'lucide-react'
 
 const nav = [
@@ -30,6 +31,7 @@ const nav = [
   { to: '/audit', label: 'Аудит', icon: FileText },
   { to: '/telemetry', label: 'Телеметрия', icon: BarChart3 },
   { to: '/trends', label: 'Тренды', icon: TrendingUp },
+  { to: '/trends-analytics', label: 'Тренды — аналитика', icon: PieChart },
   { to: '/prompt-playground', label: 'Playground', icon: Sparkles },
   { to: '/copy-style', label: 'Стиль копирования', icon: Palette },
   { to: '/settings', label: 'Настройки', icon: Settings },

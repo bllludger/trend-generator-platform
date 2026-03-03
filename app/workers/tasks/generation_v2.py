@@ -29,6 +29,7 @@ from app.services.telegram.client import TelegramClient
 from app.services.telegram_messages.runtime import runtime_templates
 from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as transfer_get_effective
 from app.services.trends.service import TrendService
+from app.utils.image_formats import aspect_ratio_to_size
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +51,10 @@ def _build_prompt_for_job(db: Session, job: Job, trend: Trend) -> tuple[str, str
     Returns (prompt, negative_prompt, model, size).
     """
     gs = GenerationPromptSettingsService(db)
-    effective = gs.get_effective()
+    effective = gs.get_effective(profile="release")
     model = effective.get("default_model", "gemini-2.5-flash-image")
-    size = job.image_size or effective.get("default_size", "1024x1024")
+    # Приоритет: выбор пользователя (job.image_size), иначе дефолт из админки (default_aspect_ratio → size)
+    size = job.image_size or aspect_ratio_to_size(effective.get("default_aspect_ratio", "1:1"))
     fmt = effective.get("default_format", "png")
 
     # Если у тренда prompt_sections (Playground) — собираем из секций с тегами [], [STYLE], [AVOID], [COMPOSITION]
@@ -184,7 +186,9 @@ def generate_image(
 
         temperature = trend.prompt_temperature if trend.prompt_temperature is not None else None
         seed = int(trend.prompt_seed) if trend.prompt_seed is not None else None
-        image_size_tier = getattr(trend, "prompt_image_size_tier", None) or None
+        gs = GenerationPromptSettingsService(db)
+        effective_job = gs.get_effective(profile="release")
+        image_size_tier = (getattr(trend, "prompt_image_size_tier", None) or "").strip() or effective_job.get("default_image_size_tier") or None
 
         app_svc = AppSettingsService(db)
         provider_override = app_svc.get_effective_provider(settings)
@@ -253,7 +257,12 @@ def generate_image(
             reserved_tokens=job.reserved_tokens or 0,
         )
         decision = decide_access(ctx)
-        delivery_result = prepare_delivery(decision, raw_path, out_dir, job_id, attempt)
+        wm_params = AppSettingsService(db).get_watermark_params(
+            getattr(settings, "watermark_text", "NanoBanan Preview")
+        )
+        delivery_result = prepare_delivery(
+            decision, raw_path, out_dir, job_id, attempt, watermark_params=wm_params
+        )
 
         if delivery_result.is_preview and delivery_result.preview_path and delivery_result.original_path:
             job_service.set_output_with_paywall(
@@ -287,6 +296,14 @@ def generate_image(
                 telegram.send_message(status_chat_id, f"✅ Генерация готова, но не удалось отправить фото: {e}")
 
         return {"ok": True, "job_id": job_id, "output_path": photo_path}
+    except Exception:
+        logger.exception("generate_image_fatal", extra={"job_id": job_id})
+        if status_chat_id:
+            try:
+                telegram.send_message(status_chat_id, "❌ Произошла ошибка при генерации. Попробуйте ещё раз.")
+            except Exception:
+                pass
+        return {"ok": False, "error": "unexpected_error"}
     finally:
         db.close()
         telegram.close()
