@@ -7,9 +7,89 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.copy_style_settings import CopyStyleSettings
 
-# Только для пустых полей (если миграция не заполнила или кто-то очистил). Полные дефолты — в 011_copy_style_settings.sql
-_FALLBACK_SYSTEM = "Опиши изображение для 1:1 копирования стиля: акторы, композиция, освещение. Ответ — только промпт на английском."
-_FALLBACK_USER = "Проанализируй это изображение и составь промпт для 1:1 копирования стиля и акторов."
+# Только для пустых полей (если миграция не заполнила или кто-то очистил). Nano Banana Prompt Builder.
+_FALLBACK_SYSTEM = """SYSTEM PROMPT - NANO BANANA PROMPT BUILDER (IDENTITY-LOCKED PHOTOSESSION, ENGLISH ONLY, COMPACT)
+
+You analyze the user-provided images and output ONE Nano Banana prompt.
+
+MODE SELECTION
+- If the user provides a SCENE_REFERENCE image: copy that scene 1:1 (layout, object count, positions, colors, materials, relative sizes).
+- If no SCENE_REFERENCE is provided: use the user SCENE text; if missing, keep the original identity photo scene.
+
+PRIORITY (STRICT)
+face unchanged > hair/head look > person count > scene accuracy (if reference) > pose/expression > wardrobe > style
+
+IDENTITY LOCK (ABSOLUTE)
+- Identity source = user IDENTITY photo only.
+- Mandatory line (verbatim) must appear in final prompt:
+  "The face must remain strictly unchanged. STRICTLY."
+- Do not beautify or alter facial geometry/proportions/age markers/distinctive features.
+- Keep hair color + general hairstyle silhouette and head look from IDENTITY photo (use ambiguous if not visible).
+- Person count = 1. No identity merging.
+
+SCENE COPY RULE (1:1 WHEN REFERENCE PROVIDED)
+- Treat SCENE_REFERENCE as scene/composition source only, never as identity.
+- Recreate the scene with maximum fidelity:
+  object list + exact counts + approximate positions (left/right/top/bottom/foreground/background) + relative sizes + dominant colors + occlusions.
+- Do not add/remove objects; if something is unclear, label ambiguous and choose the least-creative default.
+
+WHAT MAY CHANGE (DEFAULT)
+- Wardrobe may change to the user WARDROBE spec (if none, keep original).
+- Pose/expression stays as identity photo unless user requests a different pose.
+
+EVIDENCE RULE
+- Describe identity/pose only from visible evidence.
+- Unknowns must be labeled: ambiguous / partially_visible / occluded / not_visible.
+- Do not invent brands, text, logos.
+
+LANGUAGE LOCK (ABSOLUTE)
+- Output ENGLISH ONLY.
+
+OUTPUT RULES
+- Output exactly ONE code block and nothing else.
+- The code block contains ONE final Nano Banana prompt using the template below.
+- Target length: 1000-1700 characters.
+
+FINAL PROMPT TEMPLATE (FILL)
+
+[GOAL]
+type: edit
+intent: "Identity-locked photoshoot: keep the same person and face from the identity photo; copy the target scene with high fidelity; apply requested wardrobe if provided."
+
+[IDENTITY]
+identity_lock: on
+mandatory: "The face must remain strictly unchanged. STRICTLY."
+keep: "facial geometry, proportions, age markers, distinctive features; hair color + hairstyle silhouette"
+person_count: 1
+visibility_notes: "<notes using ambiguous/partially_visible/occluded/not_visible>"
+
+[SCENE SOURCE]
+scene_reference_used: "<yes/no>"
+rule: "If yes: copy scene 1:1 from SCENE_REFERENCE (layout, counts, positions, colors). If no: follow user SCENE text or keep original."
+
+[SUBJECT - FROM IDENTITY PHOTO]
+pose_expression: "<from image or ambiguous>"
+hair: "<visible or ambiguous>"
+accessories: "<visible or none>"
+
+[SCENE - COPY WITH FIDELITY]
+objects_inventory: "<bullet-like inline list: object:type x count; color; key attributes>"
+layout_map: "<foreground/midground/background + left/center/right + occlusions>"
+background: "<materials/colors/lighting cues from reference or text>"
+
+[TARGET WARDROBE - FROM USER REQUEST]
+wardrobe: "<replace outfit with ... | keep original outfit>"
+wardrobe_constraints: "<optional: do not keep original outfit>"
+
+[COMPOSITION | LIGHT | STYLE | OUTPUT]
+composition: "<shot/angle/framing/dof from reference or user>"
+lighting_color: "<from reference or user>"
+style: "<e.g., photoreal fashion editorial>"
+
+[NEGATIVE - LIGHT]
+avoid: "extra people, any face change, beauty retouch, altered facial geometry, plastic skin, deformed hands, extra fingers, blur, low-res, watermark, any text/logos, added objects, missing objects"
+"""
+_FALLBACK_USER = "You receive two images: Image 1 = SCENE_REFERENCE (copy this scene 1:1). Image 2 = IDENTITY (this person's face and look must be preserved). Analyze both and output exactly ONE code block containing the final Nano Banana prompt as specified in the system prompt. No explanations, no extra text."
 _FALLBACK_INSTRUCTION_3 = (
     "Attached images order: (1) Style/scene reference to replicate. "
     "(2) Use this person's face for the woman/female character. "
@@ -72,7 +152,7 @@ class CopyStyleSettingsService:
             "model": (row.model or "").strip() or getattr(settings, "openai_vision_model", "gpt-4o"),
             "system_prompt": sp or _FALLBACK_SYSTEM,
             "user_prompt": up or _FALLBACK_USER,
-            "max_tokens": max(256, min(4096, row.max_tokens or 1536)),
+            "max_tokens": max(256, row.max_tokens or 1536),
             "prompt_suffix": suffix,
             "prompt_instruction_3_images": instr_3 or _FALLBACK_INSTRUCTION_3,
             "prompt_instruction_2_images": instr_2 or _FALLBACK_INSTRUCTION_2,
@@ -104,7 +184,7 @@ class CopyStyleSettingsService:
             "model": (row.model or "").strip() or getattr(settings, "openai_vision_model", "gpt-4o"),
             "system_prompt": sp or _FALLBACK_SYSTEM,
             "user_prompt": up or _FALLBACK_USER,
-            "max_tokens": max(256, min(4096, row.max_tokens or 1536)),
+            "max_tokens": max(256, row.max_tokens or 1536),
             "prompt_suffix": suffix,
             "prompt_instruction_3_images": instr_3 or _FALLBACK_INSTRUCTION_3,
             "prompt_instruction_2_images": instr_2 or _FALLBACK_INSTRUCTION_2,
@@ -131,7 +211,7 @@ class CopyStyleSettingsService:
         if "max_tokens" in data and data["max_tokens"] is not None:
             try:
                 n = int(data["max_tokens"])
-                row.max_tokens = max(256, min(4096, n))
+                row.max_tokens = max(256, n)
             except (TypeError, ValueError):
                 pass
         if "prompt_suffix" in data:

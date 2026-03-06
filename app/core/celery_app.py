@@ -18,6 +18,7 @@ celery_app = Celery(
         "app.workers.tasks.deliver_hd",
         "app.workers.tasks.watchdog_rendering",
         "app.workers.tasks.delete_user_data",
+        "app.workers.tasks.merge_photos",
         "app.referral.tasks",
     ],
 )

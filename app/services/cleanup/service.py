@@ -5,12 +5,14 @@ import os
 from sqlalchemy.orm import Session
 
 from app.models.job import Job
+from app.models.photo_merge_job import PhotoMergeJob
 
 
 class CleanupService:
     """
     Очистка только временных входных файлов старых Job (input_local_paths).
     Результаты генераций (outputs/), примеры трендов, чеки (receipts/) и промпты не удаляются.
+    Также очищает входные файлы PhotoMergeJob (inputs/merges/).
     """
 
     def __init__(self, db: Session) -> None:
@@ -54,3 +56,30 @@ class CleanupService:
                 cleaned += 1
         self.db.commit()
         return {"cleaned_jobs": cleaned, "older_than_hours": older_than_hours}
+
+    def cleanup_merge_inputs(self, older_than_hours: int) -> dict[str, Any]:
+        """Удаляет входные файлы завершённых PhotoMergeJob (inputs/merges/)."""
+        threshold = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
+        jobs = (
+            self.db.query(PhotoMergeJob)
+            .filter(
+                PhotoMergeJob.updated_at <= threshold,
+                PhotoMergeJob.status.in_(["succeeded", "failed"]),
+            )
+            .all()
+        )
+        cleaned = 0
+        for job in jobs:
+            paths: list[str] = job.input_paths or []
+            if paths:
+                for path in paths:
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except OSError:
+                        continue
+                job.input_paths = []
+                self.db.add(job)
+                cleaned += 1
+        self.db.commit()
+        return {"cleaned_merge_jobs": cleaned, "older_than_hours": older_than_hours}

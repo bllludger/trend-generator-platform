@@ -5,14 +5,13 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Copy, ImageIcon, Loader2, Save, Sparkles } from 'lucide-react'
+import { Loader2, Save } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 
 export function CopyStylePage() {
   const queryClient = useQueryClient()
-  const { data: settings, isLoading } = useQuery({
+  const { data: settings, isLoading, isError, error } = useQuery({
     queryKey: ['copy-style-settings'],
     queryFn: () => copyStyleService.getSettings(),
   })
@@ -28,30 +27,23 @@ export function CopyStylePage() {
       queryClient.invalidateQueries({ queryKey: ['copy-style-settings'] })
       toast.success('Настройки «Сделать такую же» сохранены')
     },
-    onError: (err: any) => {
-      const msg = err?.response?.data?.detail ?? err?.message ?? 'Ошибка при сохранении'
-      const text = typeof msg === 'string' ? msg : JSON.stringify(msg)
-      toast.error(text)
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { detail?: string }; message?: string } })?.response?.data?.detail
+        ?? (err as Error)?.message ?? 'Ошибка при сохранении'
+      toast.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
     },
   })
 
+  const maxTokensUnlimited = (Number(form.max_tokens) ?? Number(settings?.max_tokens) ?? 3000) >= 128_000
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+    const rawMax = maxTokensUnlimited ? 128_000 : (Number(form.max_tokens) ?? Number(settings?.max_tokens) ?? 3000)
     const payload: Partial<CopyStyleSettings> = {
-      model: current.model ?? '',
-      system_prompt: current.system_prompt ?? '',
-      user_prompt: current.user_prompt ?? '',
-      max_tokens: current.max_tokens ?? 1536,
-      prompt_suffix: current.prompt_suffix ?? '',
-      prompt_instruction_3_images: current.prompt_instruction_3_images ?? '',
-      prompt_instruction_2_images: current.prompt_instruction_2_images ?? '',
-      generation_system_prompt_prefix: current.generation_system_prompt_prefix ?? '',
-      generation_negative_prompt: current.generation_negative_prompt ?? '',
-      generation_safety_constraints: current.generation_safety_constraints ?? '',
-      generation_image_constraints_template: current.generation_image_constraints_template ?? '',
-      generation_default_size: current.generation_default_size ?? '1024x1024',
-      generation_default_format: current.generation_default_format ?? 'png',
-      generation_default_model: current.generation_default_model ?? '',
+      ...settings,
+      model: (form.model ?? settings?.model ?? '').trim() || 'gpt-5.2',
+      system_prompt: form.system_prompt ?? settings?.system_prompt ?? '',
+      max_tokens: Math.max(256, rawMax),
     }
     updateMutation.mutate(payload)
   }
@@ -60,249 +52,101 @@ export function CopyStylePage() {
     setForm((prev) => ({ ...prev, [key]: value }))
   }
 
-  if (isLoading || !settings) return <div className="text-center py-8">Загрузка...</div>
+  if (isError) {
+    const errMsg = (error as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
+      ?? (error as Error)?.message ?? 'Не удалось загрузить настройки'
+    return (
+      <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-6 text-center">
+        <p className="font-medium text-destructive">Ошибка загрузки</p>
+        <p className="mt-2 text-sm text-muted-foreground">{typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg)}</p>
+      </div>
+    )
+  }
+
+  if (isLoading || !settings) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      </div>
+    )
+  }
 
   const current = { ...settings, ...form }
+  const systemPrompt = String(current.system_prompt ?? '')
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold">Сделать такую же</h1>
-        <p className="text-muted-foreground">
-          Единая точка управления флоу «Сделать такую же»: анализ референса (Vision), инструкции для лиц и полный промпт генерации (Gemini). Не смешивается с трендами. Изменения применяются сразу.
+        <p className="text-muted-foreground mt-1">
+          Один системный промпт Vision (например Nano Banana Prompt Builder). Референс + своё лицо → Vision возвращает один промпт в code block → он используется 1:1 в Gemini с фото пользователя → 3 варианта (A/B/C), выбор, оплата 4K.
         </p>
       </div>
 
       <form onSubmit={handleSubmit}>
-        <Tabs defaultValue="analysis" className="w-full">
-          <TabsList className="grid w-full grid-cols-3 max-w-2xl">
-            <TabsTrigger value="analysis" className="flex items-center gap-2">
-              <Copy className="h-4 w-4" />
-              Анализ референса
-            </TabsTrigger>
-            <TabsTrigger value="generation" className="flex items-center gap-2">
-              <ImageIcon className="h-4 w-4" />
-              Инструкции (лица)
-            </TabsTrigger>
-            <TabsTrigger value="prompt" className="flex items-center gap-2">
-              <Sparkles className="h-4 w-4" />
-              Промпт генерации
-            </TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="analysis" className="mt-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>Настройки анализа референса</CardTitle>
-                <p className="text-sm text-muted-foreground">
-                  Модель ChatGPT Vision и промпты задают, как описывается изображение и формируется текст для копирования стиля (акторы, композиция).
-                </p>
-              </CardHeader>
-              <CardContent className="space-y-6">
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div className="space-y-2">
-                    <Label htmlFor="model">Модель ChatGPT (Vision)</Label>
-                    <Input
-                      id="model"
-                      placeholder="gpt-4o"
-                      value={String(current.model ?? '')}
-                      onChange={(e) => handleChange('model', e.target.value)}
-                    />
-                    <p className="text-xs text-muted-foreground">Например: gpt-4o, gpt-4o-mini</p>
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="max_tokens">max_tokens</Label>
-                    <Input
-                      id="max_tokens"
-                      type="number"
-                      min={256}
-                      max={4096}
-                      value={Number(current.max_tokens ?? 1536)}
-                      onChange={(e) => handleChange('max_tokens', parseInt(e.target.value) || 1536)}
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="system_prompt">Системный промпт</Label>
-                  <Textarea
-                    id="system_prompt"
-                    rows={10}
-                    className="font-mono text-sm"
-                    value={String(current.system_prompt ?? '')}
-                    onChange={(e) => handleChange('system_prompt', e.target.value)}
-                    placeholder="Инструкция модели: как анализировать изображение и формировать промпт..."
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="user_prompt">Пользовательский промпт (к изображению)</Label>
-                  <Textarea
-                    id="user_prompt"
-                    rows={3}
-                    className="font-mono text-sm"
-                    value={String(current.user_prompt ?? '')}
-                    onChange={(e) => handleChange('user_prompt', e.target.value)}
-                    placeholder="Текст запроса к модели по анализу изображения..."
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="prompt_suffix">Суффикс промпта для генератора (Gemini)</Label>
-                  <Textarea
-                    id="prompt_suffix"
-                    rows={3}
-                    className="font-mono text-sm"
-                    value={String(current.prompt_suffix ?? '')}
-                    onChange={(e) => handleChange('prompt_suffix', e.target.value)}
-                    placeholder="Добавляется к custom_prompt. Например: Always include the person or people from the input image..."
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Добавляется к промпту при отправке в генератор (режим «Своя идея» / copy flow).
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="generation" className="mt-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>Инструкции для генерации (лица в сцене)</CardTitle>
-                <p className="text-sm text-muted-foreground">
-                  Текст, который добавляется в запрос к Gemini при флоу «2 фотографии»: порядок изображений и кто за кого (девушка/парень). Пишите на английском для Gemini.
-                </p>
-              </CardHeader>
-              <CardContent className="space-y-6">
-                <div className="space-y-2">
-                  <Label htmlFor="prompt_instruction_3_images">Когда 3 фото: стиль + лицо девушки + лицо парня</Label>
-                  <Textarea
-                    id="prompt_instruction_3_images"
-                    rows={5}
-                    className="font-mono text-sm"
-                    value={String(current.prompt_instruction_3_images ?? '')}
-                    onChange={(e) => handleChange('prompt_instruction_3_images', e.target.value)}
-                    placeholder="(1) Style reference. (2) Face for woman. (3) Face for man. Generate scene with these faces."
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Порядок вложений: 1 — референс стиля, 2 — фото девушки (лицо для женского персонажа), 3 — фото парня (лицо для мужского).
-                  </p>
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="prompt_instruction_2_images">Когда 2 фото: лицо девушки + лицо парня (без референса в запросе)</Label>
-                  <Textarea
-                    id="prompt_instruction_2_images"
-                    rows={4}
-                    className="font-mono text-sm"
-                    value={String(current.prompt_instruction_2_images ?? '')}
-                    onChange={(e) => handleChange('prompt_instruction_2_images', e.target.value)}
-                    placeholder="(1) Face for woman. (2) Face for man. Generate scene with these faces."
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Порядок: 1 — фото девушки, 2 — фото парня. Стиль задаётся только текстом (из анализа референса).
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="prompt" className="mt-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>Промпт генерации (Gemini)</CardTitle>
-                <p className="text-sm text-muted-foreground">
-                  Системный префикс, ограничения и дефолты только для флоу «Сделать такую же». Тренды и общий «Промпт генерации» здесь не используются — единая точка управления.
-                </p>
-              </CardHeader>
-              <CardContent className="space-y-6">
-                <div className="space-y-2">
-                  <Label htmlFor="generation_system_prompt_prefix">Системный префикс (Gemini)</Label>
-                  <Textarea
-                    id="generation_system_prompt_prefix"
-                    rows={12}
-                    className="font-mono text-sm"
-                    value={String(current.generation_system_prompt_prefix ?? '')}
-                    onChange={(e) => handleChange('generation_system_prompt_prefix', e.target.value)}
-                    placeholder="You are an image generation system... TREND (text) defines style. Attached images define who must appear..."
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Полный системный блок для Gemini. Ниже в запрос подставится TREND (текст из анализа референса) и инструкции для 2/3 фото.
-                  </p>
-                </div>
-                <div className="grid gap-4 md:grid-cols-3">
-                  <div className="space-y-2">
-                    <Label htmlFor="generation_default_model">Модель Gemini</Label>
-                    <Input
-                      id="generation_default_model"
-                      placeholder="gemini-2.5-flash-image"
-                      value={String(current.generation_default_model ?? '')}
-                      onChange={(e) => handleChange('generation_default_model', e.target.value)}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="generation_default_size">Размер по умолчанию</Label>
-                    <Input
-                      id="generation_default_size"
-                      placeholder="1024x1024"
-                      value={String(current.generation_default_size ?? '1024x1024')}
-                      onChange={(e) => handleChange('generation_default_size', e.target.value)}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="generation_default_format">Формат</Label>
-                    <Input
-                      id="generation_default_format"
-                      placeholder="png"
-                      value={String(current.generation_default_format ?? 'png')}
-                      onChange={(e) => handleChange('generation_default_format', e.target.value)}
-                    />
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="generation_negative_prompt">Negative prompt</Label>
-                  <Textarea
-                    id="generation_negative_prompt"
-                    rows={2}
-                    className="font-mono text-sm"
-                    value={String(current.generation_negative_prompt ?? '')}
-                    onChange={(e) => handleChange('generation_negative_prompt', e.target.value)}
-                    placeholder="Оставьте пустым или укажите, что исключить из сцены"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="generation_safety_constraints">Ограничения безопасности</Label>
-                  <Textarea
-                    id="generation_safety_constraints"
-                    rows={2}
-                    className="font-mono text-sm"
-                    value={String(current.generation_safety_constraints ?? '')}
-                    onChange={(e) => handleChange('generation_safety_constraints', e.target.value)}
-                    placeholder="no text generation, no chat."
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="generation_image_constraints_template">Шаблон ограничений изображения</Label>
+        <Card>
+          <CardHeader>
+            <CardTitle>Vision: системный промпт и настройки</CardTitle>
+            <p className="text-sm text-muted-foreground">
+              Только system_prompt, model и max_tokens. User-сообщение фиксировано в коде.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="model">model (OpenAI Vision)</Label>
+                <Input
+                  id="model"
+                  placeholder="gpt-5.2"
+                  value={String(current.model ?? '')}
+                  onChange={(e) => handleChange('model', e.target.value)}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="max_tokens">max_tokens</Label>
+                <div className="flex items-center gap-4">
                   <Input
-                    id="generation_image_constraints_template"
-                    className="font-mono"
-                    value={String(current.generation_image_constraints_template ?? 'size={size}, format={format}')}
-                    onChange={(e) => handleChange('generation_image_constraints_template', e.target.value)}
-                    placeholder="size={size}, format={format}"
+                    id="max_tokens"
+                    type="number"
+                    min={256}
+                    value={maxTokensUnlimited ? 128000 : (Number(current.max_tokens) ?? 3000)}
+                    onChange={(e) => handleChange('max_tokens', parseInt(e.target.value, 10) || 256)}
+                    disabled={maxTokensUnlimited}
+                    className="w-32"
                   />
-                  <p className="text-xs text-muted-foreground">Плейсхолдеры: {'{size}'}, {'{format}'}</p>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={maxTokensUnlimited}
+                      onChange={(e) => handleChange('max_tokens', e.target.checked ? 128000 : 3000)}
+                    />
+                    <span className="text-sm">Без лимита (max)</span>
+                  </label>
                 </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-        </Tabs>
+              </div>
+            </div>
 
-        <div className="flex justify-end mt-6">
-          <Button type="submit" disabled={updateMutation.isPending}>
-            {updateMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            <span className="ml-2">Сохранить все настройки</span>
-          </Button>
-        </div>
+            <div className="space-y-2">
+              <Label htmlFor="system_prompt">system_prompt</Label>
+              <Textarea
+                id="system_prompt"
+                rows={14}
+                className="font-mono text-sm resize-y"
+                value={systemPrompt}
+                onChange={(e) => handleChange('system_prompt', e.target.value)}
+                placeholder="Системное сообщение в запросе к ChatGPT (формат SCENE / STYLE / META)..."
+                required
+              />
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <Button type="submit" disabled={updateMutation.isPending || !systemPrompt.trim()}>
+                {updateMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                <span className="ml-2">Сохранить</span>
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
       </form>
     </div>
   )

@@ -117,8 +117,20 @@ function MetricCard({ title, value, subtitle, trend, icon: Icon, color }: Metric
   )
 }
 
+const FUNNEL_LABELS: Record<string, string> = {
+  bot_started: 'Старт',
+  photo_uploaded: 'Фото загружено',
+  take_preview_ready: 'Превью готовы',
+  favorite_selected: 'Выбор варианта',
+  paywall_viewed: 'Просмотр оплаты',
+  pay_initiated: 'Нажата оплата',
+  pay_success: 'Оплата успешна',
+  hd_delivered: 'HD доставлен',
+}
+
 export function TelemetryPage() {
   const [windowHours, setWindowHours] = useState(24)
+  const [productWindowDays, setProductWindowDays] = useState(7)
 
   const { data, isLoading, refetch, isFetching } = useQuery<TelemetryDashboardData>({
     queryKey: ['telemetry', windowHours],
@@ -135,6 +147,21 @@ export function TelemetryPage() {
   const { data: productMetrics } = useQuery({
     queryKey: ['telemetry-product', 30],
     queryFn: () => telemetryService.getProductMetrics(30),
+  })
+
+  const { data: productFunnel } = useQuery({
+    queryKey: ['telemetry-product-funnel', productWindowDays],
+    queryFn: () => telemetryService.getProductFunnel(productWindowDays),
+  })
+
+  const { data: productMetricsV2 } = useQuery({
+    queryKey: ['telemetry-product-metrics-v2', productWindowDays],
+    queryFn: () => telemetryService.getProductMetricsV2(productWindowDays),
+  })
+
+  const { data: revenueData } = useQuery({
+    queryKey: ['telemetry-revenue', productWindowDays],
+    queryFn: () => telemetryService.getRevenue(productWindowDays),
   })
 
   const errorsWindowDays = 30
@@ -205,10 +232,12 @@ export function TelemetryPage() {
       </div>
 
       <Tabs defaultValue="overview" className="space-y-6">
-        <TabsList className="grid w-full grid-cols-4 lg:w-auto">
+        <TabsList className="grid w-full grid-cols-6 lg:w-auto lg:flex-wrap">
           <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="funnel">Funnel</TabsTrigger>
           <TabsTrigger value="engagement">Engagement</TabsTrigger>
           <TabsTrigger value="trends">Trends</TabsTrigger>
+          <TabsTrigger value="revenue">Revenue</TabsTrigger>
           <TabsTrigger value="health">Health</TabsTrigger>
         </TabsList>
 
@@ -249,6 +278,24 @@ export function TelemetryPage() {
                 icon={Zap}
                 color="bg-amber-500"
               />
+              {productMetricsV2 != null && (
+                <>
+                  <MetricCard
+                    title="Preview → Pay"
+                    value={`${productMetricsV2.preview_to_pay_pct ?? 0}%`}
+                    subtitle={`${productWindowDays} д.`}
+                    icon={Target}
+                    color="bg-cyan-500"
+                  />
+                  <MetricCard
+                    title="Paying users"
+                    value={productMetricsV2.paying_users ?? 0}
+                    subtitle={`Выручка: ${formatNumber(productMetricsV2.total_stars ?? 0)} ⭐`}
+                    icon={Users}
+                    color="bg-emerald-500"
+                  />
+                </>
+              )}
             </div>
           </div>
 
@@ -443,6 +490,57 @@ export function TelemetryPage() {
           </div>
         </TabsContent>
 
+        {/* FUNNEL */}
+        <TabsContent value="funnel" className="space-y-6">
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-muted-foreground">Окно:</span>
+            {[7, 14, 30].map((d) => (
+              <Button
+                key={d}
+                variant={productWindowDays === d ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setProductWindowDays(d)}
+              >
+                {d} д.
+              </Button>
+            ))}
+          </div>
+          <Card>
+            <CardHeader>
+              <CardTitle>Воронка продукта</CardTitle>
+              <CardDescription>
+                События из product_events за {productWindowDays} д.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {productFunnel?.funnel_counts ? (
+                <div className="flex flex-wrap gap-4 items-end">
+                  {Object.entries(productFunnel.funnel_counts).map(([key, count]) => (
+                    <div key={key} className="flex flex-col items-center gap-1">
+                      <div className="text-xs text-muted-foreground whitespace-nowrap">
+                        {FUNNEL_LABELS[key] ?? key}
+                      </div>
+                      <div className="bg-primary/20 rounded-t px-3 py-2 min-w-[80px] text-center min-h-[40px]">
+                        <span className="font-semibold">{formatNumber(count as number)}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-muted-foreground">Нет данных за период.</p>
+              )}
+            </CardContent>
+          </Card>
+          {productMetricsV2 != null && (
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+              <MetricCard title="Preview → Pay" value={`${productMetricsV2.preview_to_pay_pct ?? 0}%`} subtitle="Конверсия" icon={Target} color="bg-cyan-500" />
+              <MetricCard title="Hit Rate" value={`${productMetricsV2.hit_rate_pct ?? 0}%`} subtitle="Сессии с выбором / с превью" icon={CheckCircle} color="bg-green-500" />
+              <MetricCard title="AOV (Stars)" value={productMetricsV2.aov_stars ?? 0} subtitle="Средний чек" icon={TrendingUp} color="bg-amber-500" />
+              <MetricCard title="Repeat Purchase" value={`${productMetricsV2.repeat_purchase_rate_pct ?? 0}%`} subtitle="2+ покупок" icon={Users} color="bg-purple-500" />
+            </div>
+          )}
+        </TabsContent>
+
         {/* ENGAGEMENT */}
         <TabsContent value="engagement" className="space-y-6">
           <div>
@@ -614,6 +712,70 @@ export function TelemetryPage() {
               </div>
             </CardContent>
           </Card>
+        </TabsContent>
+
+        {/* REVENUE */}
+        <TabsContent value="revenue" className="space-y-6">
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-muted-foreground">Окно:</span>
+            {[7, 14, 30].map((d) => (
+              <Button
+                key={d}
+                variant={productWindowDays === d ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setProductWindowDays(d)}
+              >
+                {d} д.
+              </Button>
+            ))}
+          </div>
+          {revenueData != null ? (
+            <>
+              <div className="grid gap-4 md:grid-cols-3">
+                <MetricCard title="Выручка (Stars)" value={formatNumber(revenueData.total_stars ?? 0)} subtitle={`за ${revenueData.window_days} д.`} icon={TrendingUp} color="bg-green-500" />
+                <MetricCard title="Выручка (₽)" value={formatNumber(revenueData.revenue_rub_approx ?? 0)} subtitle="приблизительно" icon={Activity} color="bg-emerald-500" />
+                <MetricCard title="Окно" value={`${revenueData.window_days} д.`} subtitle="" icon={Clock} color="bg-blue-500" />
+              </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle>По пакетам (Stars)</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-2">
+                    {Object.entries(revenueData.by_pack ?? {}).map(([packId, stars]) => (
+                      <div key={packId} className="flex justify-between items-center py-1 border-b last:border-0">
+                        <span className="font-medium">{packId}</span>
+                        <span>{formatNumber(Number(stars))} ⭐</span>
+                      </div>
+                    ))}
+                    {Object.keys(revenueData.by_pack ?? {}).length === 0 && (
+                      <p className="text-muted-foreground">Нет данных</p>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle>По источникам (Stars)</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-2">
+                    {Object.entries(revenueData.by_source ?? {}).map(([source, stars]) => (
+                      <div key={source} className="flex justify-between items-center py-1 border-b last:border-0">
+                        <span className="font-medium">{source}</span>
+                        <span>{formatNumber(Number(stars))} ⭐</span>
+                      </div>
+                    ))}
+                    {Object.keys(revenueData.by_source ?? {}).length === 0 && (
+                      <p className="text-muted-foreground">Нет данных</p>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            </>
+          ) : (
+            <p className="text-muted-foreground">Загрузка...</p>
+          )}
         </TabsContent>
 
         {/* HEALTH */}

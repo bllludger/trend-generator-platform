@@ -3,19 +3,22 @@ Admin API: security, settings, users, telegram messages, telemetry, bank transfe
 payments, packs, trends, audit, broadcast, jobs, copy style, cleanup.
 Paths match admin-frontend/src/services/api.ts. Order: /users/analytics and /users before /users/{id}.
 """
-from datetime import datetime, timedelta, timezone
+import logging
+import os
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-import os
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import and_, case, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.db.session import get_db
 from app.models.audit_log import AuditLog
+from app.models.product_event import ProductEvent
 from app.models.bank_transfer_receipt_log import BankTransferReceiptLog
 from app.models.job import Job
 from app.models.pack import Pack
@@ -44,6 +47,13 @@ from app.api.routes.playground import trend_to_playground_config
 from app.workers.tasks.broadcast import broadcast_message
 from app.models.referral_bonus import ReferralBonus
 from app.referral.service import ReferralService
+from app.models.traffic_source import TrafficSource
+from app.models.ad_campaign import AdCampaign
+from app.models.photo_merge_job import PhotoMergeJob
+from app.models.poster_settings import PosterSettings
+from app.models.trend_post import TrendPost
+from app.services.photo_merge.settings_service import PhotoMergeSettingsService
+from app.services.telegram.client import TelegramClient
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(get_current_user)])
 
@@ -929,6 +939,160 @@ def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = 
     }
 
 
+# ---------- Product analytics (product_events) ----------
+FUNNEL_EVENT_NAMES = [
+    "bot_started",
+    "photo_uploaded",
+    "take_preview_ready",
+    "favorite_selected",
+    "paywall_viewed",
+    "pay_initiated",
+    "pay_success",
+    "hd_delivered",
+]
+
+
+@router.get("/telemetry/product-funnel")
+def telemetry_product_funnel(
+    db: Session = Depends(get_db),
+    window_days: int = Query(7, ge=1, le=90),
+):
+    """Funnel counts from product_events (for product analytics dashboard)."""
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    rows = (
+        db.query(ProductEvent.event_name, func.count(ProductEvent.id))
+        .filter(ProductEvent.timestamp >= since, ProductEvent.event_name.in_(FUNNEL_EVENT_NAMES))
+        .group_by(ProductEvent.event_name)
+        .all()
+    )
+    funnel_counts = {name: 0 for name in FUNNEL_EVENT_NAMES}
+    for name, cnt in rows:
+        funnel_counts[name] = cnt
+    return {"window_days": window_days, "funnel_counts": funnel_counts}
+
+
+@router.get("/telemetry/product-metrics-v2")
+def telemetry_product_metrics_v2(
+    db: Session = Depends(get_db),
+    window_days: int = Query(7, ge=1, le=90),
+):
+    """Calculated product metrics from product_events: preview_to_pay, hit_rate, AOV, etc."""
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    # Counts
+    take_preview = db.query(func.count(ProductEvent.id)).filter(
+        ProductEvent.event_name == "take_preview_ready", ProductEvent.timestamp >= since
+    ).scalar() or 0
+    pay_success_count = db.query(func.count(ProductEvent.id)).filter(
+        ProductEvent.event_name == "pay_success", ProductEvent.timestamp >= since
+    ).scalar() or 0
+    # Preview -> Pay conversion
+    preview_to_pay = round((pay_success_count / take_preview * 100), 1) if take_preview else 0.0
+    # Sessions with favorite vs with preview (Hit Rate)
+    sessions_with_preview = db.query(func.count(func.distinct(ProductEvent.session_id))).filter(
+        ProductEvent.event_name == "take_preview_ready",
+        ProductEvent.timestamp >= since,
+        ProductEvent.session_id.isnot(None),
+    ).scalar() or 0
+    sessions_with_favorite = db.query(func.count(func.distinct(ProductEvent.session_id))).filter(
+        ProductEvent.event_name == "favorite_selected",
+        ProductEvent.timestamp >= since,
+        ProductEvent.session_id.isnot(None),
+    ).scalar() or 0
+    hit_rate = round((sessions_with_favorite / sessions_with_preview * 100), 1) if sessions_with_preview else 0.0
+    # Revenue from pay_success (properties.price in stars)
+    pay_events = (
+        db.query(ProductEvent.properties)
+        .filter(ProductEvent.event_name == "pay_success", ProductEvent.timestamp >= since)
+        .all()
+    )
+    def _safe_price(props: dict | None) -> int:
+        try:
+            return int(float((props or {}).get("price", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    total_stars = sum(_safe_price(p[0]) for p in pay_events)
+    aov_stars = round(total_stars / pay_success_count, 1) if pay_success_count else 0.0
+    # Likeness: generation_likeness_feedback with likeness=yes
+    likeness_events = (
+        db.query(ProductEvent.properties)
+        .filter(
+            ProductEvent.event_name == "generation_likeness_feedback",
+            ProductEvent.timestamp >= since,
+        )
+        .all()
+    )
+    total_likeness = len(likeness_events)
+    likeness_yes = sum(1 for p in likeness_events if (p[0] or {}).get("likeness") == "yes")
+    likeness_score = round((likeness_yes / total_likeness * 100), 1) if total_likeness else 0.0
+    # Repeat purchase: users with 2+ pay_success
+    pay_per_user = (
+        db.query(ProductEvent.user_id, func.count(ProductEvent.id))
+        .filter(ProductEvent.event_name == "pay_success", ProductEvent.timestamp >= since)
+        .group_by(ProductEvent.user_id)
+        .all()
+    )
+    paying_users = len(pay_per_user)
+    users_2plus = sum(1 for _u, c in pay_per_user if c >= 2)
+    repeat_purchase_rate = round((users_2plus / paying_users * 100), 1) if paying_users else 0.0
+    # Unique users (bot_started) and paying users
+    users_started = db.query(func.count(func.distinct(ProductEvent.user_id))).filter(
+        ProductEvent.event_name == "bot_started", ProductEvent.timestamp >= since
+    ).scalar() or 0
+    return {
+        "window_days": window_days,
+        "preview_to_pay_pct": preview_to_pay,
+        "hit_rate_pct": hit_rate,
+        "aov_stars": aov_stars,
+        "total_stars": total_stars,
+        "pay_success_count": pay_success_count,
+        "take_preview_ready_count": take_preview,
+        "sessions_with_preview": sessions_with_preview,
+        "sessions_with_favorite": sessions_with_favorite,
+        "likeness_score_pct": likeness_score,
+        "total_likeness_feedback": total_likeness,
+        "repeat_purchase_rate_pct": repeat_purchase_rate,
+        "paying_users": paying_users,
+        "users_started": users_started,
+    }
+
+
+@router.get("/telemetry/revenue")
+def telemetry_revenue(
+    db: Session = Depends(get_db),
+    window_days: int = Query(30, ge=1, le=90),
+):
+    """Revenue by pack and by source from product_events pay_success."""
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    events = (
+        db.query(ProductEvent.pack_id, ProductEvent.source, ProductEvent.properties)
+        .filter(ProductEvent.event_name == "pay_success", ProductEvent.timestamp >= since)
+        .all()
+    )
+    by_pack: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    total_stars = 0
+    def _safe_price(p: dict | None) -> int:
+        try:
+            return int(float((p or {}).get("price", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    for pack_id, source, props in events:
+        price = _safe_price(props)
+        total_stars += price
+        pack_key = pack_id or "unknown"
+        by_pack[pack_key] = by_pack.get(pack_key, 0) + price
+        src_key = source or "organic"
+        by_source[src_key] = by_source.get(src_key, 0) + price
+    rate = getattr(app_settings, "star_to_rub", 1.3)
+    return {
+        "window_days": window_days,
+        "total_stars": total_stars,
+        "revenue_rub_approx": round(total_stars * rate, 2),
+        "by_pack": by_pack,
+        "by_source": by_source,
+    }
+
+
 # ---------- Bank transfer ----------
 @router.get("/bank-transfer/settings")
 def bank_transfer_settings_get(db: Session = Depends(get_db)):
@@ -1740,6 +1904,365 @@ def admin_trends_patch_order(trend_id: str, payload: dict = Body(...), db: Sessi
     return _trend_to_detail(trend)
 
 
+# ---------- Trend posts (автопостер в канал) ----------
+def _render_poster_caption(
+    template: str,
+    name: str,
+    emoji: str,
+    description: str,
+    deeplink: str,
+    theme_name: str = "",
+    theme_emoji: str = "",
+) -> str:
+    """Подставляет в шаблон {name}, {emoji}, {description}, {theme}, {theme_emoji}; ссылку в шаблон не вставляем — кнопка отдельно."""
+    t = template or ""
+    t = t.replace("{name}", name or "").replace("{emoji}", emoji or "").replace("{description}", description or "")
+    t = t.replace("{theme}", theme_name or "").replace("{theme_emoji}", theme_emoji or "")
+    return t.strip()
+
+
+@router.get("/trend-posts")
+def trend_posts_list(
+    db: Session = Depends(get_db),
+    status: str | None = Query(None, description="draft | sent | deleted"),
+):
+    """Список публикаций трендов (с данными тренда)."""
+    if status and status not in ("draft", "sent", "deleted"):
+        raise HTTPException(400, "status must be one of: draft, sent, deleted")
+    q = db.query(TrendPost).join(Trend, TrendPost.trend_id == Trend.id)
+    if status:
+        q = q.filter(TrendPost.status == status)
+    q = q.order_by(TrendPost.sent_at.desc().nulls_last(), TrendPost.created_at.desc())
+    posts = q.all()
+    ps = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+    db_bot = (getattr(ps, "poster_bot_username", None) or "").strip() if ps else ""
+    env_bot = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
+    bot_username = (db_bot or env_bot).lstrip("@")
+    items = []
+    for p in posts:
+        t = p.trend
+        deeplink = f"https://t.me/{bot_username}?start=trend_{p.trend_id}" if bot_username else None
+        items.append({
+            "id": p.id,
+            "trend_id": p.trend_id,
+            "trend_name": t.name if t else None,
+            "trend_emoji": t.emoji if t else None,
+            "channel_id": p.channel_id,
+            "caption": p.caption,
+            "telegram_message_id": p.telegram_message_id,
+            "status": p.status,
+            "sent_at": p.sent_at.isoformat() if p.sent_at else None,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+            "deeplink": deeplink,
+        })
+    return {"items": items}
+
+
+@router.get("/trend-posts/unpublished")
+def trend_posts_unpublished(db: Session = Depends(get_db)):
+    """Тренды (enabled), у которых нет отправленной публикации (status=sent). С темами для группировки по блокам."""
+    rows = db.query(TrendPost.trend_id).filter(TrendPost.status == "sent").distinct().all()
+    sent_trend_ids = {row[0] for row in rows}
+    all_trends = (
+        db.query(Trend)
+        .options(joinedload(Trend.theme))
+        .outerjoin(Theme, Trend.theme_id == Theme.id)
+        .order_by(Theme.order_index.asc().nulls_last(), Trend.order_index.asc())
+        .all()
+    )
+    ps = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+    db_bot = (getattr(ps, "poster_bot_username", None) or "").strip() if ps else ""
+    env_bot = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
+    bot_username = (db_bot or env_bot).lstrip("@")
+    unpublished = []
+    for t in all_trends:
+        if not t.enabled or t.id in sent_trend_ids:
+            continue
+        example_path = _resolve_trend_media_path(t.example_image_path, t.id, "_example")
+        deeplink = f"https://t.me/{bot_username}?start=trend_{t.id}" if bot_username else None
+        theme = getattr(t, "theme", None)
+        theme_order = theme.order_index if theme else 9999
+        theme_name = (theme.name or "Без тематики") if theme else "Без тематики"
+        theme_emoji = (theme.emoji or "") if theme else ""
+        unpublished.append({
+            "id": t.id,
+            "name": t.name,
+            "emoji": t.emoji,
+            "description": t.description or "",
+            "has_example": example_path is not None,
+            "deeplink": deeplink,
+            "theme_id": t.theme_id,
+            "theme_name": theme_name,
+            "theme_emoji": theme_emoji,
+            "theme_order_index": theme_order,
+        })
+    return {"items": unpublished}
+
+
+@router.post("/trend-posts/preview")
+def trend_posts_preview(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """Рендер подписи по шаблону. Возвращает caption и признак наличия картинки."""
+    trend_id = payload.get("trend_id")
+    caption_template = payload.get("caption") or payload.get("caption_template") or ""
+    if not trend_id:
+        raise HTTPException(400, "trend_id required")
+    trend = db.query(Trend).options(joinedload(Trend.theme)).filter(Trend.id == trend_id).one_or_none()
+    if not trend:
+        raise HTTPException(404, "Trend not found")
+    # Если caption не передан — берём дефолтный шаблон из poster_settings
+    if not caption_template.strip():
+        ps = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+        caption_template = (ps.poster_default_template if ps else "") or "{emoji} {name}\n\n{description}\n\nПопробовать тут:"
+    deeplink = ""
+    ps_bot = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+    db_bot = (getattr(ps_bot, "poster_bot_username", None) or "").strip() if ps_bot else ""
+    env_bot = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
+    bot_username = (db_bot or env_bot).lstrip("@")
+    if bot_username:
+        deeplink = f"https://t.me/{bot_username}?start=trend_{trend_id}"
+    theme = getattr(trend, "theme", None)
+    theme_name = (theme.name or "") if theme else ""
+    theme_emoji = (theme.emoji or "") if theme else ""
+    caption = _render_poster_caption(
+        caption_template,
+        trend.name or "",
+        trend.emoji or "",
+        trend.description or "",
+        deeplink,
+        theme_name=theme_name,
+        theme_emoji=theme_emoji,
+    )
+    # В превью тоже не добавляем URL в текст — только кнопка будет с ссылкой
+    example_path = _resolve_trend_media_path(trend.example_image_path, trend_id, "_example")
+    return {
+        "trend_id": trend_id,
+        "caption": caption,
+        "has_example": example_path is not None,
+        "deeplink": deeplink,
+    }
+
+
+@router.post("/trend-posts/publish")
+def trend_posts_publish(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """Отправить пост в канал: фото + подпись + кнопка «Попробовать»."""
+    trend_id = payload.get("trend_id") or payload.get("trendId")
+    caption = (payload.get("caption") or "").strip()
+    if not trend_id:
+        logger.warning("trend_posts_publish: trend_id missing in payload")
+        raise HTTPException(400, "trend_id required")
+    # Канал: сначала из настроек в БД, иначе из env
+    ps_channel = ""
+    ps = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+    if ps and (ps.poster_channel_id or "").strip():
+        ps_channel = (ps.poster_channel_id or "").strip()
+    env_channel = (getattr(app_settings, "poster_channel_id", None) or "").strip()
+    channel_id = ps_channel or env_channel
+    if not channel_id:
+        logger.warning("trend_posts_publish: channel not set; set in Admin → Автопостер → Настройки or POSTER_CHANNEL_ID in .env")
+        raise HTTPException(
+            400,
+            "Не задан канал для автопостера. Укажите канал в Настройках (Автопостер → Настройки → ID канала) или задайте POSTER_CHANNEL_ID в .env и перезапустите API.",
+        )
+    # Telegram: для канала по username нужен @ (напр. @nanobanana_al); числовой ID — как есть (напр. -1003808081075)
+    if not channel_id.lstrip("-").isdigit() and not channel_id.startswith("@"):
+        channel_id = "@" + channel_id
+    trend = db.query(Trend).options(joinedload(Trend.theme)).filter(Trend.id == trend_id).one_or_none()
+    if not trend:
+        raise HTTPException(404, "Trend not found")
+    example_path = _resolve_trend_media_path(trend.example_image_path, trend_id, "_example")
+    if not example_path or not os.path.isfile(example_path):
+        examples_dir = _get_trend_examples_dir()
+        logger.warning(
+            "trend_posts_publish: example image not found for trend_id=%s, example_image_path=%s, resolved=%s, examples_dir=%s",
+            trend_id,
+            getattr(trend, "example_image_path", None),
+            example_path,
+            examples_dir,
+        )
+        raise HTTPException(
+            400,
+            "У тренда нет картинки-примера. Загрузите пример в карточке тренда (Тренды → редактировать тренд → загрузить пример). Каталог примеров на сервере: " + examples_dir,
+        )
+    # Username бота для диплинка: сначала из настроек БД (ps уже загружен выше), иначе из env (без @ в значении)
+    db_bot = (getattr(ps, "poster_bot_username", None) or "").strip() if ps else ""
+    env_bot = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
+    bot_username = (db_bot or env_bot).lstrip("@")
+    deeplink = f"https://t.me/{bot_username}?start=trend_{trend_id}" if bot_username else ""
+    if not deeplink:
+        logger.warning("trend_posts_publish: bot username not set; no deeplink/button. Set in Настройки → Username бота or TELEGRAM_BOT_USERNAME in .env")
+    # Всегда рендерим подпись из шаблона на сервере (подставляем name, emoji, description, theme, theme_emoji).
+    # Игнорируем caption из payload — фронт может передать сырой шаблон с плейсхолдерами.
+    ps = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+    template = (ps.poster_default_template if ps else "") or "{emoji} {name}\n\n{description}\n\nПопробовать тут:"
+    theme = getattr(trend, "theme", None)
+    theme_name = (theme.name or "") if theme else ""
+    theme_emoji = (theme.emoji or "") if theme else ""
+    caption = _render_poster_caption(
+        template,
+        trend.name or "",
+        trend.emoji or "",
+        trend.description or "",
+        deeplink,
+        theme_name=theme_name,
+        theme_emoji=theme_emoji,
+    )
+    # Диплинк не добавляем в текст подписи — только в инлайн-кнопку под постом
+    if len(caption) > 1024:
+        logger.warning("trend_posts_publish: caption length %s > 1024 for trend_id=%s", len(caption), trend_id)
+        raise HTTPException(400, "Подпись слишком длинная (Telegram: макс. 1024 символа)")
+    reply_markup = None
+    if deeplink:
+        btn_text = "Попробовать"
+        if ps := db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none():
+            if (t := (ps.poster_button_text or "").strip()):
+                btn_text = t[:64]  # Telegram: label max 64 chars
+        reply_markup = {"inline_keyboard": [[{"text": btn_text or "Попробовать", "url": deeplink}]]}
+    telegram = TelegramClient()
+    try:
+        result = telegram.send_photo(
+            channel_id,
+            example_path,
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Ошибка отправки в Telegram: {e}")
+    finally:
+        telegram.close()
+    message_id = (result.get("result") or {}).get("message_id") if isinstance(result, dict) else None
+    # Создаём или обновляем запись
+    existing = db.query(TrendPost).filter(TrendPost.trend_id == trend_id, TrendPost.status == "sent").first()
+    if existing:
+        existing.caption = caption
+        existing.telegram_message_id = message_id
+        existing.sent_at = datetime.now(timezone.utc)
+        existing.updated_at = datetime.now(timezone.utc)
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+        post = existing
+    else:
+        post = TrendPost(
+            trend_id=trend_id,
+            channel_id=channel_id,
+            caption=caption,
+            telegram_message_id=message_id,
+            status="sent",
+            sent_at=datetime.now(timezone.utc),
+        )
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+    return {
+        "id": post.id,
+        "trend_id": post.trend_id,
+        "status": post.status,
+        "telegram_message_id": post.telegram_message_id,
+        "sent_at": post.sent_at.isoformat() if post.sent_at else None,
+    }
+
+
+@router.delete("/trend-posts/{post_id}")
+def trend_posts_delete(post_id: str, db: Session = Depends(get_db)):
+    """Удалить пост из канала и пометить запись как deleted."""
+    post = db.query(TrendPost).filter(TrendPost.id == post_id).one_or_none()
+    if not post:
+        raise HTTPException(404, "Post not found")
+    channel_id = post.channel_id
+    msg_id = post.telegram_message_id
+    if channel_id and msg_id is not None:
+        telegram = TelegramClient()
+        try:
+            telegram.delete_message(channel_id, msg_id)
+        except Exception:
+            pass
+        finally:
+            telegram.close()
+    post.status = "deleted"
+    post.telegram_message_id = None
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return {"id": post.id, "status": post.status}
+
+
+@router.get("/trend-posts/settings")
+def trend_posts_settings_get(db: Session = Depends(get_db)):
+    """Настройки автопостера: channel, bot_username, шаблон и текст кнопки из БД или config."""
+    ps = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+    env_channel = (getattr(app_settings, "poster_channel_id", None) or "").strip()
+    db_channel = (ps.poster_channel_id or "").strip() if ps else ""
+    channel_id = db_channel or env_channel
+    env_bot = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
+    db_bot = (getattr(ps, "poster_bot_username", None) or "").strip() if ps else ""
+    poster_bot_username = db_bot or env_bot
+    template = ps.poster_default_template if ps else "{emoji} {name}\n\n{description}\n\nПопробовать тут:"
+    button_text = (ps.poster_button_text or "Попробовать").strip() or "Попробовать" if ps else "Попробовать"
+    return {
+        "poster_channel_id": channel_id,
+        "poster_channel_id_editable": db_channel or "",
+        "poster_bot_username": poster_bot_username,
+        "poster_default_template": template or "",
+        "poster_button_text": button_text,
+    }
+
+
+@router.put("/trend-posts/settings")
+def trend_posts_settings_put(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """Обновить канал, username бота, шаблон подписи и/или текст инлайн-кнопки."""
+    template = (payload.get("poster_default_template") or "").strip()
+    button_text = (payload.get("poster_button_text") or "").strip() or "Попробовать"
+    channel_id = (payload.get("poster_channel_id") or "").strip()
+    bot_username = (payload.get("poster_bot_username") or "").strip().lstrip("@")
+    if len(button_text) > 64:
+        raise HTTPException(400, "Текст инлайн-кнопки не более 64 символов (лимит Telegram)")
+    ps = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+    if not ps:
+        ps = PosterSettings(
+            id=1,
+            poster_channel_id=channel_id or None,
+            poster_bot_username=bot_username or None,
+            poster_default_template=template or "",
+            poster_button_text=button_text,
+        )
+        db.add(ps)
+    else:
+        if "poster_channel_id" in payload:
+            ps.poster_channel_id = channel_id or None
+        if "poster_bot_username" in payload:
+            ps.poster_bot_username = bot_username or None
+        if "poster_default_template" in payload:
+            ps.poster_default_template = template or ""
+        if "poster_button_text" in payload:
+            ps.poster_button_text = button_text
+        ps.updated_at = datetime.now(timezone.utc)
+        db.add(ps)
+    db.commit()
+    db.refresh(ps)
+    env_channel = (getattr(app_settings, "poster_channel_id", None) or "").strip()
+    db_channel = (ps.poster_channel_id or "").strip()
+    env_bot = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
+    db_bot = (getattr(ps, "poster_bot_username", None) or "").strip()
+    return {
+        "poster_channel_id": db_channel or env_channel,
+        "poster_channel_id_editable": db_channel,
+        "poster_bot_username": db_bot or env_bot,
+        "poster_default_template": ps.poster_default_template,
+        "poster_button_text": (ps.poster_button_text or "Попробовать").strip() or "Попробовать",
+    }
+
+
 # ---------- Audit ----------
 @router.get("/audit")
 def audit_list(
@@ -2050,6 +2573,7 @@ def jobs_list(
             "trend_name": t.name if t else None,
             "trend_emoji": t.emoji if t else None,
             "status": j.status,
+            "is_preview": getattr(j, "is_preview", False),
             "reserved_tokens": j.reserved_tokens,
             "error_code": j.error_code,
             "created_at": j.created_at.isoformat() if j.created_at else None,
@@ -2368,3 +2892,694 @@ def referrals_bonus_freeze(bonus_id: str, db: Session = Depends(get_db)):
         raise HTTPException(400, "Cannot freeze this bonus (already spent/revoked or not found)")
     db.commit()
     return {"ok": True}
+
+
+# ===========================================
+# Traffic sources & ad campaigns — deep links (?start=src_<slug>), budget, ROI
+# ===========================================
+
+@router.get("/bot-info")
+def bot_info():
+    """Bot username for generating deep links (t.me/username?start=src_...)."""
+    username = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
+    return {"username": username or None}
+
+
+@router.get("/traffic-sources")
+def traffic_sources_list(db: Session = Depends(get_db), active_only: bool = Query(False)):
+    """List traffic sources (channels/publics where we place links)."""
+    q = db.query(TrafficSource)
+    if active_only:
+        q = q.filter(TrafficSource.is_active.is_(True))
+    sources = q.order_by(TrafficSource.name).all()
+    return [
+        {
+            "id": s.id,
+            "slug": s.slug,
+            "name": s.name,
+            "url": s.url,
+            "platform": s.platform,
+            "is_active": s.is_active,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        }
+        for s in sources
+    ]
+
+
+class TrafficSourceCreate(BaseModel):
+    slug: str
+    name: str
+    url: str | None = None
+    platform: str = "other"
+
+
+class TrafficSourceUpdate(BaseModel):
+    name: str | None = None
+    url: str | None = None
+    is_active: bool | None = None
+
+
+@router.post("/traffic-sources")
+def traffic_sources_create(body: TrafficSourceCreate, db: Session = Depends(get_db)):
+    """Create a traffic source. Slug: [a-zA-Z0-9_-], max 50 chars for start param headroom."""
+    slug = (body.slug or "").strip()
+    if not slug or len(slug) > 50:
+        raise HTTPException(400, "slug required, max 50 characters")
+    if not all(c.isalnum() or c in "_-" for c in slug):
+        raise HTTPException(400, "slug must contain only letters, digits, underscore, hyphen")
+    existing = db.query(TrafficSource).filter(TrafficSource.slug == slug).first()
+    if existing:
+        raise HTTPException(400, "slug already exists")
+    source = TrafficSource(
+        slug=slug,
+        name=(body.name or "").strip() or slug,
+        url=(body.url or "").strip() or None,
+        platform=(body.platform or "other").strip().lower() or "other",
+    )
+    db.add(source)
+    db.commit()
+    db.refresh(source)
+    return {
+        "id": source.id,
+        "slug": source.slug,
+        "name": source.name,
+        "url": source.url,
+        "platform": source.platform,
+        "is_active": source.is_active,
+        "created_at": source.created_at.isoformat() if source.created_at else None,
+    }
+
+
+@router.patch("/traffic-sources/{source_id}")
+def traffic_sources_update(source_id: str, body: TrafficSourceUpdate, db: Session = Depends(get_db)):
+    """Update traffic source."""
+    source = db.query(TrafficSource).filter(TrafficSource.id == source_id).first()
+    if not source:
+        raise HTTPException(404, "Traffic source not found")
+    if body.name is not None:
+        source.name = body.name.strip() or source.name
+    if body.url is not None:
+        source.url = body.url.strip() or None
+    if body.is_active is not None:
+        source.is_active = body.is_active
+    db.commit()
+    db.refresh(source)
+    return {
+        "id": source.id,
+        "slug": source.slug,
+        "name": source.name,
+        "url": source.url,
+        "platform": source.platform,
+        "is_active": source.is_active,
+        "updated_at": source.updated_at.isoformat() if source.updated_at else None,
+    }
+
+
+@router.delete("/traffic-sources/{source_id}")
+def traffic_sources_delete(source_id: str, db: Session = Depends(get_db)):
+    """Soft-delete: set is_active=False."""
+    source = db.query(TrafficSource).filter(TrafficSource.id == source_id).first()
+    if not source:
+        raise HTTPException(404, "Traffic source not found")
+    source.is_active = False
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/traffic-sources/stats")
+def traffic_sources_stats(
+    db: Session = Depends(get_db),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+):
+    """Aggregate stats per traffic source for the period. Clicks from audit traffic_start, users/buyers/revenue from User+Payment."""
+    df = None
+    dt = None
+    if date_from:
+        try:
+            df = datetime.fromisoformat(date_from.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            dt = datetime.fromisoformat(date_to.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+
+    # Clicks: count of traffic_start audit events (by payload->traffic_source)
+    audit_base = db.query(AuditLog).filter(AuditLog.action == "traffic_start")
+    if df is not None:
+        audit_base = audit_base.filter(AuditLog.created_at >= datetime.combine(df, datetime.min.time()).replace(tzinfo=timezone.utc))
+    if dt is not None:
+        audit_base = audit_base.filter(AuditLog.created_at <= datetime.combine(dt, datetime.max.time()).replace(tzinfo=timezone.utc))
+
+    clicks_subq = (
+        db.query(
+            AuditLog.payload["traffic_source"].astext.label("source"),
+            func.count(AuditLog.id).label("clicks"),
+        )
+        .filter(AuditLog.action == "traffic_start")
+    )
+    if df is not None:
+        clicks_subq = clicks_subq.filter(AuditLog.created_at >= datetime.combine(df, datetime.min.time()).replace(tzinfo=timezone.utc))
+    if dt is not None:
+        clicks_subq = clicks_subq.filter(AuditLog.created_at <= datetime.combine(dt, datetime.max.time()).replace(tzinfo=timezone.utc))
+    clicks_subq = clicks_subq.group_by(AuditLog.payload["traffic_source"].astext)
+    clicks_map = {row.source: row.clicks for row in clicks_subq.all()}
+
+    # Users with traffic_source set (first-touch), new users in period, buyers, revenue
+    sources = db.query(TrafficSource).filter(TrafficSource.is_active.is_(True)).all()
+    result = []
+    for s in sources:
+        q_u = db.query(User).filter(User.traffic_source == s.slug)
+        if df is not None:
+            q_u = q_u.filter(User.created_at >= datetime.combine(df, datetime.min.time()).replace(tzinfo=timezone.utc))
+        if dt is not None:
+            q_u = q_u.filter(User.created_at <= datetime.combine(dt, datetime.max.time()).replace(tzinfo=timezone.utc))
+        user_ids = [u.id for u in q_u.all()]
+        new_users = len(user_ids)
+
+        buyers = 0
+        revenue_stars = 0
+        if user_ids:
+            buyers = db.query(func.count(func.distinct(Payment.user_id))).filter(
+                Payment.user_id.in_(user_ids),
+                Payment.status == "completed",
+            ).scalar() or 0
+            rev = db.query(func.coalesce(func.sum(Payment.stars_amount), 0)).filter(
+                Payment.user_id.in_(user_ids),
+                Payment.status == "completed",
+            ).scalar() or 0
+            revenue_stars = int(rev)
+
+        clicks = clicks_map.get(s.slug, 0)
+        revenue_rub = round(revenue_stars * STAR_RUB_RATE, 0)
+        cr_pct = round(100.0 * buyers / new_users, 1) if new_users else 0
+        result.append({
+            "source_id": s.id,
+            "slug": s.slug,
+            "name": s.name,
+            "platform": s.platform,
+            "clicks": clicks,
+            "new_users": new_users,
+            "buyers": buyers,
+            "revenue_stars": revenue_stars,
+            "revenue_rub": revenue_rub,
+            "conversion_rate_pct": cr_pct,
+        })
+    return {"sources": result, "date_from": date_from, "date_to": date_to}
+
+
+@router.get("/traffic-sources/overview")
+def traffic_sources_overview(
+    db: Session = Depends(get_db),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+):
+    """Overview totals for the period: total clicks, new users from traffic, conversion, revenue, and daily series for chart."""
+    df = None
+    dt = None
+    if date_from:
+        try:
+            df = datetime.fromisoformat(date_from.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            dt = datetime.fromisoformat(date_to.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+
+    base_user = db.query(User).filter(User.traffic_source.isnot(None))
+    if df is not None:
+        base_user = base_user.filter(User.created_at >= datetime.combine(df, datetime.min.time()).replace(tzinfo=timezone.utc))
+    if dt is not None:
+        base_user = base_user.filter(User.created_at <= datetime.combine(dt, datetime.max.time()).replace(tzinfo=timezone.utc))
+    user_ids = [u.id for u in base_user.all()]
+    new_users = len(user_ids)
+
+    total_clicks = db.query(func.count(AuditLog.id)).filter(AuditLog.action == "traffic_start")
+    if df is not None:
+        total_clicks = total_clicks.filter(AuditLog.created_at >= datetime.combine(df, datetime.min.time()).replace(tzinfo=timezone.utc))
+    if dt is not None:
+        total_clicks = total_clicks.filter(AuditLog.created_at <= datetime.combine(dt, datetime.max.time()).replace(tzinfo=timezone.utc))
+    total_clicks = total_clicks.scalar() or 0
+
+    buyers = 0
+    revenue_stars = 0
+    if user_ids:
+        buyers = db.query(func.count(func.distinct(Payment.user_id))).filter(
+            Payment.user_id.in_(user_ids), Payment.status == "completed"
+        ).scalar() or 0
+        rev = db.query(func.coalesce(func.sum(Payment.stars_amount), 0)).filter(
+            Payment.user_id.in_(user_ids), Payment.status == "completed"
+        ).scalar() or 0
+        revenue_stars = int(rev)
+    revenue_rub = round(revenue_stars * STAR_RUB_RATE, 0)
+    cr_pct = round(100.0 * buyers / new_users, 1) if new_users else 0
+
+    # Daily series: clicks and purchases by day
+    daily_q = db.query(
+        func.date_trunc("day", AuditLog.created_at).label("day"),
+        func.count(AuditLog.id).label("clicks"),
+    ).filter(AuditLog.action == "traffic_start")
+    if df is not None:
+        daily_q = daily_q.filter(AuditLog.created_at >= datetime.combine(df, datetime.min.time()).replace(tzinfo=timezone.utc))
+    if dt is not None:
+        daily_q = daily_q.filter(AuditLog.created_at <= datetime.combine(dt, datetime.max.time()).replace(tzinfo=timezone.utc))
+    daily_q = daily_q.group_by(func.date_trunc("day", AuditLog.created_at)).order_by(func.date_trunc("day", AuditLog.created_at))
+    daily_clicks = [{"date": (r.day.date().isoformat() if hasattr(r.day, "date") else str(r.day)), "clicks": r.clicks} for r in daily_q.all()]
+
+    if user_ids:
+        daily_payments_q = db.query(
+            func.date(Payment.created_at).label("day"),
+            func.count(Payment.id).label("payments"),
+            func.coalesce(func.sum(Payment.stars_amount), 0).label("stars"),
+        ).filter(Payment.status == "completed", Payment.user_id.in_(user_ids))
+        if df is not None:
+            daily_payments_q = daily_payments_q.filter(Payment.created_at >= datetime.combine(df, datetime.min.time()).replace(tzinfo=timezone.utc))
+        if dt is not None:
+            daily_payments_q = daily_payments_q.filter(Payment.created_at <= datetime.combine(dt, datetime.max.time()).replace(tzinfo=timezone.utc))
+        daily_payments_q = daily_payments_q.group_by(func.date(Payment.created_at)).order_by(func.date(Payment.created_at))
+        daily_purchases = [{"date": (r.day.isoformat() if hasattr(r.day, "isoformat") else str(r.day)), "payments": r.payments, "stars": int(r.stars)} for r in daily_payments_q.all()]
+    else:
+        daily_purchases = []
+
+    return {
+        "total_clicks": total_clicks,
+        "new_users": new_users,
+        "buyers": buyers,
+        "revenue_stars": revenue_stars,
+        "revenue_rub": revenue_rub,
+        "conversion_rate_pct": cr_pct,
+        "daily_clicks": daily_clicks,
+        "daily_purchases": daily_purchases,
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+
+
+@router.get("/traffic-sources/{slug}/funnel")
+def traffic_source_funnel(
+    slug: str,
+    db: Session = Depends(get_db),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+):
+    """Funnel for one source: starts -> subscribed -> first_generation -> first_purchase -> repeat_purchase."""
+    df = None
+    dt = None
+    if date_from:
+        try:
+            df = datetime.fromisoformat(date_from.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            dt = datetime.fromisoformat(date_to.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+
+    base = db.query(User).filter(User.traffic_source == slug)
+    if df is not None:
+        base = base.filter(User.created_at >= datetime.combine(df, datetime.min.time()).replace(tzinfo=timezone.utc))
+    if dt is not None:
+        base = base.filter(User.created_at <= datetime.combine(dt, datetime.max.time()).replace(tzinfo=timezone.utc))
+    users = base.all()
+    user_ids = [u.id for u in users]
+    starts = len(user_ids)
+
+    subscribed = sum(1 for u in users if (u.flags or {}).get("subscribed_examples_channel"))
+    with_take_or_job = set()
+    if user_ids:
+        take_users = db.query(Take.user_id).filter(Take.user_id.in_(user_ids)).distinct().all()
+        job_users = db.query(Job.user_id).filter(Job.user_id.in_(user_ids)).distinct().all()
+        with_take_or_job = {r[0] for r in take_users + job_users}
+    first_generation = len(with_take_or_job)
+
+    buyers = set()
+    repeat_buyers = set()
+    if user_ids:
+        pay_per_user = db.query(Payment.user_id, func.count(Payment.id).label("cnt")).filter(
+            Payment.user_id.in_(user_ids), Payment.status == "completed"
+        ).group_by(Payment.user_id).all()
+        for uid, cnt in pay_per_user:
+            buyers.add(uid)
+            if cnt >= 2:
+                repeat_buyers.add(uid)
+    first_purchase = len(buyers)
+    repeat_purchase = len(repeat_buyers)
+
+    return {
+        "slug": slug,
+        "steps": [
+            {"name": "start", "label": "/start", "count": starts, "pct": 100.0},
+            {"name": "subscribed", "label": "Подписка на канал", "count": subscribed, "pct": round(100.0 * subscribed / starts, 1) if starts else 0},
+            {"name": "first_generation", "label": "Первая генерация", "count": first_generation, "pct": round(100.0 * first_generation / starts, 1) if starts else 0},
+            {"name": "first_purchase", "label": "Первая покупка", "count": first_purchase, "pct": round(100.0 * first_purchase / starts, 1) if starts else 0},
+            {"name": "repeat_purchase", "label": "Повторная покупка", "count": repeat_purchase, "pct": round(100.0 * repeat_purchase / starts, 1) if starts else 0},
+        ],
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+
+
+@router.get("/traffic-sources/{slug}/users")
+def traffic_source_users(
+    slug: str,
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Last users attributed to this source (for detail view)."""
+    q = db.query(User).filter(User.traffic_source == slug).order_by(User.created_at.desc()).offset(offset).limit(limit)
+    users = q.all()
+    user_ids = [u.id for u in users]
+    bought = set()
+    if user_ids:
+        bought = {r[0] for r in db.query(Payment.user_id).filter(Payment.user_id.in_(user_ids), Payment.status == "completed").distinct().all()}
+    items = []
+    for u in users:
+        items.append({
+            "id": u.id,
+            "telegram_id": u.telegram_id,
+            "username": u.telegram_username,
+            "first_name": u.telegram_first_name,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "has_purchased": u.id in bought,
+        })
+    return {"items": items, "total": db.query(User).filter(User.traffic_source == slug).count()}
+
+
+# ---------- Ad campaigns (budget, ROI) ----------
+
+class AdCampaignCreate(BaseModel):
+    source_id: str
+    name: str
+    budget_rub: float = 0
+    date_from: str
+    date_to: str
+    notes: str | None = None
+
+
+class AdCampaignUpdate(BaseModel):
+    name: str | None = None
+    budget_rub: float | None = None
+    date_from: str | None = None
+    date_to: str | None = None
+    is_active: bool | None = None
+    notes: str | None = None
+
+
+@router.get("/ad-campaigns")
+def ad_campaigns_list(db: Session = Depends(get_db)):
+    """List ad campaigns with source name."""
+    campaigns = db.query(AdCampaign).order_by(AdCampaign.date_from.desc()).all()
+    source_ids = list({c.source_id for c in campaigns})
+    sources_map = {}
+    if source_ids:
+        for s in db.query(TrafficSource).filter(TrafficSource.id.in_(source_ids)).all():
+            sources_map[s.id] = {"id": s.id, "slug": s.slug, "name": s.name}
+    out = []
+    for c in campaigns:
+        out.append({
+            "id": c.id,
+            "source_id": c.source_id,
+            "source": sources_map.get(c.source_id, {}),
+            "name": c.name,
+            "slug": c.slug,
+            "budget_rub": float(c.budget_rub),
+            "date_from": c.date_from.isoformat() if c.date_from else None,
+            "date_to": c.date_to.isoformat() if c.date_to else None,
+            "is_active": c.is_active,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "notes": c.notes,
+        })
+    return out
+
+
+@router.post("/ad-campaigns")
+def ad_campaigns_create(body: AdCampaignCreate, db: Session = Depends(get_db)):
+    """Create ad campaign."""
+    source = db.query(TrafficSource).filter(TrafficSource.id == body.source_id).first()
+    if not source:
+        raise HTTPException(404, "Traffic source not found")
+    try:
+        d_from = datetime.fromisoformat(body.date_from.replace("Z", "")).date()
+        d_to = datetime.fromisoformat(body.date_to.replace("Z", "")).date()
+    except (ValueError, AttributeError):
+        raise HTTPException(400, "date_from and date_to must be ISO date (YYYY-MM-DD)")
+    if d_from > d_to:
+        raise HTTPException(400, "date_from must be <= date_to")
+    campaign = AdCampaign(
+        source_id=body.source_id,
+        name=body.name.strip() or "Campaign",
+        budget_rub=body.budget_rub,
+        date_from=d_from,
+        date_to=d_to,
+        notes=(body.notes or "").strip() or None,
+    )
+    db.add(campaign)
+    db.commit()
+    db.refresh(campaign)
+    return {
+        "id": campaign.id,
+        "source_id": campaign.source_id,
+        "name": campaign.name,
+        "budget_rub": float(campaign.budget_rub),
+        "date_from": campaign.date_from.isoformat(),
+        "date_to": campaign.date_to.isoformat(),
+        "is_active": campaign.is_active,
+        "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
+        "notes": campaign.notes,
+    }
+
+
+@router.patch("/ad-campaigns/{campaign_id}")
+def ad_campaigns_update(campaign_id: str, body: AdCampaignUpdate, db: Session = Depends(get_db)):
+    """Update ad campaign."""
+    campaign = db.query(AdCampaign).filter(AdCampaign.id == campaign_id).first()
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    if body.name is not None:
+        campaign.name = body.name.strip() or campaign.name
+    if body.budget_rub is not None:
+        campaign.budget_rub = body.budget_rub
+    if body.date_from is not None:
+        try:
+            campaign.date_from = datetime.fromisoformat(body.date_from.replace("Z", "")).date()
+        except (ValueError, AttributeError):
+            raise HTTPException(400, "Invalid date_from")
+    if body.date_to is not None:
+        try:
+            campaign.date_to = datetime.fromisoformat(body.date_to.replace("Z", "")).date()
+        except (ValueError, AttributeError):
+            raise HTTPException(400, "Invalid date_to")
+    if body.is_active is not None:
+        campaign.is_active = body.is_active
+    if body.notes is not None:
+        campaign.notes = body.notes.strip() if body.notes else None
+    db.commit()
+    db.refresh(campaign)
+    return {
+        "id": campaign.id,
+        "source_id": campaign.source_id,
+        "name": campaign.name,
+        "budget_rub": float(campaign.budget_rub),
+        "date_from": campaign.date_from.isoformat(),
+        "date_to": campaign.date_to.isoformat(),
+        "is_active": campaign.is_active,
+        "notes": campaign.notes,
+        "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
+    }
+
+
+@router.get("/ad-campaigns/{campaign_id}/roi")
+def ad_campaign_roi(campaign_id: str, db: Session = Depends(get_db)):
+    """CPA, CPP, ROAS for this campaign. Uses campaign period and source slug."""
+    campaign = db.query(AdCampaign).filter(AdCampaign.id == campaign_id).first()
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    source = db.query(TrafficSource).filter(TrafficSource.id == campaign.source_id).first()
+    if not source:
+        raise HTTPException(404, "Source not found")
+    slug = source.slug
+    d_from = campaign.date_from
+    d_to = campaign.date_to
+    ts_from = datetime.combine(d_from, datetime.min.time()).replace(tzinfo=timezone.utc)
+    ts_to = datetime.combine(d_to, datetime.max.time()).replace(tzinfo=timezone.utc)
+
+    base = db.query(User).filter(User.traffic_source == slug, User.created_at >= ts_from, User.created_at <= ts_to)
+    user_ids = [u.id for u in base.all()]
+    new_users = len(user_ids)
+    budget = float(campaign.budget_rub)
+    cpa = round(budget / new_users, 2) if new_users else None
+    buyers = 0
+    revenue_stars = 0
+    if user_ids:
+        buyers = db.query(func.count(func.distinct(Payment.user_id))).filter(
+            Payment.user_id.in_(user_ids), Payment.status == "completed"
+        ).scalar() or 0
+        rev = db.query(func.coalesce(func.sum(Payment.stars_amount), 0)).filter(
+            Payment.user_id.in_(user_ids), Payment.status == "completed"
+        ).scalar() or 0
+        revenue_stars = int(rev)
+    revenue_rub = round(revenue_stars * STAR_RUB_RATE, 0)
+    cpp = round(budget / buyers, 2) if buyers else None
+    roas = round(revenue_rub / budget, 2) if budget and budget > 0 else None
+    return {
+        "campaign_id": campaign_id,
+        "source_slug": slug,
+        "name": campaign.name,
+        "budget_rub": budget,
+        "date_from": d_from.isoformat(),
+        "date_to": d_to.isoformat(),
+        "new_users": new_users,
+        "buyers": buyers,
+        "revenue_stars": revenue_stars,
+        "revenue_rub": revenue_rub,
+        "cpa_rub": cpa,
+        "cpp_rub": cpp,
+        "roas": roas,
+    }
+
+
+# ===========================================
+# Photo Merge — admin endpoints
+# ===========================================
+
+@router.get("/photo-merge/jobs")
+def photo_merge_jobs_list(
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    status: str | None = Query(None),
+    user_id: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+):
+    """Список заданий склейки с фильтрами."""
+    q = db.query(PhotoMergeJob)
+    if status:
+        q = q.filter(PhotoMergeJob.status == status)
+    if user_id:
+        q = q.filter(PhotoMergeJob.user_id == user_id)
+    if date_from:
+        try:
+            q = q.filter(PhotoMergeJob.created_at >= datetime.fromisoformat(date_from))
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            q = q.filter(PhotoMergeJob.created_at <= datetime.fromisoformat(date_to))
+        except ValueError:
+            pass
+    total = q.count()
+    rows = q.order_by(PhotoMergeJob.created_at.desc()).offset(offset).limit(limit).all()
+
+    # Обогащаем никами пользователей
+    user_ids = list({r.user_id for r in rows})
+    users_map: dict[str, Any] = {}
+    if user_ids:
+        for u in db.query(User).filter(User.telegram_id.in_(user_ids)).all():
+            users_map[u.telegram_id] = (u.telegram_username or u.telegram_first_name or u.telegram_id)
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": r.id,
+            "user_id": r.user_id,
+            "user_display_name": users_map.get(r.user_id, r.user_id),
+            "status": r.status,
+            "input_count": r.input_count,
+            "output_format": r.output_format,
+            "input_bytes": r.input_bytes,
+            "output_bytes": r.output_bytes,
+            "duration_ms": r.duration_ms,
+            "error_code": r.error_code,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        })
+    return {"total": total, "items": items}
+
+
+@router.get("/photo-merge/stats")
+def photo_merge_stats(
+    db: Session = Depends(get_db),
+    window_days: int = Query(30, ge=1, le=365),
+):
+    """Аналитика сервиса склейки за указанный период."""
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    q = db.query(PhotoMergeJob).filter(PhotoMergeJob.created_at >= since)
+
+    total = q.count()
+    succeeded = q.filter(PhotoMergeJob.status == "succeeded").count()
+    failed = q.filter(PhotoMergeJob.status == "failed").count()
+    processing = q.filter(PhotoMergeJob.status == "processing").count()
+
+    # Среднее время обработки (только успешные)
+    durations = [r.duration_ms for r in q.filter(PhotoMergeJob.status == "succeeded").all() if r.duration_ms]
+    durations_sorted = sorted(durations)
+    p50 = durations_sorted[len(durations_sorted) // 2] if durations_sorted else None
+    p95 = durations_sorted[int(len(durations_sorted) * 0.95)] if durations_sorted else None
+    avg_duration_ms = int(sum(durations) / len(durations)) if durations else None
+
+    # Топ пользователей
+    user_counts = {}
+    for row in db.query(PhotoMergeJob).filter(PhotoMergeJob.created_at >= since).all():
+        user_counts[row.user_id] = user_counts.get(row.user_id, 0) + 1
+    top_users_raw = sorted(user_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    user_ids = [uid for uid, _ in top_users_raw]
+    users_map = {}
+    if user_ids:
+        for u in db.query(User).filter(User.telegram_id.in_(user_ids)).all():
+            users_map[u.telegram_id] = (u.telegram_username or u.telegram_first_name or u.telegram_id)
+    top_users = [{"user_id": uid, "display_name": users_map.get(uid, uid), "count": cnt} for uid, cnt in top_users_raw]
+
+    # Распределение по дням
+    by_day: dict[str, dict] = {}
+    for row in db.query(PhotoMergeJob).filter(PhotoMergeJob.created_at >= since).all():
+        day = row.created_at.strftime("%Y-%m-%d")
+        if day not in by_day:
+            by_day[day] = {"date": day, "total": 0, "succeeded": 0, "failed": 0}
+        by_day[day]["total"] += 1
+        if row.status == "succeeded":
+            by_day[day]["succeeded"] += 1
+        elif row.status == "failed":
+            by_day[day]["failed"] += 1
+    by_day_list = sorted(by_day.values(), key=lambda x: x["date"])
+
+    # Объемы
+    vol_input = sum(r.input_bytes or 0 for r in q.filter(PhotoMergeJob.status == "succeeded").all())
+    vol_output = sum(r.output_bytes or 0 for r in q.filter(PhotoMergeJob.status == "succeeded").all())
+
+    return {
+        "window_days": window_days,
+        "total": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "processing": processing,
+        "success_rate": round(succeeded / total * 100, 1) if total > 0 else 0,
+        "avg_duration_ms": avg_duration_ms,
+        "p50_duration_ms": p50,
+        "p95_duration_ms": p95,
+        "total_input_bytes": vol_input,
+        "total_output_bytes": vol_output,
+        "top_users": top_users,
+        "by_day": by_day_list,
+    }
+
+
+@router.get("/photo-merge/settings")
+def photo_merge_settings_get(db: Session = Depends(get_db)):
+    """Текущие настройки сервиса склейки."""
+    svc = PhotoMergeSettingsService(db)
+    return svc.as_dict()
+
+
+@router.put("/photo-merge/settings")
+def photo_merge_settings_put(payload: dict, db: Session = Depends(get_db)):
+    """Обновить настройки сервиса склейки."""
+    svc = PhotoMergeSettingsService(db)
+    return svc.update(payload)

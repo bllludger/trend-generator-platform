@@ -23,6 +23,7 @@ from app.models.session import Session as SessionModel
 from app.models.take import Take
 from app.models.user import User
 from app.services.audit.service import AuditService
+from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.sessions.service import SessionService
 from app.services.hd_balance.service import HDBalanceService
 
@@ -570,6 +571,15 @@ class PaymentService:
                         "collection_run_id": session.collection_run_id,
                     },
                 )
+                try:
+                    ProductAnalyticsService(self.db).track(
+                        "collection_started",
+                        user.id,
+                        session_id=session.id,
+                        pack_id=pack_id,
+                    )
+                except Exception as e:
+                    logger.warning("product_analytics track(collection_started) failed: %s", e)
             else:
                 session = session_svc.create_session(user.id, pack_id)
             hd_svc.credit_paid(user, pack.hd_amount or 0)

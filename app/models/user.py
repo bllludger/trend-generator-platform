@@ -42,6 +42,10 @@ class User(Base):
     admin_notes = Column(Text, nullable=True)
     flags = Column(JSONB, nullable=False, default=dict)  # VIP, tester, etc
 
+    # Traffic source (first-touch from ad deep link ?start=src_<slug>)
+    traffic_source = Column(String, nullable=True, index=True)
+    traffic_campaign = Column(String, nullable=True)
+
     # Referral program
     referral_code = Column(String, unique=True, nullable=True)
     referred_by_user_id = Column(String, nullable=True)

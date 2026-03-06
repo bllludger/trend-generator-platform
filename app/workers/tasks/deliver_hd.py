@@ -15,6 +15,7 @@ from app.models.pack import Pack
 from app.models.session import Session
 from app.models.user import User
 from app.services.audit.service import AuditService
+from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.balance_tariffs import _pack_outcome_label
 from app.services.compensations.service import CompensationService
 from app.services.favorites.service import FavoriteService
@@ -69,44 +70,43 @@ def _try_upsell_after_hd(db, fav, chat_id: str, telegram: TelegramClient) -> Non
                 )
             return
 
-        upsell_ids = (pack.upsell_pack_ids if pack else None) or []
-        buttons = []
-        if upsell_ids:
-            upsell_packs = (
-                db.query(Pack)
-                .filter(Pack.id.in_(upsell_ids), Pack.enabled.is_(True))
-                .order_by(Pack.order_index)
-                .all()
-            )
-            for up in upsell_packs:
-                if getattr(up, "pack_subtype", "standalone") == "collection" and not getattr(up, "playlist", None):
-                    continue
-                outcome = _pack_outcome_label(up)
-                label = f"{up.emoji} {up.collection_label or up.name}: {outcome} — {up.stars_price}⭐"
-                buttons.append([{"text": label, "callback_data": f"paywall:{up.id}"}])
+        paid_pack_ids = ("neo_start", "neo_pro", "neo_unlimited")
+        is_paid = pack and getattr(pack, "id", None) in paid_pack_ids
 
-        if not buttons:
-            creator = (
-                db.query(Pack)
-                .filter(Pack.enabled.is_(True), Pack.stars_price >= 500)
-                .order_by(Pack.stars_price.desc())
-                .first()
+        if is_paid:
+            # Платный тариф: счётчик + только «Купить ещё 4K» и «Меню с тарифами»
+            session_svc = SessionService(db)
+            remaining_takes = session.takes_limit - session.takes_used
+            hd_rem = session_svc.hd_remaining(session)
+            text = (
+                f"Осталось снимков: {remaining_takes} из {session.takes_limit}\n"
+                f"4K без watermark: {hd_rem}\n\n"
+                "Купить ещё 4K — выберите пакет в меню тарифов."
             )
-            if creator:
-                outcome = _pack_outcome_label(creator)
-                buttons.append([{"text": f"{creator.emoji} {creator.name}: {outcome} — {creator.stars_price}⭐", "callback_data": f"paywall:{creator.id}"}])
-
-        # Кнопки навигации: К трендам (в меню) и Мой профиль (баланс)
-        buttons.append([
-            {"text": "📋 В меню", "callback_data": "nav:menu"},
-            {"text": "👤 Мой профиль", "callback_data": "nav:profile"},
-        ])
+            buttons = [
+                [{"text": "🛒 Купить ещё 4K", "callback_data": "shop:open"}],
+                [{"text": "📋 В меню", "callback_data": "nav:menu"}],
+            ]
+        else:
+            # Бесплатный (free_preview или иное): закончились именно 4K без watermark, не «образы»
+            text = (
+                "Закончились 4K без watermark.\n\n"
+                "Хотите попробовать ещё образы?\n\n"
+                "⭐ Neo Pro — 40 фото · 699 ₽\n"
+                "самый популярный пакет\n\n"
+                "🚀 Start — 10 фото · 199 ₽\n"
+                "для быстрого старта\n\n"
+                "👑 Unlimited — 120 фото · 1990 ₽\n"
+                "максимум образов"
+            )
+            buttons = [
+                [{"text": "⭐ Ещё 40 фото · 699 ₽", "callback_data": "paywall:neo_pro"}],
+                [{"text": "🚀 Ещё 10 фото · 199 ₽", "callback_data": "paywall:neo_start"}],
+                [{"text": "👑 120 фото · 1990 ₽", "callback_data": "paywall:neo_unlimited"}],
+                [{"text": "📋 В меню", "callback_data": "nav:menu"}],
+            ]
         keyboard = {"inline_keyboard": buttons}
-        telegram.send_message(
-            chat_id,
-            "🎉 Все 4K доставлены! Хотите попробовать ещё?",
-            reply_markup=keyboard,
-        )
+        telegram.send_message(chat_id, text, reply_markup=keyboard)
     except Exception:
         logger.warning("upsell_after_hd_failed", extra={"favorite_id": fav.id})
 
@@ -233,6 +233,16 @@ def deliver_hd(
             entity_id=favorite_id,
             payload={"session_id": fav.session_id, "take_id": fav.take_id, "variant": fav.variant},
         )
+        try:
+            ProductAnalyticsService(db).track(
+                "hd_delivered",
+                fav.user_id,
+                session_id=fav.session_id,
+                take_id=fav.take_id,
+                properties={"variant": fav.variant},
+            )
+        except Exception as e:
+            logger.warning("product_analytics track(hd_delivered) failed: %s", e)
 
         db.commit()
 

@@ -9,20 +9,28 @@ from app.models.pack import Pack
 from app.services.payments.service import PaymentService, PRODUCT_LADDER_IDS
 from app.services.sessions.service import SessionService
 from app.services.users.service import UserService
-from app.utils.currency import format_stars_rub
 
 DISPLAY_ORDER = ("neo_start", "neo_pro", "neo_unlimited", "trial")
 
+# Для кнопок: имя без эмодзи (эмодзи берём из pack.emoji)
 SHORT_NAMES = {
     "trial": "Trial",
     "neo_start": "Neo Start",
-    "neo_pro": "Neo Pro ⭐ Хит",
+    "neo_pro": "Neo Pro (Хит)",
     "neo_unlimited": "Neo Unlimited",
+}
+
+# Цены в рублях для отображения на кнопках оплаты (инлайн)
+DISPLAY_RUB = {
+    "trial": 59,
+    "neo_start": 199,
+    "neo_pro": 699,
+    "neo_unlimited": 1990,
 }
 
 
 def _pack_outcome_label(pack: Pack) -> str:
-    """Короткие outcome-подписи."""
+    """Короткие outcome-подписи для кнопок."""
     if pack.id == "trial":
         return "1 снимок для пробы"
     if pack.id == "neo_start":
@@ -32,6 +40,19 @@ def _pack_outcome_label(pack: Pack) -> str:
     if pack.id == "neo_unlimited":
         return "120 образов"
     return pack.description or ""
+
+
+def _pack_text_line(pack: Pack) -> str:
+    """Строка описания тарифа в тексте сообщения (без цены)."""
+    if pack.id == "trial":
+        return "1 фото — попробовать один удачный кадр."
+    if pack.id == "neo_start":
+        return "Neo Start — 10 фото (для первых фотосессий)"
+    if pack.id == "neo_pro":
+        return "Neo Pro — 40 фото ⭐ самый популярный\nАватарки, дейтинг, соцсети"
+    if pack.id == "neo_unlimited":
+        return "Neo Unlimited — 120 фото\nДля частого использования"
+    return f"{pack.name} — {pack.description or ''}"
 
 
 def get_balance_line(db, telegram_id: str) -> str:
@@ -52,15 +73,18 @@ def get_balance_line(db, telegram_id: str) -> str:
     return f"Осталось снимков: {remaining} из {session.takes_limit}\n4K без watermark: {hd_rem}"
 
 
-def _subheader(has_session: bool, remaining: int | None = None, pack_id: str | None = None) -> str:
-    """Подзаголовок перед списком пакетов. «Хочешь больше образов?» — только когда закончился платный пакет, не Trial."""
-    if not has_session:
-        return "Выбери фотосессию:"
-    if remaining == 0 and pack_id == "trial":
-        return "Триал завершён. Выбери пакет для продолжения:"
-    if has_session:
-        return "Хочешь больше образов? Выбери фотосессию:"
-    return "Выбери фотосессию:"
+def _shop_body_text(packs: list) -> str:
+    """Текст блока выбора фотосессии: заголовок, пояснения, список тарифов без цен."""
+    lines = [
+        "Выбери фотосессию 👇",
+        "",
+        "Превью из 3 фото бесплатно.",
+        "4K без watermark — после оплаты.",
+        "",
+    ]
+    for pack in packs:
+        lines.append(_pack_text_line(pack))
+    return "\n".join(lines)
 
 
 def build_balance_tariffs_message(db, telegram_id: str, star_to_rub: float = 1.3) -> tuple[str, dict | None]:
@@ -75,8 +99,6 @@ def build_balance_tariffs_message(db, telegram_id: str, star_to_rub: float = 1.3
     user = user_svc.get_by_telegram_id(telegram_id)
     session = session_svc.get_active_session(user.id) if user else None
     has_session = bool(session)
-    remaining = (session.takes_limit - session.takes_used) if session else None
-    pack_id = session.pack_id if session else None
     show_trial = user and not getattr(user, "trial_purchased", True)
 
     packs = payment_service.list_product_ladder_packs()
@@ -94,26 +116,31 @@ def build_balance_tariffs_message(db, telegram_id: str, star_to_rub: float = 1.3
             ordered.append(by_id[pid])
 
     if not ordered:
-        balance_line = get_balance_line(db, telegram_id)
-        sub = _subheader(has_session, remaining, pack_id)
-        return f"{balance_line}\n\n{sub}\n\n(Тарифы временно недоступны.)", None
+        body = _shop_body_text([]) + "\n\n(Тарифы временно недоступны.)"
+        return body, None
 
-    balance_line = get_balance_line(db, telegram_id)
-    sub = _subheader(has_session, remaining, pack_id)
-    text = f"{balance_line}\n\n{sub}\n\n"
+    body = _shop_body_text(ordered)
+    if has_session:
+        balance_line = get_balance_line(db, telegram_id)
+        text = f"{balance_line}\n\n{body}"
+    else:
+        text = body
     buttons = []
 
     for pack in ordered:
-        short = SHORT_NAMES.get(pack.id, pack.name)
-        outcome = _pack_outcome_label(pack)
-        price_str = format_stars_rub(pack.stars_price, star_to_rub)
-        # Количество и цена наглядно (жирным в HTML)
-        text += f"{pack.emoji} {short}: <b>{outcome}</b> — <b>{price_str}</b>\n"
-        badge = " • Хит" if pack.id == "neo_pro" else ""
-        label = f"{pack.emoji} {short}{badge} · {outcome} · {price_str}"
+        rub = DISPLAY_RUB.get(pack.id) or round(pack.stars_price * star_to_rub)
+        if pack.id == "trial":
+            label = f"{pack.emoji} Попробовать 1 фото · {rub} ₽"
+        elif pack.id == "neo_start":
+            label = f"{pack.emoji} Neo Start · 10 фото · {rub} ₽"
+        elif pack.id == "neo_pro":
+            label = f"{pack.emoji} Neo Pro · 40 фото · {rub} ₽ ⭐"
+        elif pack.id == "neo_unlimited":
+            label = f"{pack.emoji} Neo Unlimited · 120 фото · {rub} ₽"
+        else:
+            label = f"{pack.emoji} {pack.name} · {rub} ₽"
         buttons.append([{"text": label, "callback_data": f"paywall:{pack.id}"}])
-
-    text += "\n👇 Выбирай подходящий пакет"
-    buttons.append([{"text": "💳 Не знаю как купить Stars", "callback_data": "bank_transfer:start"}])
+    buttons.append([{"text": "📘 Как купить Stars", "callback_data": "shop:how_buy_stars"}])
+    buttons.append([{"text": "💳 Не получается купить Stars", "callback_data": "shop:how_buy_stars"}])
     buttons.append([{"text": "📋 В меню", "callback_data": "nav:menu"}])
     return text, {"inline_keyboard": buttons}

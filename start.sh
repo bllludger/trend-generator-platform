@@ -380,6 +380,33 @@ fi
 if [ -f migrations/048_theme_trend_target_audiences.sql ]; then
     $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/048_theme_trend_target_audiences.sql 2>/dev/null || true
 fi
+if [ -f migrations/049_neo_plans.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/049_neo_plans.sql 2>/dev/null || true
+fi
+if [ -f migrations/050_photo_merge.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/050_photo_merge.sql 2>/dev/null || true
+fi
+if [ -f migrations/051_copy_style_nano_banana_prompt.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/051_copy_style_nano_banana_prompt.sql 2>/dev/null || true
+fi
+if [ -f migrations/052_trend_posts.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/052_trend_posts.sql 2>/dev/null || true
+fi
+if [ -f migrations/053_poster_button_text.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/053_poster_button_text.sql 2>/dev/null || true
+fi
+if [ -f migrations/054_poster_channel_in_settings.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/054_poster_channel_in_settings.sql 2>/dev/null || true
+fi
+if [ -f migrations/055_poster_bot_username.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/055_poster_bot_username.sql 2>/dev/null || true
+fi
+if [ -f migrations/056_traffic_sources.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/056_traffic_sources.sql 2>/dev/null || true
+fi
+if [ -f migrations/057_product_events.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/057_product_events.sql 2>/dev/null || true
+fi
 # Роль postgres: создать или обновить пароль (внешние клиенты/IDE часто подключаются как postgres → убираем FATAL в логах)
 if ! $COMPOSE_CMD exec -T db psql -U trends -d trends -c "
 DO \$\$

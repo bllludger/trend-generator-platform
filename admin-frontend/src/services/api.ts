@@ -213,6 +213,12 @@ export const telemetryService = {
     api
       .get('/admin/telemetry/errors', { params: { window_days: windowDays } })
       .then((r) => r.data as TelemetryErrorsResponse),
+  getProductFunnel: (windowDays?: number) =>
+    api.get('/admin/telemetry/product-funnel', { params: { window_days: windowDays } }).then((r) => r.data),
+  getProductMetricsV2: (windowDays?: number) =>
+    api.get('/admin/telemetry/product-metrics-v2', { params: { window_days: windowDays } }).then((r) => r.data),
+  getRevenue: (windowDays?: number) =>
+    api.get('/admin/telemetry/revenue', { params: { window_days: windowDays } }).then((r) => r.data),
 }
 
 // ─── Bank transfer ─────────────────────────────────────────────────────────
@@ -456,6 +462,69 @@ export const broadcastService = {
     api.post('/admin/broadcast/send', { message, include_blocked: includeBlocked }).then((r) => r.data),
 }
 
+// ─── Trend poster (автопостер трендов в канал) ──────────────────────────────
+export interface TrendPostItem {
+  id: string
+  trend_id: string
+  trend_name: string | null
+  trend_emoji: string | null
+  channel_id: string
+  caption: string | null
+  telegram_message_id: number | null
+  status: string
+  sent_at: string | null
+  created_at: string | null
+  updated_at: string | null
+  deeplink: string | null
+}
+
+export interface UnpublishedTrend {
+  id: string
+  name: string | null
+  emoji: string | null
+  description: string
+  has_example: boolean
+  deeplink: string | null
+  theme_id: string | null
+  theme_name: string
+  theme_emoji: string
+  theme_order_index: number
+}
+
+export interface PosterSettingsRes {
+  poster_channel_id: string
+  poster_bot_username: string
+  poster_default_template: string
+  poster_button_text: string
+}
+
+export const trendPosterService = {
+  getPosts: (status?: string) =>
+    api.get<{ items: TrendPostItem[] }>('/admin/trend-posts', { params: { status } }).then((r) => r.data),
+  getUnpublished: () =>
+    api.get<{ items: UnpublishedTrend[] }>('/admin/trend-posts/unpublished').then((r) => r.data),
+  preview: (trendId: string, caption?: string) =>
+    api
+      .post<{ trend_id: string; caption: string; has_example: boolean; deeplink: string }>(
+        '/admin/trend-posts/preview',
+        { trend_id: trendId, caption }
+      )
+      .then((r) => r.data),
+  publish: (trendId: string, caption: string) =>
+    api
+      .post<{ id: string; trend_id: string; status: string; telegram_message_id: number | null; sent_at: string | null }>(
+        '/admin/trend-posts/publish',
+        { trend_id: trendId, caption }
+      )
+      .then((r) => r.data),
+  deletePost: (postId: string) =>
+    api.delete<{ id: string; status: string }>(`/admin/trend-posts/${postId}`).then((r) => r.data),
+  getSettings: () =>
+    api.get<PosterSettingsRes>('/admin/trend-posts/settings').then((r) => r.data),
+  updateSettings: (payload: { poster_default_template?: string; poster_button_text?: string; poster_channel_id?: string; poster_bot_username?: string }) =>
+    api.put<PosterSettingsRes>('/admin/trend-posts/settings', payload).then((r) => r.data),
+}
+
 // ─── Jobs ──────────────────────────────────────────────────────────────────
 export interface JobsListParams {
   page?: number
@@ -493,6 +562,21 @@ export const jobsService = {
 
 // ─── Copy style ────────────────────────────────────────────────────────────
 export interface CopyStyleSettings {
+  model?: string
+  system_prompt?: string
+  user_prompt?: string
+  max_tokens?: number
+  prompt_suffix?: string
+  prompt_instruction_3_images?: string
+  prompt_instruction_2_images?: string
+  generation_system_prompt_prefix?: string
+  generation_negative_prompt?: string
+  generation_safety_constraints?: string
+  generation_image_constraints_template?: string
+  generation_default_size?: string
+  generation_default_format?: string
+  generation_default_model?: string
+  updated_at?: string
   [key: string]: unknown
 }
 
@@ -511,6 +595,106 @@ export const referralsService = {
     api.post(`/admin/referrals/bonuses/${bonusId}/freeze`).then((r) => r.data),
 }
 
+// ─── Traffic sources & ad campaigns ────────────────────────────────────────
+export interface TrafficSourceItem {
+  id: string
+  slug: string
+  name: string
+  url: string | null
+  platform: string
+  is_active: boolean
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface TrafficSourceStatsItem {
+  source_id: string
+  slug: string
+  name: string
+  platform: string
+  clicks: number
+  new_users: number
+  buyers: number
+  revenue_stars: number
+  revenue_rub: number
+  conversion_rate_pct: number
+}
+
+export interface TrafficOverview {
+  total_clicks: number
+  new_users: number
+  buyers: number
+  revenue_stars: number
+  revenue_rub: number
+  conversion_rate_pct: number
+  daily_clicks: Array<{ date: string; clicks: number }>
+  daily_purchases: Array<{ date: string; payments: number; stars: number }>
+  date_from: string | null
+  date_to: string | null
+}
+
+export interface TrafficFunnelStep {
+  name: string
+  label: string
+  count: number
+  pct: number
+}
+
+export interface AdCampaignItem {
+  id: string
+  source_id: string
+  source: { id: string; slug: string; name: string }
+  name: string
+  slug: string | null
+  budget_rub: number
+  date_from: string | null
+  date_to: string | null
+  is_active: boolean
+  created_at: string | null
+  notes: string | null
+}
+
+export interface CampaignRoi {
+  campaign_id: string
+  source_slug: string
+  name: string
+  budget_rub: number
+  date_from: string
+  date_to: string
+  new_users: number
+  buyers: number
+  revenue_stars: number
+  revenue_rub: number
+  cpa_rub: number | null
+  cpp_rub: number | null
+  roas: number | null
+}
+
+export const trafficService = {
+  getBotInfo: () => api.get<{ username: string | null }>('/admin/bot-info').then((r) => r.data),
+  listSources: (params?: { active_only?: boolean }) =>
+    api.get<TrafficSourceItem[]>('/admin/traffic-sources', { params }).then((r) => r.data),
+  createSource: (body: { slug: string; name: string; url?: string; platform?: string }) =>
+    api.post<TrafficSourceItem>('/admin/traffic-sources', body).then((r) => r.data),
+  updateSource: (id: string, body: { name?: string; url?: string; is_active?: boolean }) =>
+    api.patch<TrafficSourceItem>(`/admin/traffic-sources/${id}`, body).then((r) => r.data),
+  deleteSource: (id: string) => api.delete(`/admin/traffic-sources/${id}`).then((r) => r.data),
+  getStats: (params?: { date_from?: string; date_to?: string }) =>
+    api.get<{ sources: TrafficSourceStatsItem[]; date_from?: string; date_to?: string }>('/admin/traffic-sources/stats', { params }).then((r) => r.data),
+  getOverview: (params?: { date_from?: string; date_to?: string }) =>
+    api.get<TrafficOverview>('/admin/traffic-sources/overview', { params }).then((r) => r.data),
+  getFunnel: (slug: string, params?: { date_from?: string; date_to?: string }) =>
+    api.get<{ slug: string; steps: TrafficFunnelStep[]; date_from?: string; date_to?: string }>(`/admin/traffic-sources/${slug}/funnel`, { params }).then((r) => r.data),
+  getSourceUsers: (slug: string, params?: { limit?: number; offset?: number }) =>
+    api.get<{ items: Array<{ id: string; telegram_id: string; username: string | null; first_name: string | null; created_at: string | null; has_purchased: boolean }>; total: number }>(`/admin/traffic-sources/${slug}/users`, { params }).then((r) => r.data),
+  listCampaigns: () => api.get<AdCampaignItem[]>('/admin/ad-campaigns').then((r) => r.data),
+  createCampaign: (body: { source_id: string; name: string; budget_rub: number; date_from: string; date_to: string; notes?: string }) =>
+    api.post<AdCampaignItem>('/admin/ad-campaigns', body).then((r) => r.data),
+  updateCampaign: (id: string, body: { name?: string; budget_rub?: number; date_from?: string; date_to?: string; is_active?: boolean; notes?: string }) =>
+    api.patch<AdCampaignItem>(`/admin/ad-campaigns/${id}`, body).then((r) => r.data),
+  getCampaignRoi: (id: string) => api.get<CampaignRoi>(`/admin/ad-campaigns/${id}/roi`).then((r) => r.data),
+}
+
 // ─── Cleanup ───────────────────────────────────────────────────────────────
 export const cleanupService = {
   getPreview: (olderThanHours: number) =>
@@ -519,4 +703,77 @@ export const cleanupService = {
     }).then((r) => r.data),
   run: (olderThanHours: number) =>
     api.post('/admin/cleanup/run', {}, { params: { older_than_hours: olderThanHours } }).then((r) => r.data),
+}
+
+// ─── Photo Merge ──────────────────────────────────────────────────────────
+export interface PhotoMergeJob {
+  id: string
+  user_id: string
+  user_display_name: string
+  status: 'pending' | 'processing' | 'succeeded' | 'failed'
+  input_count: number
+  output_format: string
+  input_bytes: number | null
+  output_bytes: number | null
+  duration_ms: number | null
+  error_code: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface PhotoMergeJobsResponse {
+  total: number
+  items: PhotoMergeJob[]
+}
+
+export interface PhotoMergeStatsByDay {
+  date: string
+  total: number
+  succeeded: number
+  failed: number
+}
+
+export interface PhotoMergeStats {
+  window_days: number
+  total: number
+  succeeded: number
+  failed: number
+  processing: number
+  success_rate: number
+  avg_duration_ms: number | null
+  p50_duration_ms: number | null
+  p95_duration_ms: number | null
+  total_input_bytes: number
+  total_output_bytes: number
+  top_users: Array<{ user_id: string; display_name: string; count: number }>
+  by_day: PhotoMergeStatsByDay[]
+}
+
+export interface PhotoMergeSettings {
+  output_format: 'png' | 'jpeg'
+  jpeg_quality: number
+  max_output_side_px: number
+  max_input_file_mb: number
+  background_color: string
+  enabled: boolean
+  updated_at: string | null
+}
+
+export interface PhotoMergeJobsListParams {
+  limit?: number
+  offset?: number
+  status?: string
+  user_id?: string
+  date_from?: string
+  date_to?: string
+}
+
+export const photoMergeService = {
+  listJobs: (params: PhotoMergeJobsListParams) =>
+    api.get<PhotoMergeJobsResponse>('/admin/photo-merge/jobs', { params }).then((r) => r.data),
+  getStats: (windowDays = 30) =>
+    api.get<PhotoMergeStats>('/admin/photo-merge/stats', { params: { window_days: windowDays } }).then((r) => r.data),
+  getSettings: () => api.get<PhotoMergeSettings>('/admin/photo-merge/settings').then((r) => r.data),
+  updateSettings: (payload: Partial<PhotoMergeSettings>) =>
+    api.put<PhotoMergeSettings>('/admin/photo-merge/settings', payload).then((r) => r.data),
 }

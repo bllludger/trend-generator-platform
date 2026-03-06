@@ -69,6 +69,7 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     },
     "menu.btn.create_photo": {"value": "🔥 Создать фото", "category": "buttons", "description": "Главная кнопка создания."},
     "menu.btn.copy_style": {"value": "🔄 Сделать такую же", "category": "buttons", "description": "Главная кнопка copy style."},
+    "menu.btn.merge_photos": {"value": "🧩 Соединить фото", "category": "buttons", "description": "Кнопка сервиса склейки фото."},
     "menu.btn.profile": {"value": "👤 Мой профиль", "category": "buttons", "description": "Главная кнопка профиля."},
     "menu.btn.help": {"value": "❓ Помощь", "category": "buttons", "description": "Главная кнопка помощи."},
     "menu.btn.shop": {"value": "🛒 Купить генерации", "category": "buttons", "description": "Главная кнопка магазина."},
@@ -152,6 +153,19 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "value": "🛒 *Магазин генераций*\n\nКупите пакет — получайте фото в полном качестве, без watermark!\n\n",
         "category": "payments",
         "description": "Заголовок экрана магазина.",
+    },
+    "shop.how_buy_stars": {
+        "value": (
+            "📘 *Как купить Telegram Stars*\n\n"
+            "1. Откройте любой тариф в боте и нажмите на него.\n"
+            "2. В открывшемся окне оплаты выберите способ — *Stars* (звёзды).\n"
+            "3. Если Stars нет в списке — пополните баланс Stars в настройках Telegram: "
+            "Настройки → Telegram Stars (или через оплату в другом боте).\n"
+            "4. Подтвердите оплату — генерации зачислятся автоматически.\n\n"
+            "Не получается оплатить Stars? Можно оплатить *переводом на карту* — нажмите кнопку ниже."
+        ),
+        "category": "payments",
+        "description": "Инструкция «Как купить Stars» в экране выбора тарифа.",
     },
     "pay.pack_unavailable": {
         "value": "Пакет недоступен.",

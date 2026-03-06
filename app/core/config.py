@@ -3,7 +3,7 @@ Application configuration.
 All settings are loaded from environment variables.
 Use env.example as a reference for required variables.
 """
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -50,7 +50,9 @@ class Settings(BaseSettings):
     telegram_channel_url: str = ""
     # Обязательная подписка для новых пользователей: @username канала (без @). Пример: nanobanana_al. Пусто = не требовать.
     subscription_channel_username: str = ""
-    
+    # Автопостер трендов: Telegram chat ID или @username канала (например -1003808081075, @nanobanana_al или nanobanana_al). Пусто = отключено.
+    poster_channel_id: str = ""
+
     # ===========================================
     # IMAGE GENERATION - PROVIDER SELECTION
     # ===========================================
@@ -59,7 +61,7 @@ class Settings(BaseSettings):
     # ===========================================
     # OPENAI API (Provider: openai)
     # ===========================================
-    openai_api_key: str  # Required, no default
+    openai_api_key: str = ""  # Required only when IMAGE_PROVIDER=openai
     openai_image_model: str = "dall-e-2"  # dall-e-2, dall-e-3
     # Модель для анализа референса ("Сделать такую же"): должна точно считать и описывать акторов (людей/животных) 1:1. Рекомендуется gpt-4o.
     openai_vision_model: str = "gpt-4o"
@@ -252,6 +254,13 @@ class Settings(BaseSettings):
         if v in ("admin", "password", "123456", "changeme"):
             raise ValueError("admin_ui_password is too weak, please change it")
         return v
+
+    @model_validator(mode="after")
+    def check_openai_key_when_openai_provider(self) -> "Settings":
+        """Require openai_api_key only when image_provider is openai."""
+        if self.image_provider == "openai" and not (self.openai_api_key or "").strip():
+            raise ValueError("openai_api_key is required when IMAGE_PROVIDER=openai")
+        return self
 
     class Config:
         env_file = ".env"

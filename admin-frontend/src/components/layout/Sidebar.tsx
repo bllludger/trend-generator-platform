@@ -18,6 +18,9 @@ import {
   TrendingUp,
   Gift,
   PieChart,
+  Layers,
+  Megaphone,
+  Target,
 } from 'lucide-react'
 
 const nav = [
@@ -27,11 +30,13 @@ const nav = [
   { to: '/packs', label: 'Пакеты', icon: Package },
   { to: '/payments', label: 'Платежи', icon: CreditCard },
   { to: '/bank-transfer', label: 'Оплата переводом', icon: Receipt },
+  { to: '/traffic', label: 'Реклама', icon: Target },
   { to: '/security', label: 'Безопасность', icon: Shield },
   { to: '/audit', label: 'Аудит', icon: FileText },
   { to: '/telemetry', label: 'Телеметрия', icon: BarChart3 },
   { to: '/trends', label: 'Тренды', icon: TrendingUp },
   { to: '/trends-analytics', label: 'Тренды — аналитика', icon: PieChart },
+  { to: '/trend-poster', label: 'Автопостер', icon: Megaphone },
   { to: '/prompt-playground', label: 'Playground', icon: Sparkles },
   { to: '/copy-style', label: 'Стиль копирования', icon: Palette },
   { to: '/settings', label: 'Настройки', icon: Settings },
@@ -39,6 +44,7 @@ const nav = [
   { to: '/telegram-messages', label: 'Сообщения бота', icon: MessageSquare },
   { to: '/broadcast', label: 'Рассылка', icon: Send },
   { to: '/referrals', label: 'Рефералы', icon: Gift },
+  { to: '/photo-merge', label: 'Склейка фото', icon: Layers },
   { to: '/cleanup', label: 'Очистка', icon: Trash2 },
 ]
 

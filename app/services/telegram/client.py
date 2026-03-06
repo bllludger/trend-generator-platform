@@ -3,6 +3,7 @@ Telegram client wrapper using httpx sync client.
 Provides sync interface for Celery workers (no event loop issues).
 """
 import json
+import re
 import time
 import logging
 
@@ -101,7 +102,8 @@ class TelegramClient:
         """Delete message (e.g. progress bar after sending result)."""
         start = time.time()
         try:
-            data = {"chat_id": int(chat_id), "message_id": message_id}
+            chat_id_val = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+            data = {"chat_id": chat_id_val, "message_id": message_id}
             self._api_call("deleteMessage", data)
             self._record_request("deleteMessage", "success", time.time() - start)
         except Exception as e:
@@ -126,26 +128,41 @@ class TelegramClient:
         caption: str | None = None,
         reply_markup: dict | None = None,
         parse_mode: str | None = None,
-    ) -> None:
-        """Send photo to chat. reply_markup — inline-клавиатура (например, «Что дальше?»)."""
+    ) -> dict:
+        """Send photo to chat. reply_markup — inline-клавиатура. Returns API result (e.g. message_id in result).
+        При 429 (Too Many Requests) ждём retry_after секунд и повторяем один раз."""
         start = time.time()
-        try:
-            with open(photo_path, "rb") as f:
-                files = {"photo": (photo_path.split("/")[-1], f, "image/png")}
-                data = {"chat_id": int(chat_id)}
-                if caption:
-                    data["caption"] = runtime_templates.resolve_literal(caption)
-                if parse_mode:
-                    data["parse_mode"] = parse_mode
-                if reply_markup:
-                    # В multipart/form-data reply_markup передаётся как JSON-строка
-                    data["reply_markup"] = json.dumps(reply_markup)
-                self._api_call("sendPhoto", data=data, files=files)
-            self._record_request("sendPhoto", "success", time.time() - start)
-        except Exception as e:
-            self._record_request("sendPhoto", "error", time.time() - start)
-            logger.error("Failed to send photo", extra={"error": str(e), "chat_id": chat_id})
-            raise
+        last_error = None
+        for attempt in range(2):
+            try:
+                chat_id_val = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+                with open(photo_path, "rb") as f:
+                    files = {"photo": (photo_path.split("/")[-1], f, "image/png")}
+                    data = {"chat_id": chat_id_val}
+                    if caption:
+                        data["caption"] = runtime_templates.resolve_literal(caption)
+                    if parse_mode:
+                        data["parse_mode"] = parse_mode
+                    if reply_markup:
+                        data["reply_markup"] = json.dumps(reply_markup)
+                    result = self._api_call("sendPhoto", data=data, files=files)
+                self._record_request("sendPhoto", "success", time.time() - start)
+                return result
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if attempt == 0 and "429" in err_str and "retry after" in err_str.lower():
+                    match = re.search(r"retry after (\d+)", err_str, re.IGNORECASE)
+                    wait = int(match.group(1)) if match else 40
+                    wait = min(wait, 60)
+                    logger.warning("Telegram 429, waiting %ss before retry (sendPhoto)", wait)
+                    time.sleep(wait)
+                    continue
+                self._record_request("sendPhoto", "error", time.time() - start)
+                logger.error("Failed to send photo", extra={"error": err_str, "chat_id": chat_id})
+                raise
+        self._record_request("sendPhoto", "error", time.time() - start)
+        raise last_error
 
     def send_media_group(
         self,

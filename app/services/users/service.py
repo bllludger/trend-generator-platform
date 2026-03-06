@@ -79,6 +79,19 @@ class UserService:
         self.db.flush()
         return result.rowcount > 0
 
+    def return_free_take(self, user_id: str) -> bool:
+        """
+        Вернуть один бесплатный снимок при ошибке генерации (atomic).
+        Вызывать из воркера, когда take со сессией free_preview завершился с ошибкой.
+        """
+        result = self.db.execute(
+            update(User)
+            .where(User.id == user_id, User.free_takes_used > 0)
+            .values(free_takes_used=User.free_takes_used - 1)
+        )
+        self.db.flush()
+        return result.rowcount > 0
+
     def try_use_copy_generation(self, user: User) -> bool:
         """
         Atomically consume 1 of N copy generations («Сделать такую же»). Prevents abuse.

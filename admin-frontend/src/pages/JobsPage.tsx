@@ -75,6 +75,7 @@ type JobItem = {
   trend_name?: string
   trend_emoji?: string
   status: string
+  is_preview?: boolean
   reserved_tokens: number
   error_code?: string
   created_at: string
@@ -411,9 +412,16 @@ export function JobsPage() {
                           </Link>
                         </TableCell>
                         <TableCell>
-                          <Badge variant={getStatusBadge(job.status)}>
-                            {job.status}
-                          </Badge>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <Badge variant={getStatusBadge(job.status)}>
+                              {job.status}
+                            </Badge>
+                            {job.is_preview && (
+                              <Badge variant="secondary" className="font-normal">
+                                Превью
+                              </Badge>
+                            )}
+                          </div>
                         </TableCell>
                         <TableCell>{job.reserved_tokens}</TableCell>
                         <TableCell className="text-muted-foreground">

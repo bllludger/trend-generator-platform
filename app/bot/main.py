@@ -36,6 +36,7 @@ from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.session import SessionLocal
 from app.services.audit.service import AuditService
+from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.jobs.service import JobService
 from app.services.themes.service import ThemeService
 from app.services.trends.service import TrendService
@@ -61,11 +62,14 @@ from app.services.sessions.service import SessionService
 from app.services.takes.service import TakeService
 from app.services.favorites.service import FavoriteService
 from app.services.hd_balance.service import HDBalanceService
+from app.services.input_photo_analyzer import analyze_input_photo
 from app.services.compensations.service import CompensationService
 from app.models.pack import Pack
 from app.models.session import Session as SessionModel
 from app.models.take import Take as TakeModel
 from app.models.trend import Trend as TrendModel
+from app.models.photo_merge_job import PhotoMergeJob
+from app.services.photo_merge.settings_service import PhotoMergeSettingsService
 
 configure_logging()
 logger = logging.getLogger("bot")
@@ -107,9 +111,13 @@ _BOT_ROOT = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_IMAGE_DIR = os.path.join(_BOT_ROOT, "..", "..", "image")
 WELCOME_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "start_page.png")
 # Картинка к экрану «Выбор фотосессии» (баланс + тарифы)
-MONEY_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "money2.png")
+MONEY_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "money3.png")
 # Картинка к экрану «Загрузи своё фото» (правила для идеального кадра)
 RULE_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "rule.png")
+# Картинка к интро «Сделать такую же» (правила: один в кадре, без очков/маски/фильтров; сжимается при >10 МБ)
+COPY_STYLE_INTRO_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "Без названия (16).png")
+# Картинка к интро «Соединить фото» (сжимается при >10 МБ)
+MERGE_INTRO_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "merge_photo.png")
 WELCOME_TEXT_DEFAULT = (
     "👋 Nano Banana — ИИ фотостудия\n\n"
     "Это просто фото.\n"
@@ -348,14 +356,18 @@ class BotStates(StatesGroup):
     waiting_for_format = State()          # Step 3: select aspect ratio
     # "Сделать такую же" flow
     waiting_for_reference_photo = State()  # Шаг 1: референс для копирования
-    waiting_for_self_photo = State()       # Шаг 2: своё фото (1 или первое из 2)
-    waiting_for_self_photo_2 = State()     # Шаг 2b: второе фото (если выбрано 2)
+    waiting_for_self_photo = State()       # Шаг 2: своё фото (identity)
     # Оплата переводом на карту
     bank_transfer_waiting_receipt = State()  # Ждём чек (скриншот/фото)
     # Session-based flow (MVP)
     session_active = State()
     viewing_take_result = State()
     viewing_favorites = State()
+    # «Соединить фото» flow
+    merge_waiting_count = State()          # Шаг 1: выбор 2 или 3 человек
+    merge_waiting_photo_1 = State()        # Шаг 2: фото 1
+    merge_waiting_photo_2 = State()        # Шаг 3: фото 2
+    merge_waiting_photo_3 = State()        # Шаг 4: фото 3 (если выбрано 3)
 
 
 # ===========================================
@@ -369,7 +381,10 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text=t("menu.btn.copy_style", "🔄 Сделать такую же")),
             ],
             [
+                KeyboardButton(text=t("menu.btn.merge_photos", "🧩 Соединить фото")),
                 KeyboardButton(text=t("menu.btn.shop", "🛒 Купить тариф")),
+            ],
+            [
                 KeyboardButton(text=t("menu.btn.profile", "👤 Мой профиль")),
             ],
         ],
@@ -438,16 +453,6 @@ def trends_keyboard(trends: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def copy_photos_choice_keyboard() -> InlineKeyboardMarkup:
-    """Инлайн-кнопки: 1 фото или 2 фото (для флоу «Сделать такую же»)."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=t("copy.btn.one_photo", "1 фотография"), callback_data="copy_photos:1"),
-            InlineKeyboardButton(text=t("copy.btn.two_photos", "2 фотографии"), callback_data="copy_photos:2"),
-        ],
-    ])
-
-
 def _get_default_aspect_ratio() -> str:
     """Дефолтный формат кадра из админки (Мастер промпт → На релиз → default_aspect_ratio)."""
     try:
@@ -490,6 +495,37 @@ def format_keyboard() -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# Product analytics: feedback and likeness (callback_data: gen_fb:take_id:variant:1|0, ln:take_id:variant:yes|no, nr:take_id:variant:reason)
+GENERATION_NEGATIVE_REASONS = [
+    ("face_not_similar", "Лицо не похоже"),
+    ("strange_details", "Странные детали"),
+    ("wrong_style", "Не тот стиль"),
+    ("bad_background", "Плохой фон"),
+    ("pose_problem", "Поза/композиция"),
+    ("low_quality", "Низкое качество"),
+    ("other", "Другое"),
+]
+
+
+def _feedback_keyboard(take_id: str, variant: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👍 Нравится", callback_data=f"gen_fb:{take_id}:{variant}:1"),
+            InlineKeyboardButton(text="👎 Не нравится", callback_data=f"gen_fb:{take_id}:{variant}:0"),
+        ],
+        [
+            InlineKeyboardButton(text="✅ Похоже на меня", callback_data=f"ln:{take_id}:{variant}:yes"),
+            InlineKeyboardButton(text="❌ Не похоже", callback_data=f"ln:{take_id}:{variant}:no"),
+        ],
+    ])
+
+
+def _negative_reason_keyboard(take_id: str, variant: str) -> InlineKeyboardMarkup:
+    row1 = [InlineKeyboardButton(text=label, callback_data=f"nr:{take_id}:{variant}:{slug}") for slug, label in GENERATION_NEGATIVE_REASONS[:4]]
+    row2 = [InlineKeyboardButton(text=label, callback_data=f"nr:{take_id}:{variant}:{slug}") for slug, label in GENERATION_NEGATIVE_REASONS[4:]]
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
 
 
 # ===========================================
@@ -562,6 +598,20 @@ def _parse_referral_code(text: str | None) -> str | None:
     return None
 
 
+def _parse_traffic_source(text: str | None) -> tuple[str | None, str | None]:
+    """Parse /start ad deep link. E.g. '/start src_vk_beauty' -> ('vk_beauty', None); '/start src_vk_beauty_c_mar26' -> ('vk_beauty', 'mar26'). Returns (source_slug, campaign) or (None, None)."""
+    raw = _parse_start_raw_arg(text)
+    if not raw or not raw.startswith("src_"):
+        return (None, None)
+    rest = raw[4:]
+    if not rest:
+        return (None, None)
+    if "_c_" in rest:
+        slug, _, campaign = rest.partition("_c_")
+        return (slug, campaign) if slug else (None, None)
+    return (rest, None)
+
+
 # Обязательная подписка на канал для новых пользователей
 SUBSCRIPTION_CHANNEL_USERNAME = (getattr(settings, "subscription_channel_username", None) or "").strip()
 SUBSCRIPTION_CALLBACK = "subscription_check"
@@ -617,6 +667,38 @@ async def cmd_start(message: Message, state: FSMContext):
                 entity_id=None,
                 payload={},
             )
+            if user:
+                ProductAnalyticsService(db).track("bot_started", user.id)
+
+            # Traffic source from ad deep link (?start=src_<slug> or src_<slug>_c_<campaign>)
+            traffic_source_slug, traffic_campaign = _parse_traffic_source(message.text)
+            if traffic_source_slug and user:
+                audit.log(
+                    actor_type="user",
+                    actor_id=telegram_id,
+                    action="traffic_start",
+                    entity_type="user",
+                    entity_id=user.id,
+                    payload={
+                        "traffic_source": traffic_source_slug,
+                        "campaign": traffic_campaign,
+                        "raw_param": _parse_start_raw_arg(message.text),
+                    },
+                )
+                # First-touch: set source on user once (do not overwrite)
+                if user.traffic_source is None:
+                    user.traffic_source = traffic_source_slug
+                    user.traffic_campaign = traffic_campaign
+                ProductAnalyticsService(db).track(
+                    "traffic_attribution",
+                    user.id,
+                    source=traffic_source_slug,
+                    campaign_id=traffic_campaign,
+                    properties={
+                        "source": traffic_source_slug,
+                        "campaign_id": traffic_campaign,
+                    },
+                )
 
             ref_code = _parse_referral_code(message.text)
             if ref_code and user:
@@ -639,6 +721,16 @@ async def cmd_start(message: Message, state: FSMContext):
                         entity_id=user.id,
                         payload={"referrer_code": ref_code},
                     )
+                    referrer = db.query(User).filter(User.referral_code == ref_code).first()
+                    ProductAnalyticsService(db).track(
+                        "traffic_attribution",
+                        user.id,
+                        source="referral",
+                        properties={
+                            "source": "referral",
+                            "referrer_user_id": referrer.id if referrer else None,
+                        },
+                    )
 
             # Обязательная подписка на канал для новых пользователей
             if SUBSCRIPTION_CHANNEL_USERNAME and user and not _user_subscribed(user):
@@ -646,6 +738,8 @@ async def cmd_start(message: Message, state: FSMContext):
                 await state.update_data(
                     pending_start_arg=_parse_start_arg(message.text),
                     pending_ref_code=ref_code,
+                    pending_traffic_source=traffic_source_slug,
+                    pending_traffic_campaign=traffic_campaign,
                 )
                 kb = _subscription_keyboard()
                 await message.answer(
@@ -725,6 +819,12 @@ async def subscription_check(callback: CallbackQuery, state: FSMContext, bot: Bo
             )
             return
 
+        data = await state.get_data()
+        pending_start_arg = data.get("pending_start_arg")
+        pending_traffic_source = data.get("pending_traffic_source")
+        pending_traffic_campaign = data.get("pending_traffic_campaign")
+        await state.clear()
+
         with get_db_session() as db:
             user_service = UserService(db)
             user = user_service.get_by_telegram_id(telegram_id)
@@ -732,10 +832,22 @@ async def subscription_check(callback: CallbackQuery, state: FSMContext, bot: Bo
                 flags = dict(user.flags or {})
                 flags["subscribed_examples_channel"] = True
                 user.flags = flags
-
-        data = await state.get_data()
-        pending_start_arg = data.get("pending_start_arg")
-        await state.clear()
+                if pending_traffic_source and user.traffic_source is None:
+                    user.traffic_source = pending_traffic_source
+                    user.traffic_campaign = pending_traffic_campaign
+                    audit_svc = AuditService(db)
+                    audit_svc.log(
+                        actor_type="user",
+                        actor_id=telegram_id,
+                        action="traffic_start",
+                        entity_type="user",
+                        entity_id=user.id,
+                        payload={
+                            "traffic_source": pending_traffic_source,
+                            "campaign": pending_traffic_campaign,
+                            "after_subscription": True,
+                        },
+                    )
 
         # Продолжаем как после /start: диплинк или приветствие
         with get_db_session() as db:
@@ -829,17 +941,29 @@ async def cmd_cancel(message: Message, state: FSMContext):
         await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
 
 
-# --- Мой профиль (баланс, бесплатные генерации) ---
+# --- Мой профиль (тариф, образы, кнопки) ---
+
+def _profile_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура профиля: Продолжить, Выбрать пакет, Выбрать фотосессию, Пригласить друга, Оплата, Поддержка."""
+    buttons = [
+        [InlineKeyboardButton(text="▶️ Продолжить фотосессию", callback_data="nav:menu")],
+        [InlineKeyboardButton(text="🛒 Выбрать пакет", callback_data="shop:open")],
+        [InlineKeyboardButton(text="🖼 Выбрать фотосессию", callback_data="shop:open")],
+        [InlineKeyboardButton(text="🤝 Пригласить друга — бонусы", callback_data="referral:invite")],
+        [InlineKeyboardButton(text="💳 Купить через Stars или карту", callback_data="profile:payment")],
+        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="profile:support")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @router.message(lambda m: (m.text or "").strip() == t("menu.btn.profile", "👤 Мой профиль"))
 async def my_profile(message: Message):
-    """Show user balance and free generations."""
+    """Показать тариф, остаток образов и кнопки (Продолжить, Магазин, Пригласить, Оплата, Поддержка)."""
     telegram_id = str(message.from_user.id)
     try:
         with get_db_session() as db:
             user_service = UserService(db)
-            sec_svc = SecuritySettingsService(db)
             session_svc = SessionService(db)
-            hd_svc = HDBalanceService(db)
             user = user_service.get_by_telegram_id(telegram_id)
             if not user:
                 user = user_service.get_or_create_user(
@@ -848,67 +972,22 @@ async def my_profile(message: Message):
                     telegram_first_name=message.from_user.first_name,
                     telegram_last_name=message.from_user.last_name,
                 )
-            sec = sec_svc.get_or_create()
-            free_limit = getattr(sec, "free_generations_per_user", 3)
-            free_used = getattr(user, "free_generations_used", 0)
-            free_left = max(0, free_limit - free_used)
-            copy_limit = getattr(sec, "copy_generations_per_user", 1)
-            copy_used = getattr(user, "copy_generations_used", 0)
-            copy_left = max(0, copy_limit - copy_used)
-            token_balance = user.token_balance
-            total_purchased = getattr(user, "total_purchased", 0)
-            hd_credits = getattr(user, "hd_credits_balance", 0)
-            show_referral = getattr(user, "has_purchased_hd", False)
-
             active_session = session_svc.get_active_session(user.id)
-            plan_name = None
-            remaining_takes = 0
-            total_takes = 0
-            hd_balance_total = 0
+            text = t("profile.title", "👤 *Мой профиль*") + "\n\n"
             if active_session:
                 _pack = db.query(Pack).filter(Pack.id == active_session.pack_id).one_or_none()
-                plan_name = _pack.name if _pack else active_session.pack_id
-                remaining_takes = active_session.takes_limit - active_session.takes_used
-                total_takes = active_session.takes_limit
-                hd_balance_total = hd_svc.get_balance(user)["total"]
-
-        text = t("profile.title", "👤 *Мой профиль*") + "\n\n"
-        if plan_name:
-            plan_safe = _escape_markdown(str(plan_name))
-            text += (
-                f"📦 *Текущий план:* {plan_safe}\n"
-                f"📸 *Осталось снимков:* {remaining_takes} из {total_takes}\n"
-                f"🖼 *4K без watermark:* {hd_balance_total}\n\n"
-            )
-        else:
-            text += "📦 *Текущий план:* Нет активного плана\n\n"
-        text += tr(
-            "profile.body",
-            "🆓 *Бесплатные превью:* {free_left} из {free_limit}\n"
-            "🔄 *«Сделать такую же»:* {copy_left} из {copy_limit}\n"
-            "💰 *Баланс генераций:* {token_balance}\n"
-            "📊 *Всего куплено:* {total_purchased}\n\n"
-            "Бесплатные генерации дают превью с watermark.\n"
-            "Купите пакет — получайте фото в полном качестве!",
-            free_left=free_left,
-            free_limit=free_limit,
-            copy_left=copy_left,
-            copy_limit=copy_limit,
-            token_balance=token_balance,
-            total_purchased=total_purchased,
-        )
-        if hd_credits > 0:
-            text += f"\n\n🎁 *Бонусы 4K:* {hd_credits}"
-
-        buttons = [
-            [InlineKeyboardButton(text=t("profile.btn.top_up", "🛒 Выбрать фотосессию"), callback_data="shop:open")],
-        ]
-        if show_referral:
-            buttons.append([
-                InlineKeyboardButton(text="💌 Пригласить подругу", callback_data="referral:invite"),
-                InlineKeyboardButton(text="📊 Реферальный баланс", callback_data="referral:status"),
-            ])
-        profile_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+                plan_name = _pack.name if _pack else ("Бесплатный" if active_session.pack_id == "free_preview" else active_session.pack_id)
+                plan_safe = _escape_markdown(str(plan_name))
+                remaining = active_session.takes_limit - active_session.takes_used
+                total = active_session.takes_limit
+                if active_session.pack_id == "free_preview":
+                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} бесплатн{'ое фото' if remaining == 1 else 'ых фото'}\nПосле него потребуется пакет."
+                else:
+                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} из {total} фото"
+                text += "\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+            else:
+                text += "Текущий тариф: —\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+            profile_kb = _profile_keyboard()
         await message.answer(text, parse_mode="Markdown", reply_markup=profile_kb)
     except Exception:
         logger.exception("Error in my_profile")
@@ -1048,15 +1127,41 @@ async def referral_status(callback: CallbackQuery):
 
 @router.callback_query(F.data == "referral:back_profile")
 async def referral_back_to_profile(callback: CallbackQuery):
-    """Return to profile from referral screen."""
+    """Return to profile from referral screen (cannot mutate Message.from_user — Pydantic frozen)."""
     try:
         try:
             await callback.message.delete()
         except Exception:
             pass
-        fake_msg = callback.message
-        fake_msg.from_user = callback.from_user
-        await my_profile(fake_msg)
+        telegram_id = str(callback.from_user.id)
+        with get_db_session() as db:
+            user_service = UserService(db)
+            session_svc = SessionService(db)
+            user = user_service.get_by_telegram_id(telegram_id)
+            if not user:
+                user = user_service.get_or_create_user(
+                    telegram_id,
+                    telegram_username=callback.from_user.username,
+                    telegram_first_name=callback.from_user.first_name,
+                    telegram_last_name=callback.from_user.last_name,
+                )
+            active_session = session_svc.get_active_session(user.id)
+            text = t("profile.title", "👤 *Мой профиль*") + "\n\n"
+            if active_session:
+                _pack = db.query(Pack).filter(Pack.id == active_session.pack_id).one_or_none()
+                plan_name = _pack.name if _pack else ("Бесплатный" if active_session.pack_id == "free_preview" else active_session.pack_id)
+                plan_safe = _escape_markdown(str(plan_name))
+                remaining = active_session.takes_limit - active_session.takes_used
+                total = active_session.takes_limit
+                if active_session.pack_id == "free_preview":
+                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} бесплатн{'ое фото' if remaining == 1 else 'ых фото'}\nПосле него потребуется пакет."
+                else:
+                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} из {total} фото"
+                text += "\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+            else:
+                text += "Текущий тариф: —\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+            profile_kb = _profile_keyboard()
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=profile_kb)
     except Exception:
         logger.exception("Error in referral_back_to_profile")
         await callback.message.answer(t("errors.profile_load", "Ошибка загрузки профиля."), reply_markup=main_menu_keyboard())
@@ -1177,21 +1282,43 @@ async def on_audience_selected(callback: CallbackQuery, state: FSMContext, bot: 
 # --- "Сделать такую же" flow ---
 @router.message(lambda m: (m.text or "").strip() == t("menu.btn.copy_style", "🔄 Сделать такую же"))
 async def start_copy_flow(message: Message, state: FSMContext, bot: Bot):
-    """Начало флоу копирования стиля 1:1."""
+    """Начало флоу копирования стиля 1:1. Пост с картинкой, как в логе трендов."""
+    copy_intro_text = t(
+        "copy.start_text",
+        "🔄 *Сделать такую же*\n\n"
+        "Я могу скопировать 1:1 любой тренд.\n\n"
+        "Загрузи картинку-образец в хорошем качестве — "
+        "я изучу дизайн и подскажу, как сделать такую же.\n\n"
+        "Поддерживаются: JPG, PNG, WEBP.",
+    )
     try:
+        await state.clear()
         await state.set_state(BotStates.waiting_for_reference_photo)
-        sent = await message.answer(
-            t(
-                "copy.start_text",
-                "🔄 *Сделать такую же*\n\n"
-                "Я могу скопировать 1:1 любой тренд.\n\n"
-                "Загрузи картинку-образец в хорошем качестве — "
-                "я изучу дизайн и подскажу, как сделать такую же.\n\n"
-                "Поддерживаются: JPG, PNG, WEBP.",
-            ),
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(),
-        )
+        photo_sent = False
+        if os.path.isfile(COPY_STYLE_INTRO_IMAGE_PATH):
+            photo_path, is_temp = path_for_telegram_photo(COPY_STYLE_INTRO_IMAGE_PATH)
+            try:
+                sent = await message.answer_photo(
+                    FSInputFile(photo_path),
+                    caption=copy_intro_text,
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard(),
+                )
+                photo_sent = True
+            except Exception as e:
+                logger.warning("start_copy_flow_photo_failed", extra={"path": COPY_STYLE_INTRO_IMAGE_PATH, "error": str(e)})
+            finally:
+                if is_temp and photo_path and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+        if not photo_sent:
+            sent = await message.answer(
+                copy_intro_text,
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
         await state.update_data(last_bot_message_id=sent.message_id)
     except Exception:
         logger.exception("Error in start_copy_flow")
@@ -1200,8 +1327,7 @@ async def start_copy_flow(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(BotStates.waiting_for_reference_photo, F.photo)
 async def handle_reference_photo(message: Message, state: FSMContext, bot: Bot):
-    """Принимаем референс, вызываем LLM Vision, просим своё фото."""
-    telegram_id = str(message.from_user.id)
+    """Принимаем референс, сохраняем путь, просим своё фото. Vision — после загрузки своего фото."""
     photo = message.photo[-1]
     try:
         inputs_dir = os.path.join(settings.storage_base_path, "inputs")
@@ -1224,50 +1350,21 @@ async def handle_reference_photo(message: Message, state: FSMContext, bot: Bot):
         await message.answer(t("flow.save_photo_error", "Не удалось сохранить фото. Попробуйте ещё раз."))
         return
 
-    analyzing_msg = await message.answer(t("flow.analyzing", "⏳ Анализирую дизайн..."))
-    try:
-        from app.services.llm.vision_analyzer import analyze_reference_image
-        copy_prompt = await asyncio.to_thread(analyze_reference_image, local_path)
-    except Exception as e:
-        logger.exception("Vision analysis failed")
-        await analyzing_msg.edit_text(
-            f"Не удалось проанализировать фото. Попробуйте другое изображение в хорошем качестве."
-        )
-        return
-
-    await analyzing_msg.delete()
-    try:
-        with get_db_session() as db:
-            AuditService(db).log(
-                actor_type="user",
-                actor_id=telegram_id,
-                action="copy_flow_reference_analyzed",
-                entity_type="session",
-                entity_id=None,
-                payload={"prompt_len": len(copy_prompt)},
-            )
-    except Exception:
-        pass
     data = await state.get_data()
     await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-    await state.update_data(
-        copy_prompt=copy_prompt,
-        reference_path=local_path,
-        copy_photos_count=1,
-    )
+    await state.update_data(reference_path=local_path)
     await state.set_state(BotStates.waiting_for_self_photo)
     sent = await message.answer(
-        "✅ Круто! Я изучил дизайн.\n\n"
-        "Сколько фотографий загрузить? Выбери:",
+        "✅ Референс сохранён.\n\nОтправьте своё фото — по нему сохраню лицо и перенесу в сцену из образца.",
         parse_mode="Markdown",
-        reply_markup=copy_photos_choice_keyboard(),
+        reply_markup=main_menu_keyboard(),
     )
     await state.update_data(last_bot_message_id=sent.message_id)
 
 
 @router.message(BotStates.waiting_for_reference_photo, F.document)
 async def handle_reference_photo_as_document(message: Message, state: FSMContext, bot: Bot):
-    """Принимаем референс, отправленный как файл (документ) — тот же флоу, что и фото."""
+    """Принимаем референс как документ, сохраняем путь, просим своё фото."""
     doc = message.document
     if not doc:
         await message.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."))
@@ -1276,7 +1373,6 @@ async def handle_reference_photo_as_document(message: Message, state: FSMContext
     if not ext:
         await message.answer(t("flow.only_images", "Поддерживаются только изображения: JPG, PNG, WEBP. Отправьте файл с фото."))
         return
-    telegram_id = str(message.from_user.id)
     try:
         inputs_dir = os.path.join(settings.storage_base_path, "inputs")
         os.makedirs(inputs_dir, exist_ok=True)
@@ -1298,84 +1394,29 @@ async def handle_reference_photo_as_document(message: Message, state: FSMContext
         await message.answer(t("flow.save_file_error", "Не удалось сохранить файл. Попробуйте ещё раз."))
         return
 
-    analyzing_msg = await message.answer(t("flow.analyzing", "⏳ Анализирую дизайн..."))
-    try:
-        from app.services.llm.vision_analyzer import analyze_reference_image
-        copy_prompt = await asyncio.to_thread(analyze_reference_image, local_path)
-    except Exception:
-        logger.exception("Vision analysis failed (reference document)")
-        await analyzing_msg.edit_text(
-            "Не удалось проанализировать фото. Попробуйте другое изображение в хорошем качестве."
-        )
-        return
-
-    await analyzing_msg.delete()
-    try:
-        with get_db_session() as db:
-            AuditService(db).log(
-                actor_type="user",
-                actor_id=telegram_id,
-                action="copy_flow_reference_analyzed",
-                entity_type="session",
-                entity_id=None,
-                payload={"prompt_len": len(copy_prompt)},
-            )
-    except Exception:
-        pass
     data = await state.get_data()
     await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-    await state.update_data(
-        copy_prompt=copy_prompt,
-        reference_path=local_path,
-        copy_photos_count=1,
-    )
+    await state.update_data(reference_path=local_path)
     await state.set_state(BotStates.waiting_for_self_photo)
     sent = await message.answer(
-        "✅ Круто! Я изучил дизайн.\n\n"
-        "Сколько фотографий загрузить? Выбери:",
+        "✅ Референс сохранён.\n\nОтправьте своё фото — по нему сохраню лицо и перенесу в сцену из образца.",
         parse_mode="Markdown",
-        reply_markup=copy_photos_choice_keyboard(),
+        reply_markup=main_menu_keyboard(),
     )
     await state.update_data(last_bot_message_id=sent.message_id)
 
 
-@router.callback_query(F.data.startswith("copy_photos:"))
-async def copy_photos_choice(callback: CallbackQuery, state: FSMContext):
-    """Пользователь выбрал 1 или 2 фотографии в флоу «Сделать такую же»."""
-    count_str = callback.data.split(":", 1)[1]
-    if count_str not in ("1", "2"):
-        await callback.answer(t("copy.choose_one_two", "Выбери 1 или 2."), show_alert=True)
-        return
-    count = int(count_str)
-    await state.update_data(copy_photos_count=count)
-    if count == 1:
-        await callback.message.edit_text(
-            "✅ Круто! Я изучил дизайн.\n\n"
-            "Отправьте *одну* фотографию — сделаю такое же изображение.",
-            parse_mode="Markdown",
-        )
-        await callback.answer(t("copy.wait_one_photo", "Жду одну фотографию."))
-    else:
-        await callback.message.edit_text(
-            "✅ Круто! Я изучил дизайн.\n\n"
-            "Отправьте *две* фотографии по очереди. Сначала первую:",
-            parse_mode="Markdown",
-        )
-        await callback.answer(t("copy.wait_two_photos", "Жду две фотографии."))
-
-
 @router.message(BotStates.waiting_for_self_photo, F.photo)
 async def handle_self_photo_for_copy(message: Message, state: FSMContext, bot: Bot):
-    """Принимаем своё фото (1-е или единственное), сохраняем; при 2 фото — ждём второе."""
+    """Принимаем своё фото (identity), запускаем Vision с референсом + identity, переходим к формату."""
     telegram_id = str(message.from_user.id)
     data = await state.get_data()
-    copy_prompt = data.get("copy_prompt")
-    if not copy_prompt:
+    reference_path = data.get("reference_path")
+    if not reference_path or not os.path.exists(reference_path):
         await message.answer(t("flow.session_expired_copy", "Сессия истекла. Начните заново: «🔄 Сделать такую же»."))
         await state.clear()
         return
 
-    copy_photos_count = data.get("copy_photos_count", 1)
     photo = message.photo[-1]
     try:
         with get_db_session() as db:
@@ -1406,34 +1447,41 @@ async def handle_self_photo_for_copy(message: Message, state: FSMContext, bot: B
         return
 
     await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-    if copy_photos_count == 2:
-        received = data.get("copy_photos_received") or []
-        received.append({"file_id": photo.file_id, "path": local_path})
-        await state.update_data(
-            copy_photos_received=received,
-            selected_trend_id=TREND_CUSTOM_ID,
-            custom_prompt=copy_prompt,
+    analyzing_msg = await message.answer(t("flow.analyzing", "⏳ Анализирую дизайн..."))
+    try:
+        from app.services.llm.vision_analyzer import analyze_for_copy_style
+        copy_prompt = await asyncio.to_thread(analyze_for_copy_style, reference_path, local_path)
+    except Exception:
+        logger.exception("Vision analysis failed (copy_style)")
+        await analyzing_msg.edit_text(
+            "Не удалось проанализировать фото. Попробуйте другое изображение в хорошем качестве."
         )
-        await state.set_state(BotStates.waiting_for_self_photo_2)
-        sent = await message.answer(
-            "✅ Первое фото получено.\n"
-            f"{t('flow.reference_note', REFERENCE_NOTE_DEFAULT)}\n\n"
-            "Отправьте вторую фотографию."
-        )
-        await state.update_data(last_bot_message_id=sent.message_id)
         return
+
+    await analyzing_msg.delete()
+    try:
+        with get_db_session() as db:
+            AuditService(db).log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="copy_flow_reference_analyzed",
+                entity_type="session",
+                entity_id=None,
+                payload={"prompt_len": len(copy_prompt)},
+            )
+    except Exception:
+        pass
 
     await state.update_data(
         photo_file_id=photo.file_id,
         photo_local_path=local_path,
         selected_trend_id=TREND_CUSTOM_ID,
         custom_prompt=copy_prompt,
+        copy_flow_origin=True,
     )
     await state.set_state(BotStates.waiting_for_format)
     sent = await message.answer(
-        "✅ Фото получено!\n"
-        f"{t('flow.reference_note', REFERENCE_NOTE_DEFAULT)}\n\n"
-        "Выбери формат:",
+        "✅ Готово! Выбери формат:",
         reply_markup=format_keyboard(),
     )
     await state.update_data(last_bot_message_id=sent.message_id)
@@ -1441,7 +1489,7 @@ async def handle_self_photo_for_copy(message: Message, state: FSMContext, bot: B
 
 @router.message(BotStates.waiting_for_self_photo, F.document)
 async def handle_self_photo_as_document_for_copy(message: Message, state: FSMContext, bot: Bot):
-    """Принимаем своё фото (1-е или единственное), отправленное как документ."""
+    """Принимаем своё фото (identity) как документ, запускаем Vision, переходим к формату."""
     doc = message.document
     if not doc:
         await message.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."))
@@ -1452,13 +1500,12 @@ async def handle_self_photo_as_document_for_copy(message: Message, state: FSMCon
         return
     telegram_id = str(message.from_user.id)
     data = await state.get_data()
-    copy_prompt = data.get("copy_prompt")
-    if not copy_prompt:
+    reference_path = data.get("reference_path")
+    if not reference_path or not os.path.exists(reference_path):
         await message.answer(t("flow.session_expired_copy", "Сессия истекла. Начните заново: «🔄 Сделать такую же»."))
         await state.clear()
         return
 
-    copy_photos_count = data.get("copy_photos_count", 1)
     try:
         with get_db_session() as db:
             UserService(db).get_or_create_user(
@@ -1488,151 +1535,44 @@ async def handle_self_photo_as_document_for_copy(message: Message, state: FSMCon
         return
 
     await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-    if copy_photos_count == 2:
-        received = data.get("copy_photos_received") or []
-        received.append({"file_id": doc.file_id, "path": local_path})
-        await state.update_data(
-            copy_photos_received=received,
-            selected_trend_id=TREND_CUSTOM_ID,
-            custom_prompt=copy_prompt,
+    analyzing_msg = await message.answer(t("flow.analyzing", "⏳ Анализирую дизайн..."))
+    try:
+        from app.services.llm.vision_analyzer import analyze_for_copy_style
+        copy_prompt = await asyncio.to_thread(analyze_for_copy_style, reference_path, local_path)
+    except Exception:
+        logger.exception("Vision analysis failed (copy_style document)")
+        await analyzing_msg.edit_text(
+            "Не удалось проанализировать фото. Попробуйте другое изображение в хорошем качестве."
         )
-        await state.set_state(BotStates.waiting_for_self_photo_2)
-        sent = await message.answer(
-            "✅ Первое фото получено.\n"
-            f"{t('flow.reference_note', REFERENCE_NOTE_DEFAULT)}\n\n"
-            "Отправьте вторую фотографию."
-        )
-        await state.update_data(last_bot_message_id=sent.message_id)
         return
+
+    await analyzing_msg.delete()
+    try:
+        with get_db_session() as db:
+            AuditService(db).log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="copy_flow_reference_analyzed",
+                entity_type="session",
+                entity_id=None,
+                payload={"prompt_len": len(copy_prompt)},
+            )
+    except Exception:
+        pass
 
     await state.update_data(
         photo_file_id=doc.file_id,
         photo_local_path=local_path,
         selected_trend_id=TREND_CUSTOM_ID,
         custom_prompt=copy_prompt,
+        copy_flow_origin=True,
     )
     await state.set_state(BotStates.waiting_for_format)
     sent = await message.answer(
-        "✅ Фото получено!\n"
-        f"{t('flow.reference_note', REFERENCE_NOTE_DEFAULT)}\n\n"
-        "Выбери формат:",
+        "✅ Готово! Выбери формат:",
         reply_markup=format_keyboard(),
     )
     await state.update_data(last_bot_message_id=sent.message_id)
-
-
-@router.message(BotStates.waiting_for_self_photo_2, F.photo)
-async def handle_self_photo_2_for_copy(message: Message, state: FSMContext, bot: Bot):
-    """Принимаем второе фото в флоу «2 фотографии»."""
-    data = await state.get_data()
-    copy_photos_received = data.get("copy_photos_received") or []
-    if len(copy_photos_received) != 1:
-        await message.answer(t("flow.session_reset_copy", "Сессия сброшена. Начните заново: «🔄 Сделать такую же»."))
-        await state.clear()
-        return
-
-    photo = message.photo[-1]
-    try:
-        inputs_dir = os.path.join(settings.storage_base_path, "inputs")
-        os.makedirs(inputs_dir, exist_ok=True)
-        local_path = os.path.join(inputs_dir, f"{photo.file_id}.jpg")
-        file = await bot.get_file(photo.file_id)
-        await bot.download_file(file.file_path, local_path)
-        size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        if size_mb > settings.max_file_size_mb:
-            try:
-                os.remove(local_path)
-            except OSError:
-                pass
-            await message.answer(
-                tr("errors.file_too_large_max", "Файл слишком большой ({size_mb:.1f} МБ). Максимум {max_mb} МБ.", size_mb=size_mb, max_mb=settings.max_file_size_mb)
-            )
-            return
-    except Exception:
-        logger.exception("Failed to save second photo for copy")
-        await message.answer(t("flow.save_photo_error", "Не удалось сохранить фото. Попробуйте ещё раз."))
-        return
-
-    data = await state.get_data()
-    await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-    received = copy_photos_received + [{"file_id": photo.file_id, "path": local_path}]
-    first = received[0]
-    await state.update_data(
-        copy_photos_received=received,
-        photo_file_id=first["file_id"],
-        photo_local_path=first["path"],
-    )
-    await state.set_state(BotStates.waiting_for_format)
-    sent = await message.answer(
-        "✅ Оба фото получены!\n"
-        f"{t('flow.reference_note', REFERENCE_NOTE_DEFAULT)}\n\n"
-        "Выбери формат:",
-        reply_markup=format_keyboard(),
-    )
-    await state.update_data(last_bot_message_id=sent.message_id)
-
-
-@router.message(BotStates.waiting_for_self_photo_2, F.document)
-async def handle_self_photo_2_as_document_for_copy(message: Message, state: FSMContext, bot: Bot):
-    """Принимаем второе фото как документ в флоу «2 фотографии»."""
-    doc = message.document
-    if not doc:
-        await message.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."))
-        return
-    ext = _document_image_ext(doc.mime_type, doc.file_name)
-    if not ext:
-        await message.answer(t("flow.only_images", "Поддерживаются только изображения: JPG, PNG, WEBP."))
-        return
-    data = await state.get_data()
-    copy_photos_received = data.get("copy_photos_received") or []
-    if len(copy_photos_received) != 1:
-        await message.answer(t("flow.session_reset_copy", "Сессия сброшена. Начните заново: «🔄 Сделать такую же»."))
-        await state.clear()
-        return
-
-    try:
-        inputs_dir = os.path.join(settings.storage_base_path, "inputs")
-        os.makedirs(inputs_dir, exist_ok=True)
-        local_path = os.path.join(inputs_dir, f"{doc.file_id}{ext}")
-        file = await bot.get_file(doc.file_id)
-        await bot.download_file(file.file_path, local_path)
-        size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        if size_mb > settings.max_file_size_mb:
-            try:
-                os.remove(local_path)
-            except OSError:
-                pass
-            await message.answer(
-                tr("errors.file_too_large_max", "Файл слишком большой ({size_mb:.1f} МБ). Максимум {max_mb} МБ.", size_mb=size_mb, max_mb=settings.max_file_size_mb)
-            )
-            return
-    except Exception:
-        logger.exception("Failed to save second photo for copy (document)")
-        await message.answer(t("flow.save_file_error", "Не удалось сохранить файл. Попробуйте ещё раз."))
-        return
-
-    data = await state.get_data()
-    await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-    received = copy_photos_received + [{"file_id": doc.file_id, "path": local_path}]
-    first = received[0]
-    await state.update_data(
-        copy_photos_received=received,
-        photo_file_id=first["file_id"],
-        photo_local_path=first["path"],
-    )
-    await state.set_state(BotStates.waiting_for_format)
-    sent = await message.answer(
-        "✅ Оба фото получены!\n"
-        f"{t('flow.reference_note', REFERENCE_NOTE_DEFAULT)}\n\n"
-        "Выбери формат:",
-        reply_markup=format_keyboard(),
-    )
-    await state.update_data(last_bot_message_id=sent.message_id)
-
-
-@router.message(BotStates.waiting_for_self_photo_2)
-async def copy_flow_wrong_input_self_2(message: Message):
-    await message.answer(t("flow.send_second_photo", "Отправьте вторую фотографию (фото или файл изображения)."))
 
 
 @router.message(BotStates.waiting_for_reference_photo)
@@ -1643,6 +1583,267 @@ async def copy_flow_wrong_input_ref(message: Message):
 @router.message(BotStates.waiting_for_self_photo)
 async def copy_flow_wrong_input_self(message: Message):
     await message.answer(t("flow.send_your_photo", "Отправьте свою фотографию."))
+
+
+# ===========================================
+# «Соединить фото» flow
+# ===========================================
+
+@router.message(lambda m: (m.text or "").strip() == t("menu.btn.merge_photos", "🧩 Соединить фото"))
+async def start_merge_flow(message: Message, state: FSMContext):
+    """Пользователь нажал кнопку 'Соединить фото'. Отправляем интро с картинкой merge_photo.png (ужатой при >10 МБ)."""
+    telegram_id = str(message.from_user.id)
+    merge_intro_text = (
+        "🧩 <b>Соединить фото</b>\n\n"
+        "Сколько фотографий хотите объединить?"
+    )
+    merge_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤👤 2 фото", callback_data="merge_count:2"),
+            InlineKeyboardButton(text="👤👤👤 3 фото", callback_data="merge_count:3"),
+        ],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="merge_cancel")],
+    ])
+    try:
+        # Проверяем, включён ли сервис
+        with get_db_session() as db:
+            svc_settings = PhotoMergeSettingsService(db)
+            cfg = svc_settings.as_dict()
+        if not cfg["enabled"]:
+            await message.answer("🔒 Сервис склейки фото временно недоступен.")
+            return
+
+        await state.clear()
+        await state.set_state(BotStates.merge_waiting_count)
+        photo_sent = False
+        if os.path.isfile(MERGE_INTRO_IMAGE_PATH):
+            photo_path, is_temp = path_for_telegram_photo(MERGE_INTRO_IMAGE_PATH)
+            try:
+                await message.answer_photo(
+                    FSInputFile(photo_path),
+                    caption=merge_intro_text,
+                    parse_mode="HTML",
+                    reply_markup=merge_keyboard,
+                )
+                photo_sent = True
+            except Exception as e:
+                logger.warning("start_merge_flow_photo_failed", extra={"path": MERGE_INTRO_IMAGE_PATH, "error": str(e)})
+            finally:
+                if is_temp and photo_path and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+        if not photo_sent:
+            await message.answer(
+                merge_intro_text,
+                parse_mode="HTML",
+                reply_markup=merge_keyboard,
+            )
+        with get_db_session() as db:
+            AuditService(db).log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="photo_merge_started",
+                entity_type="user",
+                entity_id=telegram_id,
+            )
+    except Exception:
+        logger.exception("start_merge_flow error")
+        await message.answer("Произошла ошибка. Попробуйте позже.")
+
+
+def _edit_message_text_or_caption(msg: Message, text: str, parse_mode: str = "HTML", reply_markup=None):
+    """Edit message text or caption. Use edit_caption when message has photo (no text)."""
+    # Сообщение с фото нельзя редактировать через edit_text — только edit_caption
+    if msg.photo:
+        return msg.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
+    if msg.text is not None:
+        return msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    if msg.caption is not None:
+        return msg.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
+    return msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+@router.callback_query(F.data.startswith("merge_count:"))
+async def merge_count_selected(callback: CallbackQuery, state: FSMContext):
+    count = int(callback.data.split(":")[1])
+    telegram_id = str(callback.from_user.id)
+    await state.update_data(merge_count=count, merge_photos_paths=[])
+    await state.set_state(BotStates.merge_waiting_photo_1)
+    next_text = (
+        f"🧩 <b>Соединить фото</b> — {count} фото\n\n"
+        "📷 Отправьте фото 1 из " + str(count) + " (можно как фото или как документ)."
+    )
+    await _edit_message_text_or_caption(callback.message, next_text)
+    await callback.answer()
+    try:
+        with get_db_session() as db:
+            AuditService(db).log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="photo_merge_count_selected",
+                entity_type="user",
+                entity_id=telegram_id,
+                payload={"count": count},
+            )
+    except Exception:
+        logger.exception("merge_count_selected audit error")
+
+
+@router.callback_query(F.data == "merge_cancel")
+async def merge_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await _edit_message_text_or_caption(callback.message, "Отменено.", reply_markup=None)
+    except Exception as e:
+        logger.warning("merge_cancel edit failed (message may be media)", extra={"error": str(e)})
+    await callback.answer()
+    await callback.message.answer("Выберите действие:", reply_markup=main_menu_keyboard())
+
+
+async def _download_merge_photo(message: Message, bot: Bot, cfg: dict) -> str | None:
+    """Скачать фото из сообщения, вернуть путь или None при ошибке."""
+    max_bytes = cfg["max_input_file_mb"] * 1024 * 1024
+    file_id: str | None = None
+    ext = ".jpg"
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        file_size = message.photo[-1].file_size or 0
+        ext = ".jpg"
+    elif message.document:
+        doc = message.document
+        allowed_exts = (".jpg", ".jpeg", ".png", ".webp")
+        doc_ext = os.path.splitext(doc.file_name or "")[1].lower()
+        if doc_ext not in allowed_exts:
+            await message.answer("❌ Поддерживаются только .jpg, .jpeg, .png, .webp")
+            return None
+        file_id = doc.file_id
+        file_size = doc.file_size or 0
+        ext = doc_ext
+    else:
+        return None
+
+    if file_size > max_bytes:
+        await message.answer(f"❌ Файл слишком большой. Максимум {cfg['max_input_file_mb']} МБ.")
+        return None
+
+    tg_file = await bot.get_file(file_id)
+    out_dir = os.path.join(settings.storage_base_path, "inputs", "merges")
+    os.makedirs(out_dir, exist_ok=True)
+    local_path = os.path.join(out_dir, f"{uuid4()}{ext}")
+    await bot.download_file(tg_file.file_path, local_path)
+    return local_path
+
+
+async def _merge_proceed_to_next_step(message: Message, state: FSMContext, bot: Bot, photo_path: str):
+    """После получения очередного фото: добавляем в список, переходим к следующему шагу или запускаем задачу."""
+    data = await state.get_data()
+    count = data.get("merge_count", 2)
+    paths: list[str] = data.get("merge_photos_paths", [])
+    paths.append(photo_path)
+    await state.update_data(merge_photos_paths=paths)
+    done = len(paths)
+    telegram_id = str(message.from_user.id)
+
+    try:
+        with get_db_session() as db:
+            AuditService(db).log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="photo_merge_photo_uploaded",
+                entity_type="user",
+                entity_id=telegram_id,
+                payload={"photo_num": done, "total": count},
+            )
+    except Exception:
+        logger.exception("merge photo uploaded audit error")
+
+    if done < count:
+        next_num = done + 1
+        next_state = BotStates.merge_waiting_photo_2 if next_num == 2 else BotStates.merge_waiting_photo_3
+        await state.set_state(next_state)
+        await message.answer(
+            f"✅ Фото {done}/{count} получено!\n\n"
+            f"📷 Теперь отправьте фото {next_num} из {count}."
+        )
+    else:
+        # Все фото получены — запускаем задачу
+        await state.clear()
+        progress_msg = await message.answer("⏳ Склеиваю фото, подождите…")
+        try:
+            with get_db_session() as db:
+                cfg = PhotoMergeSettingsService(db).as_dict()
+                job = PhotoMergeJob(
+                    id=str(uuid4()),
+                    user_id=telegram_id,
+                    status="pending",
+                    input_paths=paths,
+                    input_count=count,
+                    output_format=cfg["output_format"],
+                )
+                db.add(job)
+                db.commit()
+                job_id = job.id
+
+            from app.workers.tasks.merge_photos import merge_photos as merge_task
+            merge_task.apply_async(args=[job_id], queue="generation")
+
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=progress_msg.message_id)
+            except Exception:
+                pass
+            await message.answer(
+                "🧩 Фото в обработке! Результат придёт сюда, обычно за 10–30 секунд.",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception:
+            logger.exception("merge_proceed_start_task error")
+            await message.answer("❌ Не удалось запустить обработку. Попробуйте ещё раз.")
+            await message.answer("Выберите действие:", reply_markup=main_menu_keyboard())
+
+
+@router.message(BotStates.merge_waiting_photo_1, F.photo | F.document)
+async def merge_recv_photo_1(message: Message, state: FSMContext, bot: Bot):
+    with get_db_session() as db:
+        cfg = PhotoMergeSettingsService(db).as_dict()
+    path = await _download_merge_photo(message, bot, cfg)
+    if path:
+        await _merge_proceed_to_next_step(message, state, bot, path)
+
+
+@router.message(BotStates.merge_waiting_photo_2, F.photo | F.document)
+async def merge_recv_photo_2(message: Message, state: FSMContext, bot: Bot):
+    with get_db_session() as db:
+        cfg = PhotoMergeSettingsService(db).as_dict()
+    path = await _download_merge_photo(message, bot, cfg)
+    if path:
+        await _merge_proceed_to_next_step(message, state, bot, path)
+
+
+@router.message(BotStates.merge_waiting_photo_3, F.photo | F.document)
+async def merge_recv_photo_3(message: Message, state: FSMContext, bot: Bot):
+    with get_db_session() as db:
+        cfg = PhotoMergeSettingsService(db).as_dict()
+    path = await _download_merge_photo(message, bot, cfg)
+    if path:
+        await _merge_proceed_to_next_step(message, state, bot, path)
+
+
+@router.message(BotStates.merge_waiting_photo_1)
+async def merge_wrong_input_1(message: Message):
+    await message.answer("📷 Пожалуйста, отправьте фото или файл изображения (jpg, png, webp).")
+
+
+@router.message(BotStates.merge_waiting_photo_2)
+async def merge_wrong_input_2(message: Message):
+    await message.answer("📷 Пожалуйста, отправьте фото или файл изображения (jpg, png, webp).")
+
+
+@router.message(BotStates.merge_waiting_photo_3)
+async def merge_wrong_input_3(message: Message):
+    await message.answer("📷 Пожалуйста, отправьте фото или файл изображения (jpg, png, webp).")
 
 
 async def _try_delete_messages(bot: Bot, chat_id: int, *message_ids: int) -> None:
@@ -1865,6 +2066,14 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                     session_svc.attach_take_to_session(take, session)
                     session_svc.advance_step(session)
                     take_id = take.id
+                    ProductAnalyticsService(db).track("photo_uploaded", u.id, session_id=session.id)
+                    try:
+                        analysis = analyze_input_photo(local_path)
+                        ProductAnalyticsService(db).track(
+                            "input_photo_analyzed", u.id, session_id=session.id, properties=analysis
+                        )
+                    except Exception as e:
+                        logger.warning("input_photo_analyzed failed: %s", e)
 
                     from app.core.celery_app import celery_app as _celery
                     status_msg = await message.answer(f"⏳ Образ 1 из {len(session.playlist)} — {trend_name}...")
@@ -1879,6 +2088,16 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                     await state.set_state(BotStates.viewing_take_result)
                     return
 
+            ProductAnalyticsService(db).track(
+                "photo_uploaded", u.id, session_id=session.id if session else None
+            )
+            try:
+                analysis = analyze_input_photo(local_path)
+                ProductAnalyticsService(db).track(
+                    "input_photo_analyzed", u.id, session_id=session.id if session else None, properties=analysis
+                )
+            except Exception as e:
+                logger.warning("input_photo_analyzed failed: %s", e)
         data = await state.get_data()
         audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
         # Deep link: trend already selected — skip trend choice, go to format (проверяем ЦА)
@@ -2189,6 +2408,9 @@ async def select_trend_or_idea(callback: CallbackQuery, state: FSMContext, bot: 
                 entity_id=trend_id,
                 payload={},
             )
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track("trend_viewed", user.id, trend_id=trend_id)
 
         if example_path:
             try:
@@ -2313,14 +2535,12 @@ async def nav_back_to_menu(callback: CallbackQuery, state: FSMContext, bot: Bot)
 
 @router.callback_query(F.data == "nav:profile")
 async def nav_profile(callback: CallbackQuery):
-    """Открыть «Мой профиль» (баланс) по кнопке после 4K или из меню."""
+    """Открыть «Мой профиль» по кнопке после 4K или из меню."""
     telegram_id = str(callback.from_user.id)
     try:
         with get_db_session() as db:
             user_service = UserService(db)
-            sec_svc = SecuritySettingsService(db)
             session_svc = SessionService(db)
-            hd_svc = HDBalanceService(db)
             user = user_service.get_by_telegram_id(telegram_id)
             if not user:
                 user = user_service.get_or_create_user(
@@ -2329,72 +2549,68 @@ async def nav_profile(callback: CallbackQuery):
                     telegram_first_name=callback.from_user.first_name,
                     telegram_last_name=callback.from_user.last_name,
                 )
-            sec = sec_svc.get_or_create()
-            free_limit = getattr(sec, "free_generations_per_user", 3)
-            free_used = getattr(user, "free_generations_used", 0)
-            free_left = max(0, free_limit - free_used)
-            copy_limit = getattr(sec, "copy_generations_per_user", 1)
-            copy_used = getattr(user, "copy_generations_used", 0)
-            copy_left = max(0, copy_limit - copy_used)
-            token_balance = user.token_balance
-            total_purchased = getattr(user, "total_purchased", 0)
-            hd_credits = getattr(user, "hd_credits_balance", 0)
-            show_referral = getattr(user, "has_purchased_hd", False)
-
             active_session = session_svc.get_active_session(user.id)
-            plan_name = None
-            remaining_takes = 0
-            total_takes = 0
-            hd_balance_total = 0
+            text = t("profile.title", "👤 *Мой профиль*") + "\n\n"
             if active_session:
                 _pack = db.query(Pack).filter(Pack.id == active_session.pack_id).one_or_none()
-                plan_name = _pack.name if _pack else active_session.pack_id
-                remaining_takes = active_session.takes_limit - active_session.takes_used
-                total_takes = active_session.takes_limit
-                hd_balance_total = hd_svc.get_balance(user)["total"]
-
-        text = t("profile.title", "👤 *Мой профиль*") + "\n\n"
-        if plan_name:
-            plan_safe = _escape_markdown(str(plan_name))
-            text += (
-                f"📦 *Текущий план:* {plan_safe}\n"
-                f"📸 *Осталось снимков:* {remaining_takes} из {total_takes}\n"
-                f"🖼 *4K без watermark:* {hd_balance_total}\n\n"
-            )
-        else:
-            text += "📦 *Текущий план:* Нет активного плана\n\n"
-        text += tr(
-            "profile.body",
-            "🆓 *Бесплатные превью:* {free_left} из {free_limit}\n"
-            "🔄 *«Сделать такую же»:* {copy_left} из {copy_limit}\n"
-            "💰 *Баланс генераций:* {token_balance}\n"
-            "📊 *Всего куплено:* {total_purchased}\n\n"
-            "Бесплатные генерации дают превью с watermark.\n"
-            "Купите пакет — получайте фото в полном качестве!",
-            free_left=free_left,
-            free_limit=free_limit,
-            copy_left=copy_left,
-            copy_limit=copy_limit,
-            token_balance=token_balance,
-            total_purchased=total_purchased,
-        )
-        if hd_credits > 0:
-            text += f"\n\n🎁 *Бонусы 4K:* {hd_credits}"
-
-        buttons = [
-            [InlineKeyboardButton(text=t("profile.btn.top_up", "🛒 Выбрать фотосессию"), callback_data="shop:open")],
-        ]
-        if show_referral:
-            buttons.append([
-                InlineKeyboardButton(text="💌 Пригласить подругу", callback_data="referral:invite"),
-                InlineKeyboardButton(text="📊 Реферальный баланс", callback_data="referral:status"),
-            ])
-        profile_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+                plan_name = _pack.name if _pack else ("Бесплатный" if active_session.pack_id == "free_preview" else active_session.pack_id)
+                plan_safe = _escape_markdown(str(plan_name))
+                remaining = active_session.takes_limit - active_session.takes_used
+                total = active_session.takes_limit
+                if active_session.pack_id == "free_preview":
+                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} бесплатн{'ое фото' if remaining == 1 else 'ых фото'}\nПосле него потребуется пакет."
+                else:
+                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} из {total} фото"
+                text += "\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+            else:
+                text += "Текущий тариф: —\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+            profile_kb = _profile_keyboard()
         await callback.message.answer(text, parse_mode="Markdown", reply_markup=profile_kb)
         await callback.answer()
     except Exception:
         logger.exception("Error in nav_profile")
         await callback.answer(t("errors.profile_load", "Ошибка загрузки профиля."), show_alert=True)
+
+
+@router.callback_query(F.data == "profile:payment")
+async def profile_payment(callback: CallbackQuery):
+    """Выбор способа оплаты: Stars или карта."""
+    try:
+        text = "Оплатить: Stars в боте или перевод на карту.\n\nВыберите способ:"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Stars (в боте)", callback_data="shop:open")],
+            [InlineKeyboardButton(text="💳 Карта (перевод)", callback_data="bank_transfer:start")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="nav:profile")],
+        ])
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+    except Exception:
+        logger.exception("Error in profile_payment")
+        await callback.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), show_alert=True)
+
+
+@router.callback_query(F.data == "profile:support")
+async def profile_support(callback: CallbackQuery):
+    """Показать текст поддержки по платежам (как /paysupport)."""
+    try:
+        await callback.message.answer(
+            t(
+                "cmd.paysupport",
+                "💬 *Поддержка по платежам*\n\n"
+                "Если у вас возникли проблемы с оплатой или начислением генераций:\n\n"
+                "1. Убедитесь, что у вас достаточно Telegram Stars\n"
+                "2. Проверьте баланс в «👤 Мой профиль»\n"
+                "3. Напишите нам в чат поддержки\n\n"
+                "Мы обработаем ваш запрос в кратчайшие сроки.\n\n"
+                "⚠️ Telegram support не рассматривает вопросы по покупкам в ботах.",
+            ),
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+        await callback.answer()
+    except Exception:
+        logger.exception("Error in profile_support")
+        await callback.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), show_alert=True)
 
 
 # --- Step 3: Format selected, create job and generate ---
@@ -2411,27 +2627,18 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
     data = await state.get_data()
     photo_file_id = data.get("photo_file_id")
     photo_local_path = data.get("photo_local_path")
-    copy_photos_received = data.get("copy_photos_received") or []
-    reference_path = data.get("reference_path")  # флоу «Сделать такую же»: референс стиля (1-е фото)
+    reference_path = data.get("reference_path")  # флоу «Сделать такую же»: референс (в генерацию не передаём, только identity)
     trend_id = data.get("selected_trend_id")
     trend_name = data.get("selected_trend_name", "")
     custom_prompt = data.get("custom_prompt")
 
-    if copy_photos_received and len(copy_photos_received) == 2:
-        # 1 = стиль (референс), 2 = лицо девушки, 3 = лицо парня — все три улетают в Gemini
-        if reference_path and os.path.exists(reference_path):
-            input_file_ids = ["ref"] + [p["file_id"] for p in copy_photos_received]
-            input_local_paths = [reference_path] + [p["path"] for p in copy_photos_received]
-        else:
-            input_file_ids = [p["file_id"] for p in copy_photos_received]
-            input_local_paths = [p["path"] for p in copy_photos_received]
-    else:
-        if not photo_file_id or not photo_local_path:
-            await callback.answer(t("errors.session_expired_photo", "Сессия истекла. Начните заново: отправьте фото."), show_alert=True)
-            await state.clear()
-            return
-        input_file_ids = [photo_file_id]
-        input_local_paths = [photo_local_path]
+    if not photo_file_id or not photo_local_path:
+        await callback.answer(t("errors.session_expired_photo", "Сессия истекла. Начните заново: отправьте фото."), show_alert=True)
+        await state.clear()
+        return
+    # Всегда один identity-фото в генерацию (и тренды, и «Сделать такую же»)
+    input_file_ids = [photo_file_id]
+    input_local_paths = [photo_local_path]
     
     if not trend_id:
         await callback.answer(t("errors.choose_trend_or_idea", "Выберите тренд или введите свою идею."), show_alert=True)
@@ -2481,7 +2688,7 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
                     await callback.answer(t("errors.trend_unavailable", "Тренд недоступен."), show_alert=True)
                     return
 
-            is_copy_flow = bool(data.get("copy_prompt"))
+            is_copy_flow = bool(data.get("copy_flow_origin"))
             take_type = "COPY" if is_copy_flow else ("CUSTOM" if trend_id == TREND_CUSTOM_ID else "TREND")
             copy_ref = data.get("reference_path") if is_copy_flow else None
 
@@ -2492,6 +2699,7 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
             if getattr(user, "is_moderator", False):
                 free_session = session_svc.create_free_preview_session(user.id)
                 session_id = free_session.id
+                ProductAnalyticsService(db).track("collection_started", user.id, session_id=session_id)
             elif session and session.pack_id != "free_preview":
                 if not session_svc.can_take(session):
                     await callback.answer("📸 Лимит снимков исчерпан. Купите новый пакет.", show_alert=True)
@@ -2511,6 +2719,7 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
                 db.flush()
                 free_session = session_svc.create_free_preview_session(user.id)
                 session_id = free_session.id
+                ProductAnalyticsService(db).track("collection_started", user.id, session_id=session_id)
             else:
                 # No free takes left, no active session — show paywall
                 await callback.answer("Бесплатный снимок исчерпан. Купите пакет.", show_alert=True)
@@ -2545,6 +2754,22 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
                     "audience": audience,
                 },
             )
+            _tid = trend_id if trend_id != TREND_CUSTOM_ID else None
+            ProductAnalyticsService(db).track(
+                "take_started",
+                user.id,
+                session_id=session_id,
+                trend_id=_tid,
+                take_id=created_take_id,
+            )
+            if _tid:
+                ProductAnalyticsService(db).track(
+                    "trend_take_started",
+                    user.id,
+                    session_id=session_id,
+                    trend_id=_tid,
+                    take_id=created_take_id,
+                )
 
         from app.core.celery_app import celery_app
 
@@ -2715,6 +2940,12 @@ async def regenerate_same(callback: CallbackQuery, state: FSMContext, bot: Bot):
                     "regenerate_of": job_id,
                 },
             )
+            ProductAnalyticsService(db).track(
+                "regenerate_clicked",
+                user.id,
+                job_id=job_id,
+                trend_id=trend_id if trend_id != TREND_CUSTOM_ID else None,
+            )
 
         from app.core.celery_app import celery_app
 
@@ -2752,6 +2983,31 @@ async def shop_menu_callback(callback: CallbackQuery):
     """Открыть магазин по нажатию инлайн-кнопки."""
     await _show_shop(callback.message, edit=False)
     await callback.answer()
+
+
+@router.callback_query(F.data == "shop:how_buy_stars")
+async def shop_how_buy_stars(callback: CallbackQuery):
+    """Инструкция «Как купить Stars» + кнопка оплаты картой."""
+    try:
+        text = t(
+            "shop.how_buy_stars",
+            "📘 *Как купить Telegram Stars*\n\n"
+            "1. Откройте любой тариф в боте и нажмите на него.\n"
+            "2. В открывшемся окне оплаты выберите способ — *Stars* (звёзды).\n"
+            "3. Если Stars нет в списке — пополните баланс Stars в настройках Telegram: "
+            "Настройки → Telegram Stars (или через оплату в другом боте).\n"
+            "4. Подтвердите оплату — генерации зачислятся автоматически.\n\n"
+            "Не получается оплатить Stars? Можно оплатить *переводом на карту* — нажмите кнопку ниже.",
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить картой (перевод)", callback_data="bank_transfer:start")],
+            [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="shop:open")],
+        ])
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=kb)
+        await callback.answer()
+    except Exception:
+        logger.exception("Error in shop_how_buy_stars")
+        await callback.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), show_alert=True)
 
 
 async def _show_shop(message: Message, edit: bool = False):
@@ -3081,11 +3337,27 @@ async def handle_pre_checkout(pre_checkout: PreCheckoutQuery, bot: Bot):
                 "pre_checkout_rejected",
                 extra={"user": telegram_id, "payload": payload, "reason": error_msg},
             )
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "pay_failed",
+                        user.id,
+                        properties={"reason": error_msg or "rejected", "payment_method": "stars"},
+                    )
     except Exception:
         logger.exception("Error in pre_checkout")
         await bot.answer_pre_checkout_query(
             pre_checkout.id, ok=False, error_message="Внутренняя ошибка. Попробуйте позже."
         )
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "pay_failed",
+                    user.id,
+                    properties={"reason": "internal_error", "payment_method": "stars"},
+                )
 
 
 @router.message(F.successful_payment)
@@ -3128,6 +3400,17 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                             entity_type="payment",
                             entity_id=charge_id,
                             payload={"pack_id": pack_id, "session_id": session.id, "stars": payment_info.total_amount},
+                        )
+                        ProductAnalyticsService(db).track(
+                            "pay_success",
+                            user.id,
+                            pack_id=pack_id,
+                            properties={
+                                "pack_id": pack_id,
+                                "price": payment_info.total_amount,
+                                "payment_method": "stars",
+                                "currency": "XTR",
+                            },
                         )
 
                         remaining = session.takes_limit - session.takes_used
@@ -3176,6 +3459,17 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                             entity_type="payment",
                             entity_id=charge_id,
                             payload={"new_pack_id": new_pack_id, "old_session_id": old_session_id},
+                        )
+                        ProductAnalyticsService(db).track(
+                            "pay_success",
+                            user.id,
+                            pack_id=new_pack_id,
+                            properties={
+                                "pack_id": new_pack_id,
+                                "price": payment_info.total_amount,
+                                "payment_method": "stars",
+                                "currency": "XTR",
+                            },
                         )
 
                         remaining = new_session.takes_limit - new_session.takes_used
@@ -3276,6 +3570,18 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                     entity_id=charge_id,
                     payload={"job_id": job_id_unlock, "stars": cost},
                 )
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "pay_success",
+                        user.id,
+                        pack_id="unlock",
+                        properties={
+                            "pack_id": "unlock",
+                            "price": cost,
+                            "payment_method": "stars",
+                            "currency": "XTR",
+                        },
+                    )
                 logger.info(
                     "unlock_payment_completed",
                     extra={"user": telegram_id, "job_id": job_id_unlock, "charge_id": charge_id},
@@ -3321,6 +3627,18 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                         entity_id=charge_id,
                         payload={"pack_id": pack.id, "stars": pack.stars_price, "tokens": pack.tokens},
                     )
+                    if user:
+                        ProductAnalyticsService(db).track(
+                            "pay_success",
+                            user.id,
+                            pack_id=pack.id,
+                            properties={
+                                "pack_id": pack.id,
+                                "price": pack.stars_price,
+                                "payment_method": "stars",
+                                "currency": "XTR",
+                            },
+                        )
                     logger.info(
                         "pack_payment_completed",
                         extra={
@@ -4215,6 +4533,25 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                     "trend_id": getattr(take, "trend_id", None),
                 },
             )
+            variant_position = {"A": 1, "B": 2, "C": 3}.get(variant, 0)
+            _trend_id = getattr(take, "trend_id", None)
+            ProductAnalyticsService(db).track(
+                "favorite_selected",
+                user.id,
+                session_id=take.session_id,
+                trend_id=_trend_id,
+                take_id=take_id,
+                properties={"variant_id": variant, "variant_position": variant_position},
+            )
+            if _trend_id:
+                ProductAnalyticsService(db).track(
+                    "trend_favorite_selected",
+                    user.id,
+                    session_id=take.session_id,
+                    trend_id=_trend_id,
+                    take_id=take_id,
+                    properties={"variant_id": variant, "variant_position": variant_position},
+                )
             session_id = take.session_id
             user_is_moderator = getattr(user, "is_moderator", False)
             fav_id = str(fav.id) if fav else None
@@ -4278,6 +4615,10 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 f"{trend_label} · Вариант {variant} в избранном.{collection_info}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=short_menu_buttons),
             )
+            await callback.message.answer(
+                "Оцените результат:",
+                reply_markup=_feedback_keyboard(take_id, variant),
+            )
 
     except Exception:
         logger.exception("choose_variant error", extra={"user_id": telegram_id})
@@ -4322,6 +4663,8 @@ async def _show_paywall_after_free_take(message: Message, telegram_id: str, take
                     "buttons": [{"pack_id": b["id"], "stars_price": b["stars_price"], "position": b["position"]} for b in buttons_data],
                 },
             )
+            if user:
+                ProductAnalyticsService(db).track("paywall_viewed", user.id, take_id=take_id)
 
         rate = getattr(settings, "star_to_rub", 1.3)
         buttons = []
@@ -4335,6 +4678,10 @@ async def _show_paywall_after_free_take(message: Message, telegram_id: str, take
             "👀 Смотри бесплатно, плати только если нравится!\n\n"
             "🎬 Получи 4K версию без watermark:",
             reply_markup=keyboard,
+        )
+        await message.answer(
+            "Оцените результат:",
+            reply_markup=_feedback_keyboard(take_id, variant),
         )
     except Exception:
         logger.exception("_show_paywall_after_free_take error")
@@ -4407,11 +4754,118 @@ async def add_variant_to_favorites(callback: CallbackQuery, state: FSMContext):
                     "trend_id": getattr(take, "trend_id", None),
                 },
             )
+            _trend_id = getattr(take, "trend_id", None)
+            variant_position = {"A": 1, "B": 2, "C": 3}.get(variant, 0)
+            ProductAnalyticsService(db).track(
+                "favorite_selected",
+                user.id,
+                session_id=take.session_id,
+                trend_id=_trend_id,
+                take_id=take_id,
+                properties={"variant_id": variant, "variant_position": variant_position},
+            )
+            if _trend_id:
+                ProductAnalyticsService(db).track(
+                    "trend_favorite_selected",
+                    user.id,
+                    session_id=take.session_id,
+                    trend_id=_trend_id,
+                    take_id=take_id,
+                    properties={"variant_id": variant, "variant_position": variant_position},
+                )
 
         await callback.answer(f"⭐ Добавлено: {trend_label}, вариант {variant}")
+        await callback.message.answer(
+            "Оцените результат:",
+            reply_markup=_feedback_keyboard(take_id, variant),
+        )
     except Exception:
         logger.exception("add_variant_to_favorites error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("gen_fb:"))
+async def generation_feedback_cb(callback: CallbackQuery):
+    """Product analytics: generation_feedback (liked true/false)."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _prefix, take_id, variant, liked_str = parts
+    liked = liked_str == "1"
+    try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "generation_feedback",
+                    user.id,
+                    take_id=take_id,
+                    trend_id=None,
+                    properties={"liked": liked},
+                )
+        await callback.answer("Спасибо за отзыв!")
+    except Exception:
+        logger.exception("generation_feedback_cb error", extra={"user_id": telegram_id})
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ln:"))
+async def likeness_feedback_cb(callback: CallbackQuery):
+    """Product analytics: generation_likeness_feedback (yes/no). If no, show reason buttons."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _prefix, take_id, variant, likeness = parts
+    try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "generation_likeness_feedback",
+                    user.id,
+                    take_id=take_id,
+                    properties={"likeness": likeness},
+                )
+        if likeness == "no":
+            await callback.message.answer(
+                "Укажите причину:",
+                reply_markup=_negative_reason_keyboard(take_id, variant),
+            )
+            await callback.answer()
+        else:
+            await callback.answer("Спасибо!")
+    except Exception:
+        logger.exception("likeness_feedback_cb error", extra={"user_id": telegram_id})
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nr:"))
+async def negative_reason_cb(callback: CallbackQuery):
+    """Product analytics: generation_negative_reason."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _prefix, take_id, variant, reason = parts
+    try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "generation_negative_reason",
+                    user.id,
+                    take_id=take_id,
+                    properties={"reason": reason},
+                )
+        await callback.answer("Спасибо, учтём!")
+    except Exception:
+        logger.exception("negative_reason_cb error", extra={"user_id": telegram_id})
+        await callback.answer()
 
 
 @router.callback_query(F.data == "take_more")
@@ -4433,6 +4887,7 @@ async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
             if not session or not session_svc.can_take(session):
                 if getattr(user, "is_moderator", False):
                     session = session_svc.create_free_preview_session(user.id)
+                    ProductAnalyticsService(db).track("collection_started", user.id, session_id=session.id)
                 else:
                     telegram_id = str(callback.from_user.id)
                     text, kb_dict = build_balance_tariffs_message(db, telegram_id)
@@ -5171,6 +5626,18 @@ async def paywall_buy(callback: CallbackQuery, bot: Bot):
                 entity_id=pack_id,
                 payload={"pack_name": pack_name, "stars_price": pack_stars_price, "flow": "paywall"},
             )
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                rate = getattr(settings, "star_to_rub", 1.3)
+                ProductAnalyticsService(db).track(
+                    "pay_initiated",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={
+                        "price_stars": pack_stars_price,
+                        "price_rub": round(pack_stars_price * rate, 2),
+                    },
+                )
 
         payload = f"session:{pack_id}"
         title = f"{pack_emoji} {pack_name}"
@@ -5233,6 +5700,18 @@ async def upgrade_session(callback: CallbackQuery, bot: Bot):
                 entity_id=new_pack_id,
                 payload={"pack_name": new_pack_name, "upgrade_price": upgrade_price, "flow": "upgrade", "old_session_id": session_id},
             )
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                rate = getattr(settings, "star_to_rub", 1.3)
+                ProductAnalyticsService(db).track(
+                    "pay_initiated",
+                    user.id,
+                    pack_id=new_pack_id,
+                    properties={
+                        "price_stars": upgrade_price,
+                        "price_rub": round(upgrade_price * rate, 2),
+                    },
+                )
 
         payload = f"upgrade:{new_pack_id}:{session_id}"
         title = f"⬆️ Апгрейд до {new_pack_name}"
@@ -5269,12 +5748,20 @@ async def unknown_message(message: Message, state: FSMContext):
         await message.answer(t("flow.send_reference", "Отправьте картинку-образец для копирования стиля."))
     elif current == BotStates.waiting_for_self_photo:
         await message.answer(t("flow.send_your_photo", "Отправьте свою фотографию."))
-    elif current == BotStates.waiting_for_self_photo_2:
-        await message.answer(t("flow.send_second_photo", "Отправьте вторую фотографию (фото или файл изображения)."))
     elif current == BotStates.waiting_for_prompt:
         await message.answer(t("flow.enter_idea", "Введите текстом описание своей идеи для образа (или выберите тренд по кнопкам)."))
     elif current == BotStates.bank_transfer_waiting_receipt:
         await message.answer("📸 Отправьте скриншот или фото чека перевода.")
+    elif current in (
+        BotStates.merge_waiting_count,
+        BotStates.merge_waiting_photo_1,
+        BotStates.merge_waiting_photo_2,
+        BotStates.merge_waiting_photo_3,
+    ):
+        await message.answer(
+            "🧩 Вы в режиме склейки фото. Отправьте фото или нажмите «🧩 Соединить фото» снова.",
+            reply_markup=main_menu_keyboard(),
+        )
     else:
         await message.answer(
             t("nav.main_hint", "Нажмите «🔥 Создать фото» или «🔄 Сделать такую же» — или /help для справки."),

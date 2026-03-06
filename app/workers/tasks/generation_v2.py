@@ -5,6 +5,7 @@ Bot calls: send_task("app.workers.tasks.generation_v2.generate_image", args=[job
 """
 import logging
 import os
+import time
 from sqlalchemy.orm import Session
 
 from app.core.celery_app import celery_app
@@ -25,6 +26,7 @@ from app.services.image_generation import (
     generate_with_retry,
 )
 from app.services.jobs.service import JobService
+from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.telegram.client import TelegramClient
 from app.services.telegram_messages.runtime import runtime_templates
 from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as transfer_get_effective
@@ -146,6 +148,7 @@ def generate_image(
     """
     db: Session = SessionLocal()
     telegram = TelegramClient()
+    started_at = time.time()
     try:
         job_service = JobService(db)
         job = job_service.get(job_id)
@@ -163,12 +166,21 @@ def generate_image(
         if not trend:
             logger.error("generation_v2_trend_not_found", extra={"job_id": job_id, "trend_id": job.trend_id})
             job_service.set_status(job, "FAILED", error_code="trend_missing")
+            ProductAnalyticsService(db).track(
+                "generation_failed",
+                job.user_id,
+                job_id=job_id,
+                trend_id=job.trend_id,
+                properties={"error_code": "trend_missing", "latency_ms": int((time.time() - started_at) * 1000)},
+            )
             if status_chat_id:
                 if status_message_id is not None:
                     telegram.edit_message(status_chat_id, status_message_id, "❌ Тренд не найден.")
                 else:
                     telegram.send_message(status_chat_id, "❌ Тренд не найден.")
             return {"ok": False, "error": "trend_missing"}
+
+        job_service.set_status(job, "RUNNING")
 
         if status_chat_id and status_message_id is not None:
             step1 = runtime_templates.get("progress.regenerate_step1", "⏳ Генерация изображения…")
@@ -192,7 +204,15 @@ def generate_image(
 
         app_svc = AppSettingsService(db)
         provider_override = app_svc.get_effective_provider(settings)
-        provider = ImageProviderFactory.create_from_settings(settings, provider_override or "gemini")
+        provider_name = provider_override or getattr(settings, "image_provider", "gemini")
+        provider = ImageProviderFactory.create_from_settings(settings, provider_name)
+        ProductAnalyticsService(db).track(
+            "generation_started",
+            job.user_id,
+            job_id=job_id,
+            trend_id=job.trend_id,
+            properties={"model": model, "provider": provider_name},
+        )
         request = ImageGenerationRequest(
             prompt=prompt_text,
             model=model,
@@ -227,6 +247,16 @@ def generate_image(
                 extra={"job_id": job_id, "detail": e.detail, "error_message": str(e)},
             )
             job_service.set_status(job, "FAILED", error_code="generation_failed")
+            ProductAnalyticsService(db).track(
+                "generation_failed",
+                job.user_id,
+                job_id=job_id,
+                trend_id=job.trend_id,
+                properties={
+                    "error_code": "generation_failed",
+                    "latency_ms": int((time.time() - started_at) * 1000),
+                },
+            )
             msg = (e.detail.get("finish_message") or str(e)) if e.detail else str(e)
             if status_chat_id:
                 if status_message_id is not None:
@@ -281,6 +311,14 @@ def generate_image(
             photo_path = delivery_result.original_path
             reply_markup = None
         job_service.set_status(job, "SUCCEEDED")
+        latency_ms = int((time.time() - started_at) * 1000)
+        ProductAnalyticsService(db).track(
+            "generation_completed",
+            job.user_id,
+            job_id=job_id,
+            trend_id=job.trend_id,
+            properties={"model": model, "provider": provider_name, "latency_ms": latency_ms},
+        )
 
         # Notify user: delete progress message, send photo (with unlock buttons if preview)
         if status_chat_id:
@@ -298,6 +336,14 @@ def generate_image(
         return {"ok": True, "job_id": job_id, "output_path": photo_path}
     except Exception:
         logger.exception("generate_image_fatal", extra={"job_id": job_id})
+        # Ensure job is not left in RUNNING (re-fetch to avoid inconsistent state)
+        try:
+            job_service = JobService(db)
+            job = job_service.get(job_id)
+            if job and job.status in ("CREATED", "RUNNING"):
+                job_service.set_status(job, "FAILED", error_code="unexpected_error")
+        except Exception as e:
+            logger.warning("generate_image_fatal_set_status_failed", extra={"job_id": job_id, "error": str(e)})
         if status_chat_id:
             try:
                 telegram.send_message(status_chat_id, "❌ Произошла ошибка при генерации. Попробуйте ещё раз.")

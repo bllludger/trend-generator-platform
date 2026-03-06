@@ -19,8 +19,11 @@ import { CleanupPage } from '@/pages/CleanupPage'
 import { CopyStylePage } from '@/pages/CopyStylePage'
 import { TrendsPage } from '@/pages/TrendsPage'
 import { TrendsAnalyticsPage } from '@/pages/TrendsAnalyticsPage'
+import { TrendPosterPage } from '@/pages/TrendPosterPage'
 import PromptPlaygroundPage from '@/pages/PromptPlaygroundPage'
 import ReferralsPage from '@/pages/ReferralsPage'
+import TrafficPage from '@/pages/TrafficPage'
+import PhotoMergePage from '@/pages/PhotoMergePage'
 
 function ProtectedLayout() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -47,6 +50,7 @@ export default function App() {
           <Route path="telemetry" element={<TelemetryPage />} />
           <Route path="trends" element={<TrendsPage />} />
           <Route path="trends-analytics" element={<TrendsAnalyticsPage />} />
+          <Route path="trend-poster" element={<TrendPosterPage />} />
           <Route path="prompt-playground" element={<PromptPlaygroundPage />} />
           <Route path="copy-style" element={<CopyStylePage />} />
           <Route path="settings" element={<SettingsPage />} />
@@ -55,7 +59,9 @@ export default function App() {
           <Route path="telegram-messages" element={<TelegramMessagesPage />} />
           <Route path="broadcast" element={<BroadcastPage />} />
           <Route path="referrals" element={<ReferralsPage />} />
+          <Route path="traffic" element={<TrafficPage />} />
           <Route path="cleanup" element={<CleanupPage />} />
+          <Route path="photo-merge" element={<PhotoMergePage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
