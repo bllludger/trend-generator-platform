@@ -69,9 +69,10 @@ const LIVE_REFETCH_INTERVAL_MS = 15_000
 
 type JobItem = {
   job_id: string
+  task_type?: 'job' | 'take'
   telegram_id?: string
   user_display_name?: string
-  trend_id: string
+  trend_id?: string | null
   trend_name?: string
   trend_emoji?: string
   status: string
@@ -195,10 +196,10 @@ export function JobsPage() {
               <span className="text-sm font-medium text-muted-foreground">
                 Успешно
               </span>
-              <TrendingUp className="h-4 w-4 text-emerald-600" />
+              <TrendingUp className="h-4 w-4 text-success" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold text-emerald-600">
+              <div className="text-2xl font-bold text-success">
                 {formatNumber(stats.succeeded)}
               </div>
               <p className="text-xs text-muted-foreground">
@@ -213,10 +214,10 @@ export function JobsPage() {
               <span className="text-sm font-medium text-muted-foreground">
                 Ошибки
               </span>
-              <AlertCircle className="h-4 w-4 text-red-600" />
+              <AlertCircle className="h-4 w-4 text-destructive" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold text-red-600">
+              <div className="text-2xl font-bold text-destructive">
                 {formatNumber(stats.failed)}
               </div>
               <p className="text-xs text-muted-foreground">
@@ -231,7 +232,7 @@ export function JobsPage() {
               <span className="text-sm font-medium text-muted-foreground">
                 В очереди
               </span>
-              <ListTodo className="h-4 w-4 text-amber-600" />
+              <ListTodo className="h-4 w-4 text-warning" />
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">{formatNumber(stats.in_queue)}</div>
@@ -360,6 +361,7 @@ export function JobsPage() {
                     <TableRow className="hover:bg-transparent">
                       <TableHead className="w-10"> </TableHead>
                       <TableHead className="font-mono">ID</TableHead>
+                      <TableHead className="whitespace-nowrap">Тип</TableHead>
                       <TableHead>Пользователь</TableHead>
                       <TableHead>Тренд</TableHead>
                       <TableHead>Статус</TableHead>
@@ -380,7 +382,7 @@ export function JobsPage() {
                             title="Копировать ID"
                           >
                             {copiedId === job.job_id ? (
-                              <Check className="h-4 w-4 text-emerald-600" />
+                              <Check className="h-4 w-4 text-success" />
                             ) : (
                               <Copy className="h-4 w-4" />
                             )}
@@ -388,6 +390,9 @@ export function JobsPage() {
                         </TableCell>
                         <TableCell className="font-mono text-xs">
                           {job.job_id.substring(0, 8)}…
+                        </TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {job.task_type === 'take' ? 'Снимок' : 'Задача'}
                         </TableCell>
                         <TableCell>
                           {job.user_display_name ? (
@@ -405,10 +410,10 @@ export function JobsPage() {
                           <Link
                             to="/trends"
                             className="text-primary hover:underline"
-                            title={job.trend_name ?? job.trend_id}
+                            title={job.trend_name ?? job.trend_id ?? ''}
                           >
                             {job.trend_emoji ? `${job.trend_emoji} ` : ''}
-                            {job.trend_name || job.trend_id.substring(0, 8)}
+                            {job.trend_name || (job.trend_id ? job.trend_id.substring(0, 8) : '—')}
                           </Link>
                         </TableCell>
                         <TableCell>
@@ -428,7 +433,7 @@ export function JobsPage() {
                           {job.error_code ? (
                             <Button
                               variant="link"
-                              className="h-auto p-0 text-red-600 hover:text-red-700"
+                              className="h-auto p-0 text-destructive hover:opacity-80"
                               onClick={() => setErrorDetailJob(job)}
                             >
                               {job.error_code}

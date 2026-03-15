@@ -47,6 +47,7 @@ import {
   Radio,
   BarChart3,
   TrendingUp,
+  AlertCircle,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -68,12 +69,22 @@ const ACTOR_TYPES = [
   { value: 'admin', label: 'Админ' },
 ]
 
+/** Extended static list for fallback when API filters unavailable. */
 const ACTIONS = [
   'start', 'trends_shown', 'trend_selected', 'job_created', 'job_started',
   'generation_request', 'generation_response',
   'job_succeeded', 'job_failed', 'create', 'update', 'delete', 'cleanup',
-  'user_banned', 'user_unbanned', 'user_suspended', 'user_resumed', 'rate_limit_set', 'bulk_action',
+  'user_banned', 'user_unbanned', 'user_suspended', 'user_resumed', 'rate_limit_set', 'moderator', 'bulk_action',
   'audience_selected', 'take_started',
+  'grant_pack', 'reset_limits', 'refund', 'broadcast',
+  'unlock_delivered', 'unlock_delivery_failed',
+  'bot_started', 'photo_uploaded', 'take_preview_ready', 'favorite_selected', 'paywall_viewed', 'pack_selected',
+  'pay_initiated', 'pay_success', 'hd_delivered', 'button_click', 'traffic_start', 'collection_started',
+  'choose_best_variant', 'favorites_auto_add', 'trend_favorite_selected', 'payment_pack', 'payment_unlock',
+  'pay_failed', 'referral_start', 'referral_attributed', 'referral_invite_view', 'referral_link_created',
+  'referral_first_pay_success', 'referral_bonus_pending', 'referral_bonus_spent',
+  'copy_flow_reference_analyzed', 'photo_merge_started', 'photo_merge_count_selected', 'photo_merge_photo_uploaded',
+  'unlock_with_tokens', 'trial_to_studio_upgrade_success', 'take_previews_ready', 'generation_likeness_feedback',
 ]
 
 const AUDIENCE_FILTER_OPTIONS = [
@@ -89,12 +100,11 @@ const AUDIENCE_LABELS: Record<string, string> = {
   couples: 'Пары',
 }
 
-const ENTITY_TYPES = ['session', 'trend', 'job', 'user', 'trend_prompt', 'temp_files']
-
-const DATE_PRESETS = [
-  { value: '24', label: '24 ч' },
-  { value: '168', label: '7 д' },
-  { value: '720', label: '30 д' },
+/** Extended static list for fallback when API filters unavailable. */
+const ENTITY_TYPES = [
+  'session', 'trend', 'job', 'user', 'take', 'trend_prompt', 'temp_files',
+  'payment', 'favorite', 'pack', 'referral_bonus', 'photo_merge_job',
+  'theme', 'security_settings', 'settings', 'traffic_source', 'ad_campaign', 'trend_post', 'unlock_order', 'pack_order',
 ]
 
 const ACTION_LABELS: Record<string, string> = {
@@ -116,9 +126,49 @@ const ACTION_LABELS: Record<string, string> = {
   user_suspended: 'Пользователь приостановлен',
   user_resumed: 'Пользователь возобновлён',
   rate_limit_set: 'Установлен лимит',
+  moderator: 'Модератор',
   bulk_action: 'Массовое действие',
   audience_selected: 'Выбор ЦА',
   take_started: 'Запуск снимка (Take)',
+  grant_pack: 'Выдача пакета',
+  reset_limits: 'Сброс лимитов',
+  refund: 'Возврат',
+  broadcast: 'Рассылка',
+  unlock_delivered: 'Unlock доставлен',
+  unlock_delivery_failed: 'Unlock доставка не удалась',
+  bot_started: 'Бот запущен',
+  photo_uploaded: 'Фото загружено',
+  take_preview_ready: 'Превью снимка готово',
+  favorite_selected: 'Выбрано избранное',
+  paywall_viewed: 'Просмотр платной стены',
+  pack_selected: 'Выбран пакет',
+  pay_initiated: 'Платёж инициирован',
+  pay_success: 'Платёж успешен',
+  hd_delivered: 'HD доставлен',
+  button_click: 'Нажатие кнопки',
+  traffic_start: 'Старт трафика',
+  collection_started: 'Сбор начат',
+  choose_best_variant: 'Выбор лучшего варианта',
+  favorites_auto_add: 'Автодобавление в избранное',
+  trend_favorite_selected: 'Выбран избранный тренд',
+  payment_pack: 'Платёж за пакет',
+  payment_unlock: 'Платёж за разблокировку',
+  pay_failed: 'Платёж не прошёл',
+  referral_start: 'Реферал старт',
+  referral_attributed: 'Реферал атрибутирован',
+  referral_invite_view: 'Просмотр инвайта реферала',
+  referral_link_created: 'Создана реф. ссылка',
+  referral_first_pay_success: 'Первый платёж реферала',
+  referral_bonus_pending: 'Реф. бонус в ожидании',
+  referral_bonus_spent: 'Реф. бонус потрачен',
+  copy_flow_reference_analyzed: 'Анализ референса (copy flow)',
+  photo_merge_started: 'Склейка фото начата',
+  photo_merge_count_selected: 'Выбрано кол-во для склейки',
+  photo_merge_photo_uploaded: 'Фото для склейки загружено',
+  unlock_with_tokens: 'Разблокировка токенами',
+  trial_to_studio_upgrade_success: 'Апгрейд trial → studio',
+  take_previews_ready: 'Превью снимков готовы',
+  generation_likeness_feedback: 'Оценка похожести генерации',
 }
 
 const ENTITY_LABELS: Record<string, string> = {
@@ -126,8 +176,22 @@ const ENTITY_LABELS: Record<string, string> = {
   trend: 'Тренд',
   job: 'Задача',
   user: 'Пользователь',
+  take: 'Снимок (Take)',
   trend_prompt: 'Промпт тренда',
   temp_files: 'Временные файлы',
+  payment: 'Платёж',
+  favorite: 'Избранное',
+  pack: 'Пакет',
+  referral_bonus: 'Реф. бонус',
+  photo_merge_job: 'Склейка фото',
+  theme: 'Тематика',
+  security_settings: 'Настройки безопасности',
+  settings: 'Настройки',
+  traffic_source: 'Источник трафика',
+  ad_campaign: 'Рекламная кампания',
+  trend_post: 'Пост тренда',
+  unlock_order: 'Заказ разблокировки',
+  pack_order: 'Заказ пакета',
 }
 
 function fallbackCopyText(text: string): boolean {
@@ -288,7 +352,7 @@ function AuditDetailPanel({
       <SheetContent side="right" className="flex w-full flex-col sm:max-w-2xl">
         <SheetHeader className="shrink-0 space-y-2 border-b pb-4">
           <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="secondary">{ACTION_LABELS[action] ?? action}</Badge>
+            <Badge variant="secondary">{action != null ? (ACTION_LABELS[action] ?? action) : '—'}</Badge>
             <span className="text-muted-foreground text-sm">
               {formatDate(log.created_at)}
               {log.entity_id && ` · ${log.entity_type} ${log.entity_id}`}
@@ -487,7 +551,7 @@ function AuditDetailPanel({
 
 function ActorIcon({ type }: { type: string }) {
   if (type === 'user') return <User className="h-3.5 w-3.5 text-blue-500" />
-  if (type === 'admin') return <Shield className="h-3.5 w-3.5 text-amber-500" />
+  if (type === 'admin') return <Shield className="h-3.5 w-3.5 text-warning" />
   return <Cpu className="h-3.5 w-3.5 text-muted-foreground" />
 }
 
@@ -502,6 +566,59 @@ function TableSkeleton() {
 }
 
 const LIVE_REFETCH_INTERVAL_MS = 15_000
+const AUDIT_FILTER_INPUT_MAX_LENGTH = 128
+/** Часов для статистики «всё время» (≈100 лет) */
+const AUDIT_STATS_ALL_TIME_HOURS = 876000
+
+function humanizeActionKey(key: string): string {
+  return key.replace(/_/g, ' ')
+}
+
+/** Параметры списка аудита — без ограничения по дате (логи за всё время). */
+function buildAuditListParams(p: {
+  page: number
+  actorType: string
+  action: string
+  entityType: string
+  audienceFilter: string
+  search: string
+  userIdFilter: string
+  sessionIdFilter: string
+}) {
+  const params: Record<string, string | number> = { page: p.page, page_size: 30 }
+  if (p.actorType !== 'all') params.actor_type = p.actorType
+  if (p.action !== 'all') params.action = p.action
+  if (p.entityType !== 'all') params.entity_type = p.entityType
+  if (p.audienceFilter !== 'all') params.audience = p.audienceFilter
+  const searchTrim = p.search.trim()
+  if (searchTrim) params.search = searchTrim
+  const uidTrim = p.userIdFilter.trim().slice(0, AUDIT_FILTER_INPUT_MAX_LENGTH)
+  if (uidTrim) params.user_id = uidTrim
+  const sidTrim = p.sessionIdFilter.trim().slice(0, AUDIT_FILTER_INPUT_MAX_LENGTH)
+  if (sidTrim) params.session_id = sidTrim
+  return params
+}
+
+/** Параметры аналитики аудита — без ограничения по дате (за всё время). */
+function buildAuditAnalyticsParams(p: {
+  actorType: string
+  action: string
+  entityType: string
+  audienceFilter: string
+  userIdFilter: string
+  sessionIdFilter: string
+}) {
+  const params: Record<string, string> = {}
+  if (p.actorType !== 'all') params.actor_type = p.actorType
+  if (p.action !== 'all') params.action = p.action
+  if (p.entityType !== 'all') params.entity_type = p.entityType
+  if (p.audienceFilter !== 'all') params.audience = p.audienceFilter
+  const uidTrim = p.userIdFilter.trim().slice(0, AUDIT_FILTER_INPUT_MAX_LENGTH)
+  if (uidTrim) params.user_id = uidTrim
+  const sidTrim = p.sessionIdFilter.trim().slice(0, AUDIT_FILTER_INPUT_MAX_LENGTH)
+  if (sidTrim) params.session_id = sidTrim
+  return params
+}
 
 export function AuditPage() {
   const [page, setPage] = useState(1)
@@ -509,63 +626,90 @@ export function AuditPage() {
   const [action, setAction] = useState('all')
   const [entityType, setEntityType] = useState('all')
   const [audienceFilter, setAudienceFilter] = useState('all')
-  const [datePreset, setDatePreset] = useState('168')
   const [search, setSearch] = useState('')
+  const [userIdFilter, setUserIdFilter] = useState('')
+  const [sessionIdFilter, setSessionIdFilter] = useState('')
   const [selectedLog, setSelectedLog] = useState<AuditLogType | null>(null)
   const [liveEnabled, setLiveEnabled] = useState(false)
 
-  const dateTo = new Date()
-  const dateFrom = new Date()
-  dateFrom.setTime(dateFrom.getTime() - Number(datePreset) * 60 * 60 * 1000)
+  const { data: filtersData, isError: filtersError } = useQuery({
+    queryKey: ['audit-filters'],
+    queryFn: () => auditService.getFilters({ window_days: 90 }),
+    staleTime: 5 * 60 * 1000,
+  })
+  const actionOptions = (filtersData?.actions?.length ? filtersData.actions : ACTIONS).slice().sort()
+  const entityTypeOptions = (filtersData?.entity_types?.length ? filtersData.entity_types : ENTITY_TYPES).slice().sort()
+  const usingFiltersFallback = filtersError || !filtersData?.actions?.length
 
   const { data: stats } = useQuery({
-    queryKey: ['audit-stats', datePreset],
-    queryFn: () => auditService.getStats(Number(datePreset)),
+    queryKey: ['audit-stats'],
+    queryFn: () => auditService.getStats(AUDIT_STATS_ALL_TIME_HOURS),
     refetchInterval: liveEnabled ? LIVE_REFETCH_INTERVAL_MS : false,
   })
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['audit', page, actorType, action, entityType, audienceFilter, datePreset, search],
+  const {
+    data,
+    isLoading,
+    isError: listError,
+    error: listErrorDetail,
+    refetch: refetchList,
+  } = useQuery({
+    queryKey: ['audit', page, actorType, action, entityType, audienceFilter, search, userIdFilter, sessionIdFilter],
     queryFn: () =>
-      auditService.list({
-        page,
-        page_size: 30,
-        actor_type: actorType !== 'all' ? actorType : undefined,
-        action: action !== 'all' ? action : undefined,
-        entity_type: entityType !== 'all' ? entityType : undefined,
-        audience: audienceFilter !== 'all' ? audienceFilter : undefined,
-        date_from: dateFrom.toISOString(),
-        date_to: dateTo.toISOString(),
-        search: search.trim() || undefined,
-      }),
+      auditService.list(
+        buildAuditListParams({
+          page,
+          actorType,
+          action,
+          entityType,
+          audienceFilter,
+          search,
+          userIdFilter,
+          sessionIdFilter,
+        })
+      ),
     refetchInterval: liveEnabled ? LIVE_REFETCH_INTERVAL_MS : false,
   })
 
   const { data: analytics } = useQuery<AuditAnalytics>({
-    queryKey: ['audit-analytics', datePreset, actorType, action, entityType, audienceFilter],
+    queryKey: ['audit-analytics', actorType, action, entityType, audienceFilter, userIdFilter, sessionIdFilter],
     queryFn: () =>
-      auditService.getAnalytics({
-        date_from: dateFrom.toISOString(),
-        date_to: dateTo.toISOString(),
-        actor_type: actorType !== 'all' ? actorType : undefined,
-        action: action !== 'all' ? action : undefined,
-        entity_type: entityType !== 'all' ? entityType : undefined,
-        audience: audienceFilter !== 'all' ? audienceFilter : undefined,
-      }),
+      auditService.getAnalytics(
+        buildAuditAnalyticsParams({
+          actorType,
+          action,
+          entityType,
+          audienceFilter,
+          userIdFilter,
+          sessionIdFilter,
+        })
+      ),
   })
 
   const items = (data?.items ?? []) as AuditLogType[]
-  const isEmpty = !isLoading && items.length === 0
+  const isEmpty = !isLoading && !listError && items.length === 0
 
   const eventsByDayChart = (analytics?.events_by_day ?? []).map((d) => ({
     date: d.date ? d.date.slice(0, 10) : '',
-    count: d.count,
+    count: Number(d?.count ?? 0),
     full: d.date,
   }))
   const byActionChart = Object.entries(analytics?.by_action ?? {}).map(([actionKey, count]) => ({
     name: ACTION_LABELS[actionKey] ?? actionKey,
-    count,
+    count: Number(count ?? 0),
   }))
+
+  const todayStr = new Date().toISOString().slice(0, 10)
+  const todayCount = (analytics?.events_by_day ?? []).find((d) => d.date?.slice(0, 10) === todayStr)?.count ?? 0
+  const byAction = analytics?.by_action ?? {}
+  const topActionEntry = Object.entries(byAction).length
+    ? Object.entries(byAction).sort((a, b) => Number(b[1] ?? 0) - Number(a[1] ?? 0))[0]
+    : null
+  const ERROR_ACTIONS = new Set(['job_failed', 'pay_failed', 'unlock_delivery_failed'])
+  const errorsCount = Object.entries(byAction).reduce(
+    (sum, [action, count]) => sum + (ERROR_ACTIONS.has(action) ? Number(count ?? 0) : 0),
+    0
+  )
 
   return (
     <div className="space-y-6">
@@ -578,36 +722,56 @@ export function AuditPage() {
         </p>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card>
           <CardContent className="p-4">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium text-muted-foreground">
-                  {datePreset === '24' ? '24 ч' : datePreset === '168' ? '7 д' : '30 д'}
-                </p>
+                <p className="text-sm font-medium text-muted-foreground">Всего записей</p>
                 <p className="text-2xl font-bold">{stats?.total ?? 0}</p>
               </div>
               <Activity className="h-8 w-8 text-violet-500/60" />
             </div>
           </CardContent>
         </Card>
-        {stats?.by_actor_type &&
-          Object.entries(stats.by_actor_type).map(([k, v]) => (
-            <Card key={k}>
-              <CardContent className="p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm font-medium text-muted-foreground">
-                      {k === 'user' ? 'Пользователи' : k === 'admin' ? 'Админ' : 'Система'}
-                    </p>
-                    <p className="text-2xl font-bold">{Number(v)}</p>
-                  </div>
-                  <ActorIcon type={k} />
-                </div>
-              </CardContent>
-            </Card>
-          ))}
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-muted-foreground">За сегодня</p>
+                <p className="text-2xl font-bold">{Number(todayCount)}</p>
+              </div>
+              <BarChart3 className="h-8 w-8 text-cyan-500/60" />
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between">
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-muted-foreground">Топ действие</p>
+                <p className="text-2xl font-bold truncate" title={topActionEntry ? ACTION_LABELS[topActionEntry[0]] ?? topActionEntry[0] : '—'}>
+                  {topActionEntry ? (ACTION_LABELS[topActionEntry[0]] ?? topActionEntry[0]) : '—'}
+                </p>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  {topActionEntry ? `${Number(topActionEntry[1])} записей` : 'нет данных'}
+                </p>
+              </div>
+              <TrendingUp className="h-8 w-8 shrink-0 text-amber-500/60" />
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-muted-foreground">Ошибки (job / pay / unlock)</p>
+                <p className="text-2xl font-bold">{errorsCount}</p>
+              </div>
+              <AlertCircle className="h-8 w-8 text-destructive/60" />
+            </div>
+          </CardContent>
+        </Card>
       </div>
 
       <Tabs defaultValue="journal" className="space-y-4">
@@ -624,16 +788,6 @@ export function AuditPage() {
               <Filter className="h-4 w-4 text-muted-foreground" />
               <span className="text-sm font-medium">Фильтры</span>
             </div>
-            <Select value={datePreset} onValueChange={(v) => { setDatePreset(v); setPage(1) }}>
-              <SelectTrigger className="w-28">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {DATE_PRESETS.map((p) => (
-                  <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
             <Button
               type="button"
               variant={liveEnabled ? 'default' : 'outline'}
@@ -653,6 +807,21 @@ export function AuditPage() {
                 className="pl-8"
               />
             </div>
+            <Input
+              placeholder="User UUID"
+              title="Внутренний ID пользователя (users.id), не Telegram ID"
+              value={userIdFilter}
+              onChange={(e) => { setUserIdFilter(e.target.value.slice(0, AUDIT_FILTER_INPUT_MAX_LENGTH)); setPage(1) }}
+              className="w-28 font-mono text-xs"
+              maxLength={AUDIT_FILTER_INPUT_MAX_LENGTH}
+            />
+            <Input
+              placeholder="Session ID"
+              value={sessionIdFilter}
+              onChange={(e) => { setSessionIdFilter(e.target.value.slice(0, AUDIT_FILTER_INPUT_MAX_LENGTH)); setPage(1) }}
+              className="w-28 font-mono text-xs"
+              maxLength={AUDIT_FILTER_INPUT_MAX_LENGTH}
+            />
             <Select value={actorType} onValueChange={(v) => { setActorType(v); setPage(1) }}>
               <SelectTrigger className="w-36">
                 <SelectValue placeholder="Актор" />
@@ -669,8 +838,8 @@ export function AuditPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">Все действия</SelectItem>
-                {ACTIONS.map((a) => (
-                  <SelectItem key={a} value={a}>{ACTION_LABELS[a] ?? a}</SelectItem>
+                {actionOptions.map((a) => (
+                  <SelectItem key={a} value={a}>{ACTION_LABELS[a] ?? humanizeActionKey(a)}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
@@ -680,8 +849,8 @@ export function AuditPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">Все сущности</SelectItem>
-                {ENTITY_TYPES.map((e) => (
-                  <SelectItem key={e} value={e}>{ENTITY_LABELS[e] ?? e}</SelectItem>
+                {entityTypeOptions.map((e) => (
+                  <SelectItem key={e} value={e}>{ENTITY_LABELS[e] ?? humanizeActionKey(e)}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
@@ -695,11 +864,20 @@ export function AuditPage() {
                 ))}
               </SelectContent>
             </Select>
+            {usingFiltersFallback && (
+              <span className="text-muted-foreground text-xs">Списки действий/сущностей — из резервного набора</span>
+            )}
           </div>
         </CardHeader>
         <CardContent>
           {isLoading ? (
             <TableSkeleton />
+          ) : listError ? (
+            <div className="flex flex-col items-center justify-center py-16 text-center gap-3">
+              <p className="text-destructive font-medium">Не удалось загрузить журнал</p>
+              <p className="text-muted-foreground text-sm">{listErrorDetail instanceof Error ? listErrorDetail.message : 'Ошибка сети или сервера'}</p>
+              <Button variant="outline" size="sm" onClick={() => refetchList()}>Повторить</Button>
+            </div>
           ) : isEmpty ? (
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <p className="text-muted-foreground">Записей не найдено</p>
@@ -749,14 +927,14 @@ export function AuditPage() {
                       </TableCell>
                       <TableCell>
                         <Badge variant="secondary" className="font-normal">
-                          {ACTION_LABELS[log.action] ?? log.action}
+                          {log.action != null ? (ACTION_LABELS[log.action] ?? log.action) : '—'}
                         </Badge>
                       </TableCell>
                       <TableCell className="text-muted-foreground text-sm">
                         {log.payload?.audience != null ? (AUDIENCE_LABELS[String(log.payload.audience)] ?? String(log.payload.audience)) : '—'}
                       </TableCell>
                       <TableCell className="text-muted-foreground text-sm">
-                        {ENTITY_LABELS[log.entity_type] ?? log.entity_type}
+                        {log.entity_type != null ? (ENTITY_LABELS[log.entity_type] ?? log.entity_type) : '—'}
                       </TableCell>
                       <TableCell className="font-mono text-xs text-muted-foreground">
                         {log.entity_id ? `${String(log.entity_id).slice(0, 8)}…` : '—'}

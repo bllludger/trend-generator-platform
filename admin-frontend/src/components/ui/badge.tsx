@@ -13,9 +13,9 @@ const Badge = React.forwardRef<HTMLDivElement, BadgeProps>(
       secondary: 'bg-secondary text-secondary-foreground',
       outline: 'border border-input bg-background hover:bg-accent hover:text-accent-foreground',
       destructive: 'bg-destructive text-destructive-foreground',
-      success: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100',
-      warning: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-100',
-      error: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-100',
+      success: 'bg-success/10 text-success',
+      warning: 'bg-warning/10 text-warning',
+      error: 'bg-destructive/10 text-destructive',
       info: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-100',
     }
 
@@ -23,7 +23,7 @@ const Badge = React.forwardRef<HTMLDivElement, BadgeProps>(
       <div
         ref={ref}
         className={cn(
-          'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
+          'inline-flex items-center rounded-full px-3 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
           variants[variant],
           className
         )}

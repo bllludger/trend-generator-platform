@@ -419,7 +419,7 @@ export function SecurityPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-red-600 to-orange-600 bg-clip-text text-transparent">
+        <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-destructive to-orange-600 bg-clip-text text-transparent">
           Security & Moderation
         </h1>
         <p className="text-muted-foreground mt-2">
@@ -442,10 +442,10 @@ export function SecurityPage() {
                 <div className="flex items-center justify-between">
                   <div>
                     <p className="text-sm font-medium text-muted-foreground">Забанено</p>
-                    <p className="text-3xl font-bold text-red-600">{overviewTyped?.banned_count ?? 0}</p>
+                    <p className="text-3xl font-bold text-destructive">{overviewTyped?.banned_count ?? 0}</p>
                   </div>
-                  <div className="p-3 rounded-xl bg-red-100">
-                    <Ban className="h-6 w-6 text-red-600" />
+                  <div className="p-3 rounded-xl bg-destructive/10">
+                    <Ban className="h-6 w-6 text-destructive" />
                   </div>
                 </div>
               </CardContent>
@@ -481,10 +481,10 @@ export function SecurityPage() {
                 <div className="flex items-center justify-between">
                   <div>
                     <p className="text-sm font-medium text-muted-foreground">Модераторы</p>
-                    <p className="text-3xl font-bold text-emerald-600">{overviewTyped?.moderators_count ?? 0}</p>
+                    <p className="text-3xl font-bold text-success">{overviewTyped?.moderators_count ?? 0}</p>
                   </div>
-                  <div className="p-3 rounded-xl bg-emerald-100">
-                    <UserCheck className="h-6 w-6 text-emerald-600" />
+                  <div className="p-3 rounded-xl bg-success/10">
+                    <UserCheck className="h-6 w-6 text-success" />
                   </div>
                 </div>
                 <p className="text-xs text-muted-foreground mt-1">Без лимитов</p>
@@ -578,7 +578,6 @@ export function SecurityPage() {
                         <TableHead>Статус</TableHead>
                         <TableHead>Модератор</TableHead>
                         <TableHead>Rate Limit</TableHead>
-                        <TableHead>Подписка</TableHead>
                         <TableHead>Jobs</TableHead>
                         <TableHead>Действия</TableHead>
                       </TableRow>
@@ -609,7 +608,7 @@ export function SecurityPage() {
                           <TableCell>{getStatusBadge(user)}</TableCell>
                           <TableCell>
                             {user.is_moderator ? (
-                              <Badge variant="secondary" className="bg-emerald-100 text-emerald-700">
+                              <Badge variant="secondary" className="bg-success/10 text-success">
                                 <UserCheck className="h-3 w-3 mr-1" /> Модератор
                               </Badge>
                             ) : (
@@ -637,13 +636,6 @@ export function SecurityPage() {
                               <Badge variant="outline">{user.rate_limit_per_hour}/ч</Badge>
                             ) : (
                               <span className="text-muted-foreground text-sm" title="По умолчанию (Free/PRO)">—</span>
-                            )}
-                          </TableCell>
-                          <TableCell>
-                            {user.subscription_active ? (
-                              <Badge variant="success">PRO</Badge>
-                            ) : (
-                              <span className="text-muted-foreground text-sm">Free</span>
                             )}
                           </TableCell>
                           <TableCell className="font-mono text-sm">
@@ -798,7 +790,7 @@ export function SecurityPage() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              {actionType === 'ban' && <><AlertTriangle className="h-5 w-5 text-red-600" /> Забанить пользователя</>}
+              {actionType === 'ban' && <><AlertTriangle className="h-5 w-5 text-destructive" /> Забанить пользователя</>}
               {actionType === 'unban' && <><CheckCircle2 className="h-5 w-5 text-green-600" /> Разбанить пользователя</>}
               {actionType === 'suspend' && <><Clock className="h-5 w-5 text-orange-600" /> Приостановить пользователя</>}
               {actionType === 'resume' && <><CheckCircle2 className="h-5 w-5 text-green-600" /> Возобновить доступ</>}

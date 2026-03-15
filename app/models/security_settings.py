@@ -14,7 +14,7 @@ class SecuritySettings(Base):
     free_requests_per_day = Column(Integer, nullable=False, default=10)
     free_generations_per_user = Column(Integer, nullable=False, default=3)  # 1 account = 3 free
     copy_generations_per_user = Column(Integer, nullable=False, default=1)  # «Сделать такую же»: 1 free
-    default_rate_limit_per_hour = Column(Integer, nullable=False, default=20)
+    default_rate_limit_per_hour = Column(Integer, nullable=False, default=60)
     subscriber_rate_limit_per_hour = Column(Integer, nullable=False, default=100)
     new_user_first_day_limit = Column(Integer, nullable=False, default=5)
     max_failures_before_auto_suspend = Column(Integer, nullable=False, default=15)

@@ -333,10 +333,10 @@ export function TrendPosterPage() {
         {/* Сводка для отслеживания (актуально на 2026) */}
         <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-1 rounded-lg border bg-muted/40 px-4 py-3 text-sm">
           <span className="font-medium text-foreground">
-            Новых: <span className="text-emerald-600 dark:text-emerald-400">{unpublishedWithExample.length}</span>
+            Новых: <span className="text-success">{unpublishedWithExample.length}</span>
           </span>
           <span className="font-medium text-foreground">
-            В канале: <span className="text-amber-600 dark:text-amber-400">{sentPosts.length}</span>
+            В канале: <span className="text-warning">{sentPosts.length}</span>
           </span>
           <span className="text-muted-foreground">
             Последняя отправка:{' '}
@@ -707,12 +707,12 @@ function SettingsTab({
         ) : (
           <>
             {!channelId.trim() && (
-              <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+              <div className="rounded-lg border border-warning/50 bg-warning/10 px-4 py-3 text-sm text-warning">
                 <strong>Публикация в канал не сработает, пока канал не задан.</strong> Введите @username или ID канала в поле ниже и нажмите «Сохранить настройки».
               </div>
             )}
             {channelId.trim() && !botUsername.trim() && (
-              <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+              <div className="rounded-lg border border-warning/50 bg-warning/10 px-4 py-3 text-sm text-warning">
                 <strong>Диплинка и кнопки «Попробовать» не будет</strong>, пока не указан username бота. Введите его в поле «Username бота» ниже и сохраните — тогда под каждым постом появится ссылка на тренд в боте.
               </div>
             )}
@@ -805,7 +805,7 @@ function UnpublishedCard({
     <Card>
       <CardContent className="pt-6">
         <div className="flex items-start justify-between gap-2 mb-2">
-          <Badge variant="secondary" className="shrink-0 bg-emerald-600/20 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-400">
+          <Badge variant="secondary" className="shrink-0 bg-success/20 text-success">
             Новое
           </Badge>
           {trend.deeplink ? (
@@ -886,7 +886,7 @@ function PublishedRow({
             <p className="font-medium truncate">
               {post.trend_emoji ?? ''} {post.trend_name ?? ''}
             </p>
-            <Badge variant="outline" className="shrink-0 text-amber-600 border-amber-300 dark:text-amber-400 dark:border-amber-600">
+            <Badge variant="outline" className="shrink-0 text-warning border-warning/50">
               В канале
             </Badge>
           </div>

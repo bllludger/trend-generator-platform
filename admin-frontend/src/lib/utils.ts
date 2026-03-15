@@ -24,6 +24,10 @@ export function formatDateShort(date: string | Date) {
   })
 }
 
-export function formatNumber(num: number) {
+/**
+ * Форматирует число для отображения. Безопасна к null/undefined/NaN — возвращает "—".
+ */
+export function formatNumber(num: number | null | undefined): string {
+  if (num == null || !Number.isFinite(num)) return '—'
   return new Intl.NumberFormat('ru-RU').format(num)
 }

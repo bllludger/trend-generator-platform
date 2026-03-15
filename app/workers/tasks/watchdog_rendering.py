@@ -14,6 +14,7 @@ from app.db.session import SessionLocal
 from app.models.favorite import Favorite
 from app.models.session import Session
 from app.services.audit.service import AuditService
+from app.utils.metrics import favorites_hd_stuck_rendering_reset_total
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ def reset_stuck_rendering() -> dict:
                 fav.hd_status = "none"
                 db.add(fav)
                 reset_count += 1
+            favorites_hd_stuck_rendering_reset_total.inc()
 
         db.commit()
 

@@ -17,6 +17,8 @@ class AuditService:
         entity_type: str,
         entity_id: str | None,
         payload: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
     ) -> AuditLog:
         entry = AuditLog(
             actor_type=actor_type,
@@ -25,6 +27,8 @@ class AuditService:
             entity_type=entity_type,
             entity_id=entity_id,
             payload=payload or {},
+            user_id=user_id,
+            session_id=session_id,
         )
         self.db.add(entry)
         self.db.commit()

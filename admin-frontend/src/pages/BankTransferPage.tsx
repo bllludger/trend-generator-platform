@@ -1,6 +1,12 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { bankTransferService, type BankTransferSettings, type BankTransferReceiptLogEntry } from '@/services/api'
+import {
+  bankTransferService,
+  paymentsService,
+  type BankTransferSettings,
+  type BankTransferReceiptLogEntry,
+  type BankTransferPayInitiatedEntry,
+} from '@/services/api'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -14,7 +20,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { CreditCard, Package, TrendingUp, Save, FileText, MessageSquare, ListChecks, ImageIcon, ChevronLeft, ChevronRight } from 'lucide-react'
+import { CreditCard, Package, TrendingUp, Save, FileText, MessageSquare, ListChecks, ChevronLeft, ChevronRight, Wallet, Send } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 
@@ -42,17 +48,107 @@ export function BankTransferPage() {
   const [receiptLogPageSize] = useState(20)
   const [receiptLogMatchFilter, setReceiptLogMatchFilter] = useState<boolean | ''>('')
   const [receiptLogTelegramFilter, setReceiptLogTelegramFilter] = useState('')
+  const [receiptLogExpectedRub, setReceiptLogExpectedRub] = useState<string>('')
+  const [receiptLogDateFrom, setReceiptLogDateFrom] = useState('')
+  const [receiptLogDateTo, setReceiptLogDateTo] = useState('')
 
-  const { data: receiptLogsData, isLoading: receiptLogsLoading } = useQuery({
-    queryKey: ['bank-transfer-receipt-logs', receiptLogPage, receiptLogPageSize, receiptLogMatchFilter, receiptLogTelegramFilter],
+  const [payInitiatedPage, setPayInitiatedPage] = useState(1)
+  const [payInitiatedDateFrom, setPayInitiatedDateFrom] = useState('')
+  const [payInitiatedDateTo, setPayInitiatedDateTo] = useState('')
+  const [payInitiatedPriceRub, setPayInitiatedPriceRub] = useState<string>('')
+  const [payInitiatedTelegramId, setPayInitiatedTelegramId] = useState('')
+
+  const [btPaymentsPage, setBtPaymentsPage] = useState(1)
+  const [btPaymentsDateFrom, setBtPaymentsDateFrom] = useState('')
+  const [btPaymentsDateTo, setBtPaymentsDateTo] = useState('')
+
+  const {
+    data: payInitiatedData,
+    isLoading: payInitiatedLoading,
+    isError: payInitiatedError,
+    error: payInitiatedErrorDetail,
+    refetch: refetchPayInitiated,
+  } = useQuery({
+    queryKey: [
+      'bank-transfer-pay-initiated',
+      payInitiatedPage,
+      payInitiatedDateFrom,
+      payInitiatedDateTo,
+      payInitiatedPriceRub,
+      payInitiatedTelegramId,
+    ],
+    queryFn: () =>
+      bankTransferService.getPayInitiated({
+        page: payInitiatedPage,
+        page_size: 20,
+        ...(payInitiatedDateFrom ? { date_from: payInitiatedDateFrom } : {}),
+        ...(payInitiatedDateTo ? { date_to: payInitiatedDateTo } : {}),
+        ...(payInitiatedPriceRub ? { price_rub: Number(payInitiatedPriceRub) } : {}),
+        ...(payInitiatedTelegramId.trim() ? { telegram_user_id: payInitiatedTelegramId.trim() } : {}),
+      }),
+    refetchInterval: 30_000,
+  })
+
+  const {
+    data: receiptLogsData,
+    isLoading: receiptLogsLoading,
+    isError: receiptLogsError,
+    error: receiptLogsErrorDetail,
+    refetch: refetchReceiptLogs,
+  } = useQuery({
+    queryKey: [
+      'bank-transfer-receipt-logs',
+      receiptLogPage,
+      receiptLogPageSize,
+      receiptLogMatchFilter,
+      receiptLogTelegramFilter,
+      receiptLogExpectedRub,
+      receiptLogDateFrom,
+      receiptLogDateTo,
+    ],
     queryFn: () =>
       bankTransferService.getReceiptLogs({
         page: receiptLogPage,
         page_size: receiptLogPageSize,
         ...(receiptLogMatchFilter !== '' ? { match_success: receiptLogMatchFilter as boolean } : {}),
         ...(receiptLogTelegramFilter.trim() ? { telegram_user_id: receiptLogTelegramFilter.trim() } : {}),
+        ...(receiptLogExpectedRub ? { expected_rub: Number(receiptLogExpectedRub) } : {}),
+        ...(receiptLogDateFrom ? { date_from: receiptLogDateFrom } : {}),
+        ...(receiptLogDateTo ? { date_to: receiptLogDateTo } : {}),
       }),
+    refetchInterval: 20_000,
   })
+
+  const {
+    data: btPaymentsData,
+    isLoading: btPaymentsLoading,
+    isError: btPaymentsError,
+    error: btPaymentsErrorDetail,
+    refetch: refetchBtPayments,
+  } = useQuery({
+    queryKey: ['bank-transfer-payments', btPaymentsPage, btPaymentsDateFrom, btPaymentsDateTo],
+    queryFn: () =>
+      paymentsService.list({
+        page: btPaymentsPage,
+        page_size: 20,
+        payment_method: 'bank_transfer',
+        ...(btPaymentsDateFrom ? { date_from: btPaymentsDateFrom } : {}),
+        ...(btPaymentsDateTo ? { date_to: btPaymentsDateTo } : {}),
+      }),
+    refetchInterval: 30_000,
+  })
+
+  useEffect(() => {
+    setPayInitiatedPage(1)
+  }, [payInitiatedDateFrom, payInitiatedDateTo, payInitiatedPriceRub, payInitiatedTelegramId])
+
+  useEffect(() => {
+    setReceiptLogPage(1)
+  }, [receiptLogMatchFilter, receiptLogTelegramFilter, receiptLogExpectedRub, receiptLogDateFrom, receiptLogDateTo])
+
+  useEffect(() => {
+    setBtPaymentsPage(1)
+  }, [btPaymentsDateFrom, btPaymentsDateTo])
 
   const handleOpenReceiptFile = async (logId: string) => {
     try {
@@ -262,12 +358,12 @@ export function BankTransferPage() {
             Тексты в боте
           </CardTitle>
           <p className="text-sm text-muted-foreground">
-            Тексты, которые видит пользователь в боте. Шаг 1 — описание способа оплаты и выбор тарифа. Шаг 2 — реквизиты; обязательно используйте плейсхолдер {'{receipt_code}'} (уникальный код «оплата № N»), иначе проверка комментария на чеке не сработает. Остальные плейсхолдеры: {'{pack_name}'}, {'{tokens}'}, {'{expected_rub}'}, {'{card}'}, {'{comment_line}'}. Сообщение при успехе: {'{pack_name}'}, {'{tokens}'}, {'{balance}'}. Сообщение при ошибке показывается при несовпадении суммы, карты, комментария или даты.
+            Тексты, которые видит пользователь в боте. Шаг 1 — описание способа оплаты и выбор пакета. Шаг 2 — реквизиты; обязательно используйте плейсхолдер {'{receipt_code}'} (уникальный код «оплата № N»), иначе проверка комментария на чеке не сработает. Остальные плейсхолдеры: {'{pack_name}'}, {'{tokens}'}, {'{expected_rub}'}, {'{card}'}, {'{comment_line}'}. Сообщение при успехе: {'{pack_name}'}, {'{tokens}'}, {'{balance}'}. Сообщение при ошибке показывается при несовпадении суммы, карты, комментария или даты.
           </p>
         </CardHeader>
         <CardContent className="space-y-4">
           <div>
-            <Label>Шаг 1 — описание (выбор тарифа)</Label>
+            <Label>Шаг 1 — описание (выбор пакета)</Label>
             <Textarea
               value={step1Description}
               onChange={(e) => setStep1Description(e.target.value)}
@@ -313,7 +409,7 @@ export function BankTransferPage() {
             Тарифы в боте (3 кнопки)
           </CardTitle>
           <p className="text-sm text-muted-foreground">
-            Первые 3 пакета по order_index. Меняются на странице <Link to="/packs" className="text-primary hover:underline">Пакеты (цены)</Link>.
+            Первые 3 пакета по order_index. Меняются на странице <Link to="/payments/packs" className="text-primary hover:underline">Пакеты (цены)</Link>.
           </p>
         </CardHeader>
         <CardContent>
@@ -351,6 +447,137 @@ export function BankTransferPage() {
         </CardContent>
       </Card>
 
+      {/* Инициации перевода (pay_initiated) */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Send className="h-5 w-5" />
+            Инициации перевода
+          </CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Кто и когда нажал на пакет в потоке «Оплата переводом» (до отправки чека). По дате и сумме (129, 199 ₽) можно найти пользователя.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">Период от:</Label>
+              <Input
+                type="date"
+                value={payInitiatedDateFrom}
+                onChange={(e) => setPayInitiatedDateFrom(e.target.value)}
+                className="w-40"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">до:</Label>
+              <Input
+                type="date"
+                value={payInitiatedDateTo}
+                onChange={(e) => setPayInitiatedDateTo(e.target.value)}
+                className="w-40"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">Сумма ₽:</Label>
+              <select
+                value={payInitiatedPriceRub}
+                onChange={(e) => setPayInitiatedPriceRub(e.target.value)}
+                className="h-9 rounded-md border border-input bg-background px-3 text-sm w-24"
+              >
+                <option value="">Все</option>
+                <option value="129">129</option>
+                <option value="199">199</option>
+              </select>
+            </div>
+            <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">Telegram ID:</Label>
+              <Input
+                placeholder="Опционально"
+                value={payInitiatedTelegramId}
+                onChange={(e) => setPayInitiatedTelegramId(e.target.value)}
+                className="w-36"
+              />
+            </div>
+          </div>
+          {payInitiatedLoading ? (
+            <div className="text-muted-foreground py-8">Загрузка…</div>
+          ) : payInitiatedError ? (
+            <div className="py-8 space-y-2">
+              <p className="text-destructive">
+                Не удалось загрузить данные.{' '}
+                {(payInitiatedErrorDetail as { response?: { data?: { detail?: string } } })?.response?.data?.detail && (
+                  <span className="text-muted-foreground font-normal">
+                    ({(payInitiatedErrorDetail as { response?: { data?: { detail?: string } } }).response?.data?.detail})
+                  </span>
+                )}
+              </p>
+              <Button variant="outline" size="sm" onClick={() => refetchPayInitiated()}>
+                Повторить
+              </Button>
+            </div>
+          ) : !payInitiatedData?.items?.length ? (
+            <div className="text-muted-foreground py-8">Записей нет. Задайте период (например 7 марта 2026).</div>
+          ) : (
+            <>
+              <div className="overflow-x-auto rounded-md border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Дата / время</TableHead>
+                      <TableHead>Telegram ID</TableHead>
+                      <TableHead>Username</TableHead>
+                      <TableHead>Пакет</TableHead>
+                      <TableHead className="text-right">Сумма ₽</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {payInitiatedData.items.map((row: BankTransferPayInitiatedEntry) => (
+                      <TableRow key={row.id}>
+                        <TableCell className="whitespace-nowrap text-muted-foreground">
+                          {row.timestamp
+                            ? new Date(row.timestamp).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' })
+                            : '—'}
+                        </TableCell>
+                        <TableCell className="font-mono text-sm">{row.telegram_id ?? row.user_id ?? '—'}</TableCell>
+                        <TableCell>{row.telegram_username ? `@${row.telegram_username}` : '—'}</TableCell>
+                        <TableCell className="font-mono text-xs">{row.pack_id ?? '—'}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.price_rub != null ? `${row.price_rub} ₽` : '—'}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+              {(payInitiatedData.pages ?? Math.ceil((payInitiatedData.total || 0) / 20)) > 1 && (
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-muted-foreground">
+                    Всего {payInitiatedData.total}, стр. {payInitiatedPage} из {payInitiatedData.pages ?? Math.ceil((payInitiatedData.total || 0) / 20)}
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={payInitiatedPage <= 1}
+                      onClick={() => setPayInitiatedPage((p) => p - 1)}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={payInitiatedPage >= (payInitiatedData.pages ?? Math.ceil((payInitiatedData.total || 0) / 20))}
+                      onClick={() => setPayInitiatedPage((p) => p + 1)}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </CardContent>
+      </Card>
+
       {/* Лог проверки чеков */}
       <Card>
         <CardHeader>
@@ -379,6 +606,36 @@ export function BankTransferPage() {
               </select>
             </div>
             <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">Сумма (ожид.) ₽:</Label>
+              <select
+                value={receiptLogExpectedRub}
+                onChange={(e) => setReceiptLogExpectedRub(e.target.value)}
+                className="h-9 rounded-md border border-input bg-background px-3 text-sm w-24"
+              >
+                <option value="">Все</option>
+                <option value="129">129</option>
+                <option value="199">199</option>
+              </select>
+            </div>
+            <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">Период от:</Label>
+              <Input
+                type="date"
+                value={receiptLogDateFrom}
+                onChange={(e) => setReceiptLogDateFrom(e.target.value)}
+                className="w-40"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">до:</Label>
+              <Input
+                type="date"
+                value={receiptLogDateTo}
+                onChange={(e) => setReceiptLogDateTo(e.target.value)}
+                className="w-40"
+              />
+            </div>
+            <div className="flex items-center gap-2">
               <Label className="text-muted-foreground whitespace-nowrap">Telegram ID:</Label>
               <Input
                 placeholder="Фильтр по user_id"
@@ -391,6 +648,20 @@ export function BankTransferPage() {
 
           {receiptLogsLoading ? (
             <div className="text-muted-foreground py-8">Загрузка лога…</div>
+          ) : receiptLogsError ? (
+            <div className="py-8 space-y-2">
+              <p className="text-destructive">
+                Не удалось загрузить лог чеков.{' '}
+                {(receiptLogsErrorDetail as { response?: { data?: { detail?: string } } })?.response?.data?.detail && (
+                  <span className="text-muted-foreground font-normal">
+                    ({(receiptLogsErrorDetail as { response?: { data?: { detail?: string } } }).response?.data?.detail})
+                  </span>
+                )}
+              </p>
+              <Button variant="outline" size="sm" onClick={() => refetchReceiptLogs()}>
+                Повторить
+              </Button>
+            </div>
           ) : !receiptLogsData?.items?.length ? (
             <div className="text-muted-foreground py-8">Записей пока нет.</div>
           ) : (
@@ -413,7 +684,7 @@ export function BankTransferPage() {
                       <TableHead>Пакет</TableHead>
                       <TableHead>Платёж</TableHead>
                       <TableHead>Ошибка</TableHead>
-                      <TableHead></TableHead>
+                      <TableHead className="text-center whitespace-nowrap" title="Открыть изображение чека">Скрин</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -493,14 +764,14 @@ export function BankTransferPage() {
                             {String(log.error_message ?? '') || '—'}
                           </span>
                         </TableCell>
-                        <TableCell>
+                        <TableCell className="text-center">
                           <Button
-                            variant="ghost"
+                            variant="outline"
                             size="sm"
                             onClick={() => handleOpenReceiptFile(log.id)}
-                            title="Открыть скрин чека"
+                            title="Открыть скриншот чека"
                           >
-                            <ImageIcon className="h-4 w-4" />
+                            Скрин
                           </Button>
                         </TableCell>
                       </TableRow>
@@ -527,6 +798,120 @@ export function BankTransferPage() {
                       size="sm"
                       disabled={receiptLogPage >= (receiptLogsData.pages ?? Math.ceil(receiptLogsData.total / 20))}
                       onClick={() => setReceiptLogPage((p) => p + 1)}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Успешные платежи переводом */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Wallet className="h-5 w-5" />
+            Успешные платежи переводом
+          </CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Завершённые оплаты переводом на карту (чек принят). Фильтр по периоду. Статус «completed» = пакет активирован. Сопоставьте Telegram ID с блоком «Инициации перевода», чтобы увидеть, кто инициировал и кто довёл до оплаты.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">Период от:</Label>
+              <Input
+                type="date"
+                value={btPaymentsDateFrom}
+                onChange={(e) => setBtPaymentsDateFrom(e.target.value)}
+                className="w-40"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Label className="text-muted-foreground whitespace-nowrap">до:</Label>
+              <Input
+                type="date"
+                value={btPaymentsDateTo}
+                onChange={(e) => setBtPaymentsDateTo(e.target.value)}
+                className="w-40"
+              />
+            </div>
+          </div>
+          {btPaymentsLoading ? (
+            <div className="text-muted-foreground py-8">Загрузка…</div>
+          ) : btPaymentsError ? (
+            <div className="py-8 space-y-2">
+              <p className="text-destructive">
+                Не удалось загрузить платежи.{' '}
+                {(btPaymentsErrorDetail as { response?: { data?: { detail?: string } } })?.response?.data?.detail && (
+                  <span className="text-muted-foreground font-normal">
+                    ({(btPaymentsErrorDetail as { response?: { data?: { detail?: string } } }).response?.data?.detail})
+                  </span>
+                )}
+              </p>
+              <Button variant="outline" size="sm" onClick={() => refetchBtPayments()}>
+                Повторить
+              </Button>
+            </div>
+          ) : !btPaymentsData?.items?.length ? (
+            <div className="text-muted-foreground py-8">Платежей нет за выбранный период.</div>
+          ) : (
+            <>
+              <div className="overflow-x-auto rounded-md border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Дата</TableHead>
+                      <TableHead>Telegram ID</TableHead>
+                      <TableHead>Username</TableHead>
+                      <TableHead>Пакет</TableHead>
+                      <TableHead className="text-right">Сумма</TableHead>
+                      <TableHead>Статус</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {btPaymentsData.items.map((p: { id: string; created_at?: string; telegram_id?: string; username?: string; pack_id?: string; amount_kopecks?: number; status?: string }) => (
+                      <TableRow key={p.id}>
+                        <TableCell className="whitespace-nowrap text-muted-foreground">
+                          {p.created_at
+                            ? new Date(p.created_at).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' })
+                            : '—'}
+                        </TableCell>
+                        <TableCell className="font-mono text-sm">{p.telegram_id ?? '—'}</TableCell>
+                        <TableCell>{p.username ? `@${p.username}` : '—'}</TableCell>
+                        <TableCell className="font-mono text-xs">{p.pack_id ?? '—'}</TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {p.amount_kopecks != null ? `${(p.amount_kopecks / 100).toFixed(2)} ₽` : '—'}
+                        </TableCell>
+                        <TableCell>{p.status ?? '—'}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+              {(btPaymentsData.pages ?? Math.ceil((btPaymentsData.total || 0) / 20)) > 1 && (
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-muted-foreground">
+                    Всего {btPaymentsData.total}, стр. {btPaymentsPage} из {btPaymentsData.pages ?? Math.ceil((btPaymentsData.total || 0) / 20)}
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={btPaymentsPage <= 1}
+                      onClick={() => setBtPaymentsPage((p) => p - 1)}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={btPaymentsPage >= (btPaymentsData.pages ?? Math.ceil((btPaymentsData.total || 0) / 20))}
+                      onClick={() => setBtPaymentsPage((p) => p + 1)}
                     >
                       <ChevronRight className="h-4 w-4" />
                     </Button>

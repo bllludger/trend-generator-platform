@@ -14,6 +14,7 @@ from app.services.telegram_messages.runtime import runtime_templates
 from app.utils.metrics import (
     telegram_requests_total,
     telegram_request_duration_seconds,
+    telegram_send_failures_total,
 )
 
 
@@ -43,6 +44,8 @@ class TelegramClient:
     def _record_request(self, method: str, status: str, duration: float) -> None:
         telegram_requests_total.labels(method=method, status=status).inc()
         telegram_request_duration_seconds.labels(method=method).observe(duration)
+        if status == "error":
+            telegram_send_failures_total.labels(method=method).inc()
 
     def _api_call(self, method: str, data: dict | None = None, files: dict | None = None) -> dict:
         """Make API call to Telegram."""
@@ -121,6 +124,17 @@ class TelegramClient:
             self._record_request("sendChatAction", "error", time.time() - start)
             logger.warning("Failed to send chat action", extra={"error": str(e), "chat_id": chat_id, "action": action})
 
+    def _mime_for_photo_path(self, path: str) -> str:
+        """MIME по расширению файла. Preview — всегда JPEG/WebP; original — может быть PNG. Наружу отдаём только preview."""
+        lower = (path.split("/")[-1] if path else "").lower()
+        if lower.endswith(".webp"):
+            return "image/webp"
+        if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+            return "image/jpeg"
+        if lower.endswith(".png"):
+            return "image/png"
+        return "image/jpeg"
+
     def send_photo(
         self,
         chat_id: str,
@@ -130,14 +144,16 @@ class TelegramClient:
         parse_mode: str | None = None,
     ) -> dict:
         """Send photo to chat. reply_markup — inline-клавиатура. Returns API result (e.g. message_id in result).
-        При 429 (Too Many Requests) ждём retry_after секунд и повторяем один раз."""
+        При 429 (Too Many Requests) ждём retry_after секунд и повторяем один раз.
+        MIME определяется по расширению файла (preview = .webp/.jpg)."""
         start = time.time()
         last_error = None
+        mime = self._mime_for_photo_path(photo_path)
         for attempt in range(2):
             try:
                 chat_id_val = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
                 with open(photo_path, "rb") as f:
-                    files = {"photo": (photo_path.split("/")[-1], f, "image/png")}
+                    files = {"photo": (photo_path.split("/")[-1], f, mime)}
                     data = {"chat_id": chat_id_val}
                     if caption:
                         data["caption"] = runtime_templates.resolve_literal(caption)
@@ -169,36 +185,42 @@ class TelegramClient:
         chat_id: str,
         media: list[dict],
     ) -> dict:
-        """Send media group (album) to chat. Each item: {type, media_path, caption?}."""
+        """Send media group (album) to chat. Each item: {type, media_path, caption?}.
+        MIME по расширению каждого файла (preview = .webp/.jpg). Telegram требует 2–10 элементов."""
+        if not 2 <= len(media) <= 10:
+            raise ValueError("send_media_group requires 2–10 items")
         start = time.time()
+        input_media = []
+        files = {}
         try:
-            input_media = []
-            files = {}
             for i, item in enumerate(media):
                 attach_key = f"photo_{i}"
+                media_path = item["media_path"]
+                mime = self._mime_for_photo_path(media_path)
                 input_media.append({
                     "type": item.get("type", "photo"),
                     "media": f"attach://{attach_key}",
                     "caption": item.get("caption", ""),
                 })
-                f = open(item["media_path"], "rb")
-                files[attach_key] = (item["media_path"].split("/")[-1], f, "image/png")
+                f = open(media_path, "rb")
+                files[attach_key] = (media_path.split("/")[-1], f, mime)
             data = {
                 "chat_id": str(int(chat_id)),
                 "media": json.dumps(input_media),
             }
             result = self._api_call("sendMediaGroup", data=data, files=files)
             self._record_request("sendMediaGroup", "success", time.time() - start)
-            for key in files:
-                try:
-                    files[key][1].close()
-                except Exception:
-                    pass
             return result
         except Exception as e:
             self._record_request("sendMediaGroup", "error", time.time() - start)
             logger.error("Failed to send media group", extra={"error": str(e), "chat_id": chat_id})
             raise
+        finally:
+            for key in files:
+                try:
+                    files[key][1].close()
+                except Exception:
+                    pass
 
     def send_document(
         self,

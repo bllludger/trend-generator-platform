@@ -26,10 +26,10 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 
 const ECONOMY_HELP = `Как работает экономика:
-• Бесплатно: N генераций с watermark и M раз «Сделать такую же» (настраивается в Security).
+• Бесплатно: N фото с водяным знаком и M раз «Сделать такую же» (настраивается в Security).
 • Токены: 1 генерация = 1 токен (GENERATION_COST_TOKENS в .env). Пользователь покупает пакеты за Stars → получает токены.
 • Пакеты: цены в Stars задаются здесь. В боте отображаются с примерным эквивалентом в рублях (STAR_TO_RUB).
-• Разблокировка: снять watermark с одного фото — за Stars (UNLOCK_COST_STARS) или за токены (UNLOCK_COST_TOKENS).`
+• Разблокировка: снять водяной знак с одного фото — за Stars (UNLOCK_COST_STARS) или с баланса фото (UNLOCK_COST_TOKENS).`
 
 export function PacksPage() {
   const queryClient = useQueryClient()
@@ -153,9 +153,9 @@ export function PacksPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-3xl font-bold tracking-tight">Пакеты генераций</h1>
+        <h1 className="text-3xl font-bold tracking-tight">Пакеты</h1>
         <p className="text-muted-foreground mt-2">
-          Цены в Telegram Stars. Эти пакеты показываются в боте в разделе «Купить генерации». Изменения применяются сразу.
+          Цены в Telegram Stars. Эти пакеты показываются в боте в разделе «Купить пакет». Изменения применяются сразу.
         </p>
       </div>
 
@@ -199,8 +199,8 @@ export function PacksPage() {
                   <TableHead>ID</TableHead>
                   <TableHead>Название</TableHead>
                   <TableHead>Тип / Подтип</TableHead>
-                  <TableHead>Снимки</TableHead>
-                  <TableHead>HD</TableHead>
+                  <TableHead>Фото</TableHead>
+                  <TableHead>4К</TableHead>
                   <TableHead>Цена (Stars)</TableHead>
                   <TableHead>Статус</TableHead>
                   <TableHead className="w-[120px]">Действия</TableHead>
@@ -287,7 +287,7 @@ export function PacksPage() {
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <Label>Токены (генераций)</Label>
+                <Label>Фото (в пакете)</Label>
                 <Input
                   type="number"
                   min={1}
@@ -310,7 +310,7 @@ export function PacksPage() {
               <Input
                 value={String(form.description ?? '')}
                 onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
-                placeholder="5 фото без watermark"
+                placeholder="5 фото без водяного знака"
               />
             </div>
             <div className="grid grid-cols-2 gap-4">
@@ -325,7 +325,7 @@ export function PacksPage() {
                 />
               </div>
               <div>
-                <Label>HD при покупке</Label>
+                <Label>4К при покупке</Label>
                 <Input
                   type="number"
                   min={0}
@@ -402,11 +402,11 @@ export function PacksPage() {
                         min={0}
                         value={form.favorites_cap != null ? Number(form.favorites_cap) : ''}
                         onChange={(e) => setForm((f) => ({ ...f, favorites_cap: e.target.value ? parseInt(e.target.value) : undefined }))}
-                        placeholder="Авто = hd_limit * 2"
+                        placeholder="Авто = 4К limit * 2"
                       />
                     </div>
                     <div>
-                      <Label>HD SLA (мин)</Label>
+                      <Label>4К SLA (мин)</Label>
                       <Input
                         type="number"
                         min={1}
@@ -490,7 +490,7 @@ export function PacksPage() {
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <Label>Токены (генераций) *</Label>
+                <Label>Фото (в пакете) *</Label>
                 <Input
                   type="number"
                   min={1}
@@ -513,7 +513,7 @@ export function PacksPage() {
               <Input
                 value={String(form.description ?? '')}
                 onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
-                placeholder="5 фото без watermark"
+                placeholder="5 фото без водяного знака"
               />
             </div>
             <div className="grid grid-cols-2 gap-4">
@@ -552,7 +552,7 @@ export function PacksPage() {
                 />
               </div>
               <div>
-                <Label>HD при покупке</Label>
+                <Label>4К при покупке</Label>
                 <Input
                   type="number"
                   min={0}
@@ -596,7 +596,7 @@ export function PacksPage() {
                     />
                   </div>
                   <div>
-                    <Label>HD SLA (мин)</Label>
+                    <Label>4К SLA (мин)</Label>
                     <Input
                       type="number"
                       min={1}

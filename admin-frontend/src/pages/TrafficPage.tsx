@@ -617,7 +617,7 @@ export default function TrafficPage() {
                               className={
                                 roasVal >= 1
                                   ? 'text-green-600 dark:text-green-400 font-medium'
-                                  : 'text-red-600 dark:text-red-400 font-medium'
+                                  : 'text-destructive font-medium'
                               }
                             >
                               {roasVal.toFixed(2)}x

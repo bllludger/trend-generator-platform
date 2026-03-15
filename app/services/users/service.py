@@ -4,6 +4,7 @@ from sqlalchemy import update
 
 from app.models.token_ledger import TokenLedger
 from app.models.user import User
+from app.utils.metrics import balance_rejected_total, token_operations_total
 
 
 class UserService:
@@ -123,10 +124,12 @@ class UserService:
                 .one()
             )
             if locked_user.token_balance < amount:
+                balance_rejected_total.inc()
                 return False
             locked_user.token_balance -= amount
             ledger = TokenLedger(user_id=locked_user.id, job_id=job_id, operation="HOLD", amount=amount)
             self.db.add(ledger)
+            token_operations_total.labels(operation="HOLD").inc()
             self.db.flush()
             return True
         except IntegrityError:
@@ -141,6 +144,7 @@ class UserService:
                 return
             ledger = TokenLedger(user_id=user.id, job_id=job_id, operation="CAPTURE", amount=amount)
             self.db.add(ledger)
+            token_operations_total.labels(operation="CAPTURE").inc()
             self.db.flush()
         except IntegrityError:
             self.db.rollback()
@@ -163,6 +167,7 @@ class UserService:
             locked_user.token_balance += amount
             ledger = TokenLedger(user_id=locked_user.id, job_id=job_id, operation="RELEASE", amount=amount)
             self.db.add(ledger)
+            token_operations_total.labels(operation="RELEASE").inc()
             self.db.flush()
         except IntegrityError:
             self.db.rollback()
@@ -184,6 +189,7 @@ class UserService:
             from app.services.hd_balance.service import HDBalanceService
             hd_svc = HDBalanceService(self.db)
             if not hd_svc.spend(user, amount):
+                balance_rejected_total.inc()
                 return False
 
             ledger = TokenLedger(
@@ -193,6 +199,7 @@ class UserService:
                 amount=amount,
             )
             self.db.add(ledger)
+            token_operations_total.labels(operation="HOLD").inc()
             capture = TokenLedger(
                 user_id=user.id,
                 job_id=f"{job_id}:unlock",
@@ -200,21 +207,40 @@ class UserService:
                 amount=amount,
             )
             self.db.add(capture)
+            token_operations_total.labels(operation="CAPTURE").inc()
             self.db.flush()
             return True
         except IntegrityError:
             self.db.rollback()
             return True  # idempotent
 
+    def reset_user_limits(self, user: User) -> bool:
+        """
+        Сброс счётчиков бесплатных и copy-генераций и бесплатного фото (аккаунт) для одного пользователя.
+        Возвращает True при успехе.
+        """
+        result = self.db.execute(
+            update(User)
+            .where(User.id == user.id)
+            .values(
+                free_generations_used=0,
+                copy_generations_used=0,
+                free_takes_used=0,
+            )
+        )
+        self.db.flush()
+        return result.rowcount > 0
+
     def reset_all_limits(self) -> int:
         """
-        Сброс счётчиков бесплатных и copy-генераций у всех пользователей.
+        Сброс счётчиков бесплатных и copy-генераций и бесплатного фото (аккаунт) у всех пользователей.
         Возвращает количество обновлённых строк.
         """
         result = self.db.execute(
             update(User).values(
                 free_generations_used=0,
                 copy_generations_used=0,
+                free_takes_used=0,
             )
         )
         self.db.flush()

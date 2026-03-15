@@ -23,6 +23,8 @@ class TakeService:
         input_file_ids: list[str] | None = None,
         input_local_paths: list[str] | None = None,
         copy_reference_path: str | None = None,
+        is_reroll: bool = False,
+        is_rescue_photo_replace: bool = False,
     ) -> Take:
         take = Take(
             id=str(uuid4()),
@@ -36,6 +38,8 @@ class TakeService:
             input_local_paths=input_local_paths or [],
             copy_reference_path=copy_reference_path,
             status="generating",
+            is_reroll=is_reroll,
+            is_rescue_photo_replace=is_rescue_photo_replace,
         )
         self.db.add(take)
         self.db.flush()

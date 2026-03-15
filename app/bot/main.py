@@ -10,6 +10,7 @@ from typing import Any, Generator
 from uuid import uuid4
 
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
@@ -52,18 +53,32 @@ from app.paywall import record_unlock as paywall_record_unlock
 from app.referral.config import get_min_pack_stars
 from app.referral.service import ReferralService
 from app.services.telegram_messages.runtime import runtime_templates
+from app.utils.metrics import (
+    balance_rejected_total,
+    bot_started_total,
+    photo_uploaded_total,
+    favorite_selected_total,
+    paywall_viewed_total,
+    pay_initiated_total,
+    pay_success_total,
+    pay_pre_checkout_rejected_total,
+    payment_amount_stars_total,
+    jobs_created_total,
+)
 from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
 from app.utils.currency import format_stars_rub
 from app.utils.telegram_photo import path_for_telegram_photo
 from app.constants import AUDIENCE_COUPLES, AUDIENCE_MEN, AUDIENCE_WOMEN, audience_in_target_audiences
 from app.utils.image_formats import ASPECT_RATIO_TO_SIZE
-from app.services.balance_tariffs import build_balance_tariffs_message, _pack_outcome_label
+from app.services.balance_tariffs import build_balance_tariffs_message, get_balance_line, _pack_outcome_label
 from app.services.sessions.service import SessionService
 from app.services.takes.service import TakeService
 from app.services.favorites.service import FavoriteService
 from app.services.hd_balance.service import HDBalanceService
 from app.services.input_photo_analyzer import analyze_input_photo
 from app.services.compensations.service import CompensationService
+from app.services.unlock_order.service import UnlockOrderService, validate_can_create_unlock
+from app.services.yookassa.client import YooKassaClient, YooKassaClientError
 from app.models.pack import Pack
 from app.models.session import Session as SessionModel
 from app.models.take import Take as TakeModel
@@ -110,26 +125,44 @@ def _resolve_trend_example_path(stored_path: str | None, trend_id: str) -> str |
 _BOT_ROOT = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_IMAGE_DIR = os.path.join(_BOT_ROOT, "..", "..", "image")
 WELCOME_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "start_page.png")
-# Картинка к экрану «Выбор фотосессии» (баланс + тарифы)
+# Картинка к экрану магазина (баланс + пакеты)
 MONEY_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "money3.png")
-# Картинка к экрану «Загрузи своё фото» (правила для идеального кадра)
+# Картинка к экрану «Загрузи своё фото» (правила для идеального фото)
 RULE_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "rule.png")
 # Картинка к интро «Сделать такую же» (правила: один в кадре, без очков/маски/фильтров; сжимается при >10 МБ)
 COPY_STYLE_INTRO_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "Без названия (16).png")
 # Картинка к интро «Соединить фото» (сжимается при >10 МБ)
 MERGE_INTRO_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "merge_photo.png")
+# Картинка к экрану «Подпишитесь на канал»
+SUBSCRIPTION_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "подп на канал 4.png")
+# Картинка «Фото принято» — выбор тематики/стиля
+SUCCESS_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "успехх.png")
 WELCOME_TEXT_DEFAULT = (
-    "👋 Nano Banana — ИИ фотостудия\n\n"
+    "👋 NeoBanana — ИИ фотостудия\n\n"
     "Это просто фото.\n"
     "Но оно может стать сценой.\n\n"
-    "Загрузи кадр — выбери стиль —\n"
+    "Загрузи фото — выбери стиль —\n"
     "получи результат как после съёмки.\n\n"
     "👇 Попробовать бесплатно"
 )
 
 # Image format options (aspect ratio -> size); общий маппинг с app.utils.image_formats
 IMAGE_FORMATS = ASPECT_RATIO_TO_SIZE
-TREND_CUSTOM_ID = "custom"  # Special ID for "Своя идея"
+# Соотношение сторон по умолчанию (шаг выбора формата отключён)
+DEFAULT_ASPECT_RATIO = "4:3"
+TREND_CUSTOM_ID = "custom"
+# Картинка к плашке «Поздравляем» перед прогресс-баром генерации
+GENERATION_INTRO_IMAGE_PATH = os.path.join(_PROJECT_IMAGE_DIR, "оплата2.png")
+# Плашка перед прогресс-баром генерации
+GENERATION_INTRO_TEXT = (
+    "🎉 Поздравляем, вы справились!\n\n"
+    "Теперь мы создаём вашу фотосессию.\n\n"
+    "Вы сможете посмотреть все варианты,\n"
+    "выбрать лучший\n\n"
+    "и оплатить его,\n"
+    "чтобы забрать фото\n"
+    "в полном качестве для соцсетей."
+)  # Special ID for "Своя идея"
 TRENDS_PER_PAGE = 6  # Трендов на одной странице внутри тематики
 # Отбивка для ЦА «Мужчина» (тренды пока не поддерживаются)
 AUDIENCE_MEN_OFFRAMP_TEXT = (
@@ -255,13 +288,24 @@ class SecurityMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+def _is_private_chat(event: TelegramObject) -> bool:
+    """True если апдейт из личного чата (не группа/канал). В группах с темами answer() требует message_thread_id."""
+    if isinstance(event, Message) and event.chat:
+        return (getattr(event.chat, "type", None) or "") == "private"
+    if hasattr(event, "message") and event.message and getattr(event.message, "chat", None):
+        return (getattr(event.message.chat, "type", None) or "") == "private"
+    return True
+
+
 class SubscriptionMiddleware(BaseMiddleware):
     """
     Для новых пользователей: блокировать все действия кроме /start и кнопки «Я подписался»,
-    пока не подписались на канал (subscription_channel_username).
+    пока не подписались на канал (subscription_channel_username). Только в личных чатах.
     """
     async def __call__(self, handler, event: TelegramObject, data: dict):
         if not SUBSCRIPTION_CHANNEL_USERNAME:
+            return await handler(event, data)
+        if not _is_private_chat(event):
             return await handler(event, data)
         user_id = None
         if hasattr(event, "from_user") and event.from_user:
@@ -288,11 +332,13 @@ class SubscriptionMiddleware(BaseMiddleware):
                     msg = getattr(event, "message", None)
                 if msg:
                     kb = _subscription_keyboard()
-                    await msg.answer(
+                    await _send_subscription_prompt(
+                        msg,
                         t("subscription.prompt", SUBSCRIBE_TEXT_DEFAULT),
-                        reply_markup=kb,
+                        kb,
                     )
-                    if hasattr(event, "answer"):
+                    # Only CallbackQuery has answer() that can be called with no args; Message.answer() requires text
+                    if isinstance(event, CallbackQuery):
                         await event.answer()
                 return
         except Exception as e:
@@ -301,14 +347,14 @@ class SubscriptionMiddleware(BaseMiddleware):
 
 
 HELP_TEXT_DEFAULT = (
-    "🎨 *NanoBanan — ИИ фотостудия*\n\n"
+    "🎨 *NeoBanana — ИИ фотостудия*\n\n"
     "*Как использовать:*\n"
     "1. «🔥 Создать фото» — отправьте фото, выберите тренд, формат — результат!\n"
     "2. «🔄 Сделать такую же» — загрузите образец, затем своё фото — копия стиля 1:1\n"
-    "3. «🛒 Купить генерации» — пакеты фото за Telegram Stars (без watermark)\n"
+    "3. «🛒 Купить пакет» — пакеты фото за Telegram Stars (без водяного знака)\n"
     "4. «👤 Мой профиль» — баланс и статистика\n\n"
     "*Как работает оплата:*\n"
-    "— 3 бесплатных превью (с watermark)\n"
+    "— 3 бесплатных превью (с водяным знаком)\n"
     "— Купите пакет за Stars — получайте фото в полном качестве\n"
     "— Можно разблокировать отдельное фото\n\n"
     "*Команды:*\n"
@@ -316,7 +362,8 @@ HELP_TEXT_DEFAULT = (
     "/help — Помощь\n"
     "/cancel — Отменить выбор\n"
     "/terms — Условия использования\n"
-    "/paysupport — Поддержка по платежам\n\n"
+    "/paysupport — Поддержка по платежам\n"
+    "Поддержка: @{support_username}\n\n"
     "*Форматы фото:* JPG, PNG, WEBP\n"
     "*Максимальный размер:* {max_file_size_mb} МБ"
 )
@@ -363,6 +410,7 @@ class BotStates(StatesGroup):
     session_active = State()
     viewing_take_result = State()
     viewing_favorites = State()
+    rescue_waiting_photo = State()
     # «Соединить фото» flow
     merge_waiting_count = State()          # Шаг 1: выбор 2 или 3 человек
     merge_waiting_photo_1 = State()        # Шаг 2: фото 1
@@ -382,11 +430,21 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton(text=t("menu.btn.merge_photos", "🧩 Соединить фото")),
-                KeyboardButton(text=t("menu.btn.shop", "🛒 Купить тариф")),
+                KeyboardButton(text=t("menu.btn.shop", "🛒 Купить пакет")),
             ],
             [
                 KeyboardButton(text=t("menu.btn.profile", "👤 Мой профиль")),
             ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def create_photo_only_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура только с кнопкой «Создать фото» — шаг сразу после подписки на канал."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t("menu.btn.create_photo", "🔥 Создать фото"))],
         ],
         resize_keyboard=True,
     )
@@ -454,7 +512,7 @@ def trends_keyboard(trends: list[dict[str, Any]]) -> InlineKeyboardMarkup:
 
 
 def _get_default_aspect_ratio() -> str:
-    """Дефолтный формат кадра из админки (Мастер промпт → На релиз → default_aspect_ratio)."""
+    """Дефолтное соотношение сторон из админки (Мастер промпт → На релиз → default_aspect_ratio)."""
     try:
         with get_db_session() as db:
             effective = GenerationPromptSettingsService(db).get_effective(profile="release")
@@ -477,7 +535,7 @@ def _format_button_label(key: str, default_ar: str) -> str:
 
 
 def format_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора формата кадра. Дефолт из админки помечается « (по умолч.)»; выбор пользователя приоритетный."""
+    """Клавиатура выбора соотношения сторон. Дефолт из админки помечается « (по умолч.)»; выбор пользователя приоритетный."""
     default_ar = _get_default_aspect_ratio()
     buttons = [
         [
@@ -590,6 +648,14 @@ def _parse_start_arg(text: str | None) -> str | None:
     return None
 
 
+def _parse_start_theme(text: str | None) -> str | None:
+    """Parse /start theme deep link. E.g. '/start theme_uuid' -> 'uuid'. Для рассылок: после выбора пола и фото пользователь попадёт в эту тематику."""
+    raw = _parse_start_raw_arg(text)
+    if raw and raw.startswith("theme_"):
+        return raw[6:]
+    return None
+
+
 def _parse_referral_code(text: str | None) -> str | None:
     """Parse /start referral deep link. E.g. '/start ref_ABCD1234' -> 'ABCD1234'."""
     raw = _parse_start_raw_arg(text)
@@ -617,8 +683,22 @@ SUBSCRIPTION_CHANNEL_USERNAME = (getattr(settings, "subscription_channel_usernam
 SUBSCRIPTION_CALLBACK = "subscription_check"
 
 SUBSCRIBE_TEXT_DEFAULT = (
-    "👋 Чтобы пользоваться ботом, подпишитесь на канал с примерами — там идеи для фото и обновления.\n\n"
-    "После подписки нажмите кнопку «Я подписался»."
+    "⚠️📸 Чтобы создать ВАШ уникальный образ, подпишитесь на канал 📸⚠️\n\n"
+    "В канале:\n\n"
+    "✨ идеи образов\n"
+    "🔥 новые стили фотосессий\n\n"
+    "Посмотрите примеры 👇\n\n"
+    "После подписки ВЕРНИТЕСЬ В БОТА\n"
+    "и нажмите кнопку 🔥Создать фото"
+)
+
+AFTER_SUBSCRIPTION_TEXT = (
+    "Отлично, у вас получилось! ✨\n\n"
+    "Спасибо за подписку.\n\n"
+    "Вы уже почти у цели.\n\n"
+    "Остался один шаг, чтобы создать свой образ в нужном стиле 👇\n\n"
+    "Нажмите\n"
+    "🔥 Создать фото"
 )
 
 
@@ -640,9 +720,31 @@ def _user_subscribed(user: User) -> bool:
     return bool((user.flags or {}).get("subscribed_examples_channel"))
 
 
+async def _send_subscription_prompt(target: Message, subscription_text: str, kb: InlineKeyboardMarkup | None) -> None:
+    """Отправить экран «Подпишитесь на канал»: картинка с подписью или только текст + клавиатура."""
+    if os.path.exists(SUBSCRIPTION_IMAGE_PATH):
+        try:
+            photo_path, is_temp = path_for_telegram_photo(SUBSCRIPTION_IMAGE_PATH)
+            await target.answer_photo(
+                photo=FSInputFile(photo_path),
+                caption=subscription_text,
+                reply_markup=kb,
+            )
+            if is_temp and os.path.isfile(photo_path):
+                try:
+                    os.unlink(photo_path)
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.warning("subscription_photo_failed", extra={"path": SUBSCRIPTION_IMAGE_PATH, "error": str(e)})
+            await target.answer(subscription_text, reply_markup=kb)
+    else:
+        await target.answer(subscription_text, reply_markup=kb)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    """Handle /start command. Supports deep links: /start trend_<id>, /start ref_<code>."""
+    """Handle /start command. Supports deep links: /start trend_<id>, /start theme_<id>, /start ref_<code>."""
     telegram_id = str(message.from_user.id)
     u = message.from_user
 
@@ -669,6 +771,7 @@ async def cmd_start(message: Message, state: FSMContext):
             )
             if user:
                 ProductAnalyticsService(db).track("bot_started", user.id)
+                bot_started_total.inc()
 
             # Traffic source from ad deep link (?start=src_<slug> or src_<slug>_c_<campaign>)
             traffic_source_slug, traffic_campaign = _parse_traffic_source(message.text)
@@ -737,19 +840,154 @@ async def cmd_start(message: Message, state: FSMContext):
                 await state.clear()
                 await state.update_data(
                     pending_start_arg=_parse_start_arg(message.text),
+                    pending_theme_id=_parse_start_theme(message.text),
                     pending_ref_code=ref_code,
                     pending_traffic_source=traffic_source_slug,
                     pending_traffic_campaign=traffic_campaign,
                 )
                 kb = _subscription_keyboard()
-                await message.answer(
+                await _send_subscription_prompt(
+                    message,
                     t("subscription.prompt", SUBSCRIBE_TEXT_DEFAULT),
-                    reply_markup=kb,
+                    kb,
                 )
                 logger.info("start_awaiting_subscription", extra={"user_id": telegram_id})
                 return
 
             start_arg = _parse_start_arg(message.text)
+            start_raw = _parse_start_raw_arg(message.text)
+            if start_raw and start_raw.startswith("unlock_done_"):
+                order_id = start_raw.replace("unlock_done_", "", 1).strip()
+                if order_id:
+                    unlock_svc = UnlockOrderService(db)
+                    order = unlock_svc.get_by_id(order_id)
+                    if order and str(order.telegram_user_id) == telegram_id:
+                        if order.status == "delivered":
+                            await message.answer(
+                                "Оплата принята. Файл уже отправлен в чат.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="🔄 Получить фото снова", callback_data=f"unlock_resend:{order_id}")],
+                                    [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                                ]),
+                            )
+                            return
+                        if order.status == "paid":
+                            await message.answer(
+                                "Оплата принята. Файл скоро придёт в чат.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                                ]),
+                            )
+                            try:
+                                from app.core.celery_app import celery_app as _celery
+                                _celery.send_task(
+                                    "app.workers.tasks.deliver_unlock.deliver_unlock_file",
+                                    args=[order_id],
+                                )
+                            except Exception:
+                                pass
+                            return
+                        if order.status == "payment_pending":
+                            await message.answer(
+                                "Ожидаем подтверждение оплаты. Если вы уже оплатили — нажмите «Проверить оплату».",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"unlock_check:{order_id}")],
+                                    [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                                ]),
+                            )
+                            return
+                        if order.status in ("canceled", "failed", "delivery_failed"):
+                            await message.answer(
+                                "Этот заказ отменён или завершён с ошибкой. Можно оформить новый — выберите вариант в чате с ботом.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                                ]),
+                            )
+                            return
+                    elif order_id:
+                        await message.answer("Заказ не найден или не принадлежит вам.", reply_markup=main_menu_keyboard())
+                        return
+                else:
+                    await message.answer("Неверная ссылка. Используйте меню бота.", reply_markup=main_menu_keyboard())
+                return
+            if start_raw and start_raw.startswith("pack_done_"):
+                order_id = start_raw.replace("pack_done_", "", 1).strip()
+                if order_id:
+                    from app.services.pack_order.service import PackOrderService
+                    pack_order_svc = PackOrderService(db)
+                    pack_order = pack_order_svc.get_by_id(order_id)
+                    if pack_order and str(pack_order.telegram_user_id) == telegram_id:
+                        if pack_order.status == "completed":
+                            pack = PaymentService(db).get_pack(pack_order.pack_id)
+                            pack_emoji = _escape_markdown(getattr(pack, "emoji", "") or "") if pack else ""
+                            pack_name = _escape_markdown(getattr(pack, "name", pack_order.pack_id) or pack_order.pack_id) if pack else _escape_markdown(str(pack_order.pack_id))
+                            session_svc = SessionService(db)
+                            user = UserService(db).get_by_telegram_id(telegram_id)
+                            remaining = 0
+                            takes_limit = 0
+                            if user:
+                                session = session_svc.get_active_session(user.id)
+                                if session:
+                                    remaining = (session.takes_limit or 0) - (session.takes_used or 0)
+                                    takes_limit = session.takes_limit or 0
+                            if user and takes_limit > 0:
+                                count_line = f"Доступно фото: {remaining} из {takes_limit}. "
+                            else:
+                                count_line = ""
+                            instruction = (
+                                "Один снимок — в этом шаге: выберите лучший из трёх вариантов выше.\n\n"
+                                "Вернитесь выше в чате и выберите лучший снимок — тогда получите его в полном качестве без водяного знака."
+                            )
+                            fav_svc = FavoriteService(db)
+                            last_pending = fav_svc.get_last_pending_hd_favorite(user.id) if user else None
+                            if last_pending:
+                                instruction = "Вы уже выбрали снимок — вернитесь к сообщению с кнопкой «Открыть фото в 4K» и нажмите её.\n\n" + instruction
+                            text = (
+                                "🎉 *Оплата подтверждена.*\n\n"
+                                f"Пакет {pack_emoji} {pack_name} активирован.\n\n"
+                                f"{count_line}{instruction}"
+                            )
+                            await message.answer(text, parse_mode="Markdown")
+                            return
+                        if pack_order.status == "paid":
+                            await message.answer(
+                                "Оплата принята. Пакет активируется — обычно это несколько секунд.\n\n"
+                                "Если сообщение не пришло, нажмите «Проверить оплату».",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"pack_check:{order_id}")],
+                                    [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                                ]),
+                            )
+                            return
+                        if pack_order.status == "payment_pending":
+                            await message.answer(
+                                "Платёж обрабатывается.\n\n"
+                                "Обычно это занимает несколько секунд.\n"
+                                "Пакет активируется автоматически.\n\n"
+                                "Если прошло больше минуты — нажмите «Помощь».",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"pack_check:{order_id}")],
+                                    [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                                ]),
+                            )
+                            return
+                        if pack_order.status in ("canceled", "failed"):
+                            await message.answer(
+                                "⚠️ Платёж не был завершён.\n\n"
+                                "Деньги не списаны.\n\n"
+                                "Можно оформить новый заказ и выбрать тариф заново.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="shop:open")],
+                                    [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                                ]),
+                            )
+                            return
+                    elif order_id:
+                        await message.answer("Заказ не найден или не принадлежит вам.", reply_markup=main_menu_keyboard())
+                        return
+                else:
+                    await message.answer("Неверная ссылка. Используйте меню бота.", reply_markup=main_menu_keyboard())
+                return
             if start_arg:
                 trend_service = TrendService(db)
                 trend = trend_service.get(start_arg)
@@ -769,7 +1007,17 @@ async def cmd_start(message: Message, state: FSMContext):
                     logger.info("start_deeplink_trend", extra={"user_id": telegram_id, "trend_id": trend.id})
                     return
 
+            # Диплинк на тематику (для рассылок): после выбора пола и фото откроется эта тематика
+            theme_arg = _parse_start_theme(message.text)
+
         await state.clear()
+        if theme_arg:
+            with get_db_session() as db:
+                theme_service = ThemeService(db)
+                theme = theme_service.get(theme_arg)
+                if theme and theme.enabled:
+                    await state.update_data(preselected_theme_id=theme.id)
+                    logger.info("start_deeplink_theme", extra={"user_id": telegram_id, "theme_id": theme.id})
         welcome_text = t("start.welcome_text", WELCOME_TEXT_DEFAULT)
         welcome_sent = False
         if os.path.exists(WELCOME_IMAGE_PATH):
@@ -821,6 +1069,7 @@ async def subscription_check(callback: CallbackQuery, state: FSMContext, bot: Bo
 
         data = await state.get_data()
         pending_start_arg = data.get("pending_start_arg")
+        pending_theme_id = data.get("pending_theme_id")
         pending_traffic_source = data.get("pending_traffic_source")
         pending_traffic_campaign = data.get("pending_traffic_campaign")
         await state.clear()
@@ -849,7 +1098,7 @@ async def subscription_check(callback: CallbackQuery, state: FSMContext, bot: Bo
                         },
                     )
 
-        # Продолжаем как после /start: диплинк или приветствие
+        # Продолжаем как после /start: диплинк тренда, диплинк тематики или приветствие
         with get_db_session() as db:
             if pending_start_arg:
                 trend_service = TrendService(db)
@@ -868,29 +1117,36 @@ async def subscription_check(callback: CallbackQuery, state: FSMContext, bot: Bo
                     await callback.message.answer(msg_text, reply_markup=main_menu_keyboard())
                     await callback.answer(t("subscription.done", "Спасибо! Добро пожаловать."))
                     return
+            if pending_theme_id:
+                theme_service = ThemeService(db)
+                theme = theme_service.get(pending_theme_id)
+                if theme and theme.enabled:
+                    await state.update_data(preselected_theme_id=theme.id)
+                    logger.info("start_deeplink_theme_after_subscription", extra={"user_id": telegram_id, "theme_id": theme.id})
 
-        welcome_text = t("start.welcome_text", WELCOME_TEXT_DEFAULT)
-        welcome_sent = False
+        after_text = t("subscription.after_done", AFTER_SUBSCRIPTION_TEXT)
+        after_sent = False
+        sent_msg = None
         if os.path.exists(WELCOME_IMAGE_PATH):
             try:
                 photo_path, is_temp = path_for_telegram_photo(WELCOME_IMAGE_PATH)
-                await callback.message.answer_photo(
+                sent_msg = await callback.message.answer_photo(
                     photo=FSInputFile(photo_path),
-                    caption=welcome_text,
-                    reply_markup=main_menu_keyboard(),
+                    caption=after_text,
+                    reply_markup=create_photo_only_keyboard(),
                 )
-                welcome_sent = True
+                after_sent = True
                 if is_temp and os.path.isfile(photo_path):
                     try:
                         os.unlink(photo_path)
                     except OSError:
                         pass
             except Exception as e:
-                logger.warning("start_welcome_photo_failed", extra={"path": WELCOME_IMAGE_PATH, "error": str(e)})
-        if not welcome_sent:
-            if not os.path.exists(WELCOME_IMAGE_PATH):
-                logger.warning("start_welcome_image_not_found", extra={"path": WELCOME_IMAGE_PATH})
-            await callback.message.answer(welcome_text, reply_markup=main_menu_keyboard())
+                logger.warning("subscription_after_photo_failed", extra={"path": WELCOME_IMAGE_PATH, "error": str(e)})
+        if not after_sent:
+            sent_msg = await callback.message.answer(after_text, reply_markup=create_photo_only_keyboard())
+        if sent_msg:
+            await state.update_data(after_subscription_message_id=sent_msg.message_id)
         await callback.answer(t("subscription.done", "Спасибо! Добро пожаловать."))
     except Exception as e:
         logger.exception("subscription_check error", extra={"user_id": telegram_id})
@@ -900,9 +1156,22 @@ async def subscription_check(callback: CallbackQuery, state: FSMContext, bot: Bo
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     """Handle /help command."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
     try:
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    user = UserService(db).get_or_create_user(
+                        telegram_id,
+                        telegram_username=message.from_user.username,
+                        telegram_first_name=message.from_user.first_name,
+                        telegram_last_name=message.from_user.last_name,
+                    )
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "help"})
+            except Exception:
+                logger.exception("button_click track failed help")
         await message.answer(
-            tr("help.main_text", HELP_TEXT_DEFAULT, max_file_size_mb=settings.max_file_size_mb),
+            tr("help.main_text", HELP_TEXT_DEFAULT, max_file_size_mb=settings.max_file_size_mb, support_username=settings.support_username),
             parse_mode="Markdown",
         )
     except Exception:
@@ -913,7 +1182,20 @@ async def cmd_help(message: Message):
 @router.message(Command("trends"))
 async def cmd_trends(message: Message):
     """Legacy: trends are shown after photo upload."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
     try:
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    user = UserService(db).get_or_create_user(
+                        telegram_id,
+                        telegram_username=message.from_user.username,
+                        telegram_first_name=message.from_user.first_name,
+                        telegram_last_name=message.from_user.last_name,
+                    )
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "trends"})
+            except Exception:
+                logger.exception("button_click track failed trends")
         await message.answer(
             t("flow.send_photo_first", "Сначала отправьте фото — после этого появятся тренды на выбор."),
             reply_markup=main_menu_keyboard(),
@@ -926,7 +1208,20 @@ async def cmd_trends(message: Message):
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     """Handle /cancel command."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
     try:
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    user = UserService(db).get_or_create_user(
+                        telegram_id,
+                        telegram_username=message.from_user.username,
+                        telegram_first_name=message.from_user.first_name,
+                        telegram_last_name=message.from_user.last_name,
+                    )
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "cancel"})
+            except Exception:
+                logger.exception("button_click track failed cancel")
         await state.clear()
         await message.answer(
             tr(
@@ -941,14 +1236,13 @@ async def cmd_cancel(message: Message, state: FSMContext):
         await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."))
 
 
-# --- Мой профиль (тариф, образы, кнопки) ---
+# --- Мой профиль (пакет, фото, кнопки) ---
 
 def _profile_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура профиля: Продолжить, Выбрать пакет, Выбрать фотосессию, Пригласить друга, Оплата, Поддержка."""
+    """Клавиатура профиля: В меню, Купить пакет, Пригласить друга, Оплата, Поддержка."""
     buttons = [
-        [InlineKeyboardButton(text="▶️ Продолжить фотосессию", callback_data="nav:menu")],
-        [InlineKeyboardButton(text="🛒 Выбрать пакет", callback_data="shop:open")],
-        [InlineKeyboardButton(text="🖼 Выбрать фотосессию", callback_data="shop:open")],
+        [InlineKeyboardButton(text=t("nav.btn.menu", "📋 В меню"), callback_data="nav:menu")],
+        [InlineKeyboardButton(text=t("menu.btn.shop", "🛒 Купить пакет"), callback_data="shop:open")],
         [InlineKeyboardButton(text="🤝 Пригласить друга — бонусы", callback_data="referral:invite")],
         [InlineKeyboardButton(text="💳 Купить через Stars или карту", callback_data="profile:payment")],
         [InlineKeyboardButton(text="🆘 Поддержка", callback_data="profile:support")],
@@ -958,7 +1252,7 @@ def _profile_keyboard() -> InlineKeyboardMarkup:
 
 @router.message(lambda m: (m.text or "").strip() == t("menu.btn.profile", "👤 Мой профиль"))
 async def my_profile(message: Message):
-    """Показать тариф, остаток образов и кнопки (Продолжить, Магазин, Пригласить, Оплата, Поддержка)."""
+    """Показать пакет, остаток фото и кнопки (В меню, Купить пакет, Пригласить, Оплата, Поддержка)."""
     telegram_id = str(message.from_user.id)
     try:
         with get_db_session() as db:
@@ -981,13 +1275,17 @@ async def my_profile(message: Message):
                 remaining = active_session.takes_limit - active_session.takes_used
                 total = active_session.takes_limit
                 if active_session.pack_id == "free_preview":
-                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} бесплатн{'ое фото' if remaining == 1 else 'ых фото'}\nПосле него потребуется пакет."
+                    text += f"Пакет: ✅ {plan_safe}\nОсталось фото: {remaining}\nПосле него потребуется пакет."
                 else:
-                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} из {total} фото"
-                text += "\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+                    text += f"Пакет: ✅ {plan_safe}\nОсталось фото: {remaining} из {total}"
+                text += "\n\nСделайте фото или купите пакет,\nчтобы продолжить."
             else:
-                text += "Текущий тариф: —\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+                text += "Пакет: —\n\nКупите пакет, чтобы начать."
             profile_kb = _profile_keyboard()
+            try:
+                ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "menu_profile"})
+            except Exception:
+                logger.exception("button_click track failed menu_profile")
         await message.answer(text, parse_mode="Markdown", reply_markup=profile_kb)
     except Exception:
         logger.exception("Error in my_profile")
@@ -1028,13 +1326,13 @@ async def referral_invite(callback: CallbackQuery):
         min_price_str = format_stars_rub(min_stars, rate)
 
         text = (
-            "💌 *Пригласи подругу — получи бонус на фотосессию*\n\n"
-            f"Твоя персональная ссылка:\n`{link}`\n\n"
+            "💌 *Пригласите подругу — получите бонус на фото*\n\n"
+            f"Ваша персональная ссылка:\n`{link}`\n\n"
             "📌 *Условия:*\n"
             f"• Бонус начислим, когда подруга купит пакет от {min_price_str}\n"
             "• Бонус станет доступен через 12–24 часа\n"
             "• Работает для новых пользователей\n\n"
-            "Поделись ссылкой — получи бонусы 4K!"
+            "Поделитесь ссылкой — получите бонусы 4K!"
         )
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1042,10 +1340,10 @@ async def referral_invite(callback: CallbackQuery):
             [
                 InlineKeyboardButton(
                     text="📤 Поделиться",
-                    switch_inline_query=f"Попробуй NanoBanan — крутые фото за 30 секунд! {link}",
+                    switch_inline_query=f"Попробуйте NeoBanana — крутые фото за 30 секунд! {link}",
                 ),
             ],
-            [InlineKeyboardButton(text="📊 Мой баланс", callback_data="referral:status")],
+            [InlineKeyboardButton(text="🎁 Бонусы 4K", callback_data="referral:status")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="referral:back_profile")],
         ])
         await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
@@ -1089,6 +1387,11 @@ async def referral_status(callback: CallbackQuery):
         with get_db_session() as db:
             user_service = UserService(db)
             user = user_service.get_by_telegram_id(telegram_id)
+            if user:
+                try:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "referral_status"})
+                except Exception:
+                    logger.exception("button_click track failed referral_status")
             if not user:
                 await callback.answer("Пользователь не найден.", show_alert=True)
                 return
@@ -1128,7 +1431,15 @@ async def referral_status(callback: CallbackQuery):
 @router.callback_query(F.data == "referral:back_profile")
 async def referral_back_to_profile(callback: CallbackQuery):
     """Return to profile from referral screen (cannot mutate Message.from_user — Pydantic frozen)."""
+    telegram_id = str(callback.from_user.id)
     try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                try:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "referral_back_profile"})
+                except Exception:
+                    logger.exception("button_click track failed referral_back_profile")
         try:
             await callback.message.delete()
         except Exception:
@@ -1154,12 +1465,12 @@ async def referral_back_to_profile(callback: CallbackQuery):
                 remaining = active_session.takes_limit - active_session.takes_used
                 total = active_session.takes_limit
                 if active_session.pack_id == "free_preview":
-                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} бесплатн{'ое фото' if remaining == 1 else 'ых фото'}\nПосле него потребуется пакет."
+                    text += f"Пакет: ✅ {plan_safe}\nОсталось фото: {remaining}\nПосле него потребуется пакет."
                 else:
-                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} из {total} фото"
-                text += "\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+                    text += f"Пакет: ✅ {plan_safe}\nОсталось фото: {remaining} из {total}"
+                text += "\n\nСделайте фото или купите пакет,\nчтобы продолжить."
             else:
-                text += "Текущий тариф: —\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+                text += "Пакет: —\n\nКупите пакет, чтобы начать."
             profile_kb = _profile_keyboard()
         await callback.message.answer(text, parse_mode="Markdown", reply_markup=profile_kb)
     except Exception:
@@ -1169,39 +1480,87 @@ async def referral_back_to_profile(callback: CallbackQuery):
 
 
 # --- Step 0: Request photo ---
+PHOTO_ACCEPTED_CAPTION_DEFAULT = (
+    "Фото принято ✅\n\n"
+    "Отлично! Мы получили ваше фото\n"
+    "и готовы создать для вас фотосессию\n"
+    "в любом выбранном образе.\n\n"
+    "Теперь выберите стиль 👇"
+)
+THEME_SELECTED_INSTRUCTION = (
+    "🔥 Остался последний шаг!\n\n"
+    "Выберите образ для своей фотографии.\n\n"
+    "✨ В каждом тренде — примеры\n"
+    "готовых фотосессий и образов.\n\n"
+    "👇 Нажмите на любой тренд\n"
+    "посмотрите фото и выберите стиль.\n\n"
+    "🔄 Если не понравилось —\n"
+    "вернитесь назад и попробуйте другой."
+)
 REQUEST_PHOTO_TEXT_DEFAULT = (
-    "📸 Загрузи своё фото\n"
-    "и получи съёмку как из дорогой студии — за 30 секунд\n\n"
-    "✨ Превью бесплатно\n\n"
-    "Чтобы получилось идеально:\n"
-    "— лицо крупно в кадре\n"
-    "— без очков\n"
-    "— фото чёткое\n\n"
-    "👇 Попробовать"
+    "🚀 Вы почти у цели!\n\n"
+    "Сейчас отправьте своё лучшее фото —\n"
+    "AI создаст из него уникальные образы.\n\n"
+    "📸 Нужно всего 1 фото — подойдёт обычное селфи.\n\n"
+    "Чтобы получилось идеально:\n\n"
+    "— ВАЖНО: лицо крупно в кадре\n\n"
+    "📎 Важно: отправьте фото как документ —\n"
+    "так сохранится лучшее качество.\n\n"
+    "👇 Отправьте фото\n\n"
+    "✨ Через несколько секунд\n"
+    "вы сможете выбрать стиль фотосессии."
 )
 
 
+AUDIENCE_PROMPT_DEFAULT = "Для кого фотосессия?"
+
 def audience_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора ЦА: Женщина, Мужчина, Пара."""
+    """Клавиатура выбора ЦА: Я — женщина, Я — мужчина, Мы — пара."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=t("audience.women", "👩 Женщина"), callback_data="audience:women"),
-            InlineKeyboardButton(text=t("audience.men", "👨 Мужчина"), callback_data="audience:men"),
+            InlineKeyboardButton(text=t("audience.women", "👩 Я — женщина"), callback_data="audience:women"),
+            InlineKeyboardButton(text=t("audience.men", "👨 Я — мужчина"), callback_data="audience:men"),
         ],
-        [InlineKeyboardButton(text=t("audience.couples", "👫 Пара"), callback_data="audience:couples")],
+        [InlineKeyboardButton(text=t("audience.couples", "👩‍❤️‍👨 Мы — пара"), callback_data="audience:couples")],
     ])
 
 
 @router.message(lambda m: (m.text or "").strip() == t("menu.btn.create_photo", "🔥 Создать фото"))
 async def request_photo(message: Message, state: FSMContext, bot: Bot):
     """User clicks 'Create photo' → сначала выбор ЦА, затем запрос фото."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
     try:
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    user = UserService(db).get_or_create_user(
+                        telegram_id,
+                        telegram_username=message.from_user.username,
+                        telegram_first_name=message.from_user.first_name,
+                        telegram_last_name=message.from_user.last_name,
+                    )
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "menu_create_photo"})
+            except Exception:
+                logger.exception("button_click track failed menu_create_photo")
+        data = await state.get_data()
+        after_sub_msg_id = data.get("after_subscription_message_id")
+        if after_sub_msg_id:
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=after_sub_msg_id)
+            except Exception:
+                pass
+            await state.update_data(after_subscription_message_id=None)
+
         await state.set_state(BotStates.waiting_for_audience)
         sent = await message.answer(
-            t("audience.prompt", "Для кого создаём образ?"),
+            t("audience.prompt", AUDIENCE_PROMPT_DEFAULT),
             reply_markup=audience_keyboard(),
         )
-        await state.update_data(last_bot_message_id=sent.message_id)
+        await state.update_data(
+            last_bot_message_id=sent.message_id,
+            selected_trend_id=None,
+            selected_trend_name=None,
+        )
     except Exception:
         logger.exception("Error in request_photo")
         await message.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), reply_markup=main_menu_keyboard())
@@ -1236,11 +1595,12 @@ async def on_audience_selected(callback: CallbackQuery, state: FSMContext, bot: 
 
         audience_label = {"women": "Женщина", "men": "Мужчина", "couples": "Пара"}.get(audience, audience)
         request_text = t("flow.request_photo", REQUEST_PHOTO_TEXT_DEFAULT)
+        first_sent = None
         if os.path.exists(RULE_IMAGE_PATH):
             try:
                 await callback.message.delete()
                 photo_path, is_temp = path_for_telegram_photo(RULE_IMAGE_PATH)
-                sent = await callback.message.answer_photo(
+                first_sent = await callback.message.answer_photo(
                     photo=FSInputFile(photo_path),
                     caption=request_text,
                     parse_mode="HTML",
@@ -1252,21 +1612,17 @@ async def on_audience_selected(callback: CallbackQuery, state: FSMContext, bot: 
                         pass
             except Exception as e:
                 logger.warning("rule_photo_failed", extra={"path": RULE_IMAGE_PATH, "error": str(e)})
-                sent = await callback.message.answer(request_text, parse_mode="HTML")
+                first_sent = await callback.message.answer(request_text, parse_mode="HTML")
         else:
             await callback.message.edit_text(request_text, parse_mode="HTML")
-            sent = None
-        if sent is None:
-            sent = await callback.message.answer(
-                t("audience.selected_then_upload", "Выбрано: {audience}. Отправьте фото или нажмите «🔥 Создать фото».").replace("{audience}", audience_label),
-                reply_markup=main_menu_keyboard(),
-            )
-        else:
-            sent = await callback.message.answer(
-                t("audience.selected_then_upload", "Выбрано: {audience}. Отправьте фото или нажмите «🔥 Создать фото».").replace("{audience}", audience_label),
-                reply_markup=main_menu_keyboard(),
-            )
-        await state.update_data(last_bot_message_id=sent.message_id)
+        sent = await callback.message.answer(
+            t("audience.selected_then_upload", "Выбрано: {audience}. Отправьте фото или нажмите «🔥 Создать фото».").replace("{audience}", audience_label),
+            reply_markup=main_menu_keyboard(),
+        )
+        update_data = {"last_bot_message_id": sent.message_id}
+        if first_sent is not None:
+            update_data["photo_request_message_id"] = first_sent.message_id
+        await state.update_data(**update_data)
     except Exception:
         logger.exception("Error in on_audience_selected")
         await callback.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), show_alert=True)
@@ -1283,11 +1639,24 @@ async def on_audience_selected(callback: CallbackQuery, state: FSMContext, bot: 
 @router.message(lambda m: (m.text or "").strip() == t("menu.btn.copy_style", "🔄 Сделать такую же"))
 async def start_copy_flow(message: Message, state: FSMContext, bot: Bot):
     """Начало флоу копирования стиля 1:1. Пост с картинкой, как в логе трендов."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_or_create_user(
+                    telegram_id,
+                    telegram_username=message.from_user.username,
+                    telegram_first_name=message.from_user.first_name,
+                    telegram_last_name=message.from_user.last_name,
+                )
+                ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "menu_copy_style"})
+        except Exception:
+            logger.exception("button_click track failed menu_copy_style")
     copy_intro_text = t(
         "copy.start_text",
         "🔄 *Сделать такую же*\n\n"
         "Я могу скопировать 1:1 любой тренд.\n\n"
-        "Загрузи картинку-образец в хорошем качестве — "
+        "Загрузите картинку-образец в хорошем качестве — "
         "я изучу дизайн и подскажу, как сделать такую же.\n\n"
         "Поддерживаются: JPG, PNG, WEBP.",
     )
@@ -1355,7 +1724,7 @@ async def handle_reference_photo(message: Message, state: FSMContext, bot: Bot):
     await state.update_data(reference_path=local_path)
     await state.set_state(BotStates.waiting_for_self_photo)
     sent = await message.answer(
-        "✅ Референс сохранён.\n\nОтправьте своё фото — по нему сохраню лицо и перенесу в сцену из образца.",
+        "✅ Референс сохранён.\n\nОтправьте своё фото — по нему сохраним лицо и перенесём в сцену из образца.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
@@ -1399,7 +1768,7 @@ async def handle_reference_photo_as_document(message: Message, state: FSMContext
     await state.update_data(reference_path=local_path)
     await state.set_state(BotStates.waiting_for_self_photo)
     sent = await message.answer(
-        "✅ Референс сохранён.\n\nОтправьте своё фото — по нему сохраню лицо и перенесу в сцену из образца.",
+        "✅ Референс сохранён.\n\nОтправьте своё фото — по нему сохраним лицо и перенесём в сцену из образца.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
@@ -1479,12 +1848,21 @@ async def handle_self_photo_for_copy(message: Message, state: FSMContext, bot: B
         custom_prompt=copy_prompt,
         copy_flow_origin=True,
     )
-    await state.set_state(BotStates.waiting_for_format)
-    sent = await message.answer(
-        "✅ Готово! Выбери формат:",
-        reply_markup=format_keyboard(),
+    data = await state.get_data()
+    async def _answer_alert_copy(text: str, show_alert: bool = False) -> None:
+        await message.answer(text, reply_markup=main_menu_keyboard())
+    ok = await _create_job_and_start_generation(
+        bot=bot,
+        state=state,
+        format_key=DEFAULT_ASPECT_RATIO,
+        chat_id=message.chat.id,
+        message_ids_to_delete=data.get("last_bot_message_id"),
+        from_user=message.from_user,
+        answer_alert=_answer_alert_copy,
+        send_progress_to_chat_id=message.chat.id,
     )
-    await state.update_data(last_bot_message_id=sent.message_id)
+    if ok:
+        await message.answer("Генерация запущена!", reply_markup=main_menu_keyboard())
 
 
 @router.message(BotStates.waiting_for_self_photo, F.document)
@@ -1567,12 +1945,21 @@ async def handle_self_photo_as_document_for_copy(message: Message, state: FSMCon
         custom_prompt=copy_prompt,
         copy_flow_origin=True,
     )
-    await state.set_state(BotStates.waiting_for_format)
-    sent = await message.answer(
-        "✅ Готово! Выбери формат:",
-        reply_markup=format_keyboard(),
+    data = await state.get_data()
+    async def _answer_alert_copy_doc(text: str, show_alert: bool = False) -> None:
+        await message.answer(text, reply_markup=main_menu_keyboard())
+    ok = await _create_job_and_start_generation(
+        bot=bot,
+        state=state,
+        format_key=DEFAULT_ASPECT_RATIO,
+        chat_id=message.chat.id,
+        message_ids_to_delete=data.get("last_bot_message_id"),
+        from_user=message.from_user,
+        answer_alert=_answer_alert_copy_doc,
+        send_progress_to_chat_id=message.chat.id,
     )
-    await state.update_data(last_bot_message_id=sent.message_id)
+    if ok:
+        await message.answer("Генерация запущена!", reply_markup=main_menu_keyboard())
 
 
 @router.message(BotStates.waiting_for_reference_photo)
@@ -1593,6 +1980,17 @@ async def copy_flow_wrong_input_self(message: Message):
 async def start_merge_flow(message: Message, state: FSMContext):
     """Пользователь нажал кнопку 'Соединить фото'. Отправляем интро с картинкой merge_photo.png (ужатой при >10 МБ)."""
     telegram_id = str(message.from_user.id)
+    try:
+        with get_db_session() as db:
+            user = UserService(db).get_or_create_user(
+                telegram_id,
+                telegram_username=message.from_user.username,
+                telegram_first_name=message.from_user.first_name,
+                telegram_last_name=message.from_user.last_name,
+            )
+            ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "menu_merge_photos"})
+    except Exception:
+        logger.exception("button_click track failed menu_merge_photos")
     merge_intro_text = (
         "🧩 <b>Соединить фото</b>\n\n"
         "Сколько фотографий хотите объединить?"
@@ -1905,6 +2303,10 @@ async def accept_consent(callback: CallbackQuery, state: FSMContext):
             )
             user.consent_accepted_at = datetime.now(timezone.utc)
             db.add(user)
+            try:
+                ProductAnalyticsService(db).track("consent_accepted", user.id, properties={"button_id": "accept_consent"})
+            except Exception:
+                logger.exception("consent_accepted track failed")
 
         await callback.answer("✅ Согласие принято")
         await callback.message.answer(
@@ -1933,6 +2335,10 @@ async def cmd_delete_my_data(message: Message, state: FSMContext):
             db.add(user)
             user_id = user.id
 
+        try:
+            ProductAnalyticsService(db).track("button_click", user_id, properties={"button_id": "deletemydata"})
+        except Exception:
+            logger.exception("button_click track failed deletemydata")
         from app.core.celery_app import celery_app as _celery
         _celery.send_task(
             "app.workers.tasks.delete_user_data.delete_user_data",
@@ -1955,28 +2361,29 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
     telegram_id = str(message.from_user.id)
     
     try:
-        # Consent check
-        with get_db_session() as db:
-            user_svc_consent = UserService(db)
-            u_consent = user_svc_consent.get_or_create_user(
-                telegram_id,
-                telegram_username=message.from_user.username,
-                telegram_first_name=message.from_user.first_name,
-                telegram_last_name=message.from_user.last_name,
-            )
-            if not u_consent.consent_accepted_at:
-                await message.answer(
-                    "📋 Перед загрузкой фото подтвердите согласие:\n\n"
-                    "• Используйте только свои фото или фото с согласием владельца\n"
-                    "• Входные данные хранятся 30 дней, результаты — 90 дней\n"
-                    "• Вы можете удалить данные командой /deletemydata\n\n"
-                    "Нажмите «Принимаю» чтобы продолжить.",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="✅ Принимаю", callback_data="accept_consent")],
-                        [InlineKeyboardButton(text="ℹ️ Подробнее", url="https://nanobanana.ai/privacy")],
-                    ]),
+        # Consent check (можно отключить через REQUIRE_PHOTO_CONSENT=false)
+        if settings.require_photo_consent:
+            with get_db_session() as db:
+                user_svc_consent = UserService(db)
+                u_consent = user_svc_consent.get_or_create_user(
+                    telegram_id,
+                    telegram_username=message.from_user.username,
+                    telegram_first_name=message.from_user.first_name,
+                    telegram_last_name=message.from_user.last_name,
                 )
-                return
+                if not u_consent.consent_accepted_at:
+                    await message.answer(
+                        "📋 Перед загрузкой фото подтвердите согласие:\n\n"
+                        "• Используйте только свои фото или фото с согласием владельца\n"
+                        "• Входные данные хранятся 30 дней, результаты — 90 дней\n"
+                        "• Вы можете удалить данные командой /deletemydata\n\n"
+                        "Нажмите «Принимаю» чтобы продолжить.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="✅ Принимаю", callback_data="accept_consent")],
+                            [InlineKeyboardButton(text="ℹ️ Подробнее", url="https://nanobanana.ai/privacy")],
+                        ]),
+                    )
+                    return
 
         data_early = await state.get_data()
         audience = (data_early.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
@@ -2067,6 +2474,7 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                     session_svc.advance_step(session)
                     take_id = take.id
                     ProductAnalyticsService(db).track("photo_uploaded", u.id, session_id=session.id)
+                    photo_uploaded_total.inc()
                     try:
                         analysis = analyze_input_photo(local_path)
                         ProductAnalyticsService(db).track(
@@ -2091,6 +2499,7 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
             ProductAnalyticsService(db).track(
                 "photo_uploaded", u.id, session_id=session.id if session else None
             )
+            photo_uploaded_total.inc()
             try:
                 analysis = analyze_input_photo(local_path)
                 ProductAnalyticsService(db).track(
@@ -2113,42 +2522,84 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                         )
                         await state.clear()
                         return
-                    await state.set_state(BotStates.waiting_for_format)
-                    await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-                    trend_name = trend.name
-                    trend_emoji = trend.emoji or ""
-                    example_path = _resolve_trend_example_path(getattr(trend, "example_image_path", None), str(trend.id))
-                    if example_path:
-                        try:
-                            sent = await message.answer_photo(
-                                photo=FSInputFile(example_path),
-                                caption=(
-                                    f"✅ Фото принято. Тренд: {trend_emoji} {trend_name}\n\n"
-                                    "Выберите формат кадра:"
-                                ),
-                                reply_markup=format_keyboard(),
-                            )
-                        except Exception:
-                            sent = await message.answer(
-                                f"✅ Фото принято. Тренд: {trend_emoji} {trend_name}\n\nВыберите формат кадра:",
-                                reply_markup=format_keyboard(),
-                            )
-                    else:
-                        sent = await message.answer(
-                            f"✅ Фото принято. Тренд: {trend_emoji} {trend_name}\n\nВыберите формат кадра:",
-                            reply_markup=format_keyboard(),
-                        )
-                    await state.update_data(last_bot_message_id=sent.message_id)
+                    async def _answer_alert(text: str, show_alert: bool = False) -> None:
+                        await message.answer(text, reply_markup=main_menu_keyboard())
+                    ok = await _create_job_and_start_generation(
+                        bot=bot,
+                        state=state,
+                        format_key=DEFAULT_ASPECT_RATIO,
+                        chat_id=message.chat.id,
+                        message_ids_to_delete=data.get("last_bot_message_id"),
+                        from_user=message.from_user,
+                        answer_alert=_answer_alert,
+                        send_progress_to_chat_id=message.chat.id,
+                    )
+                    if ok:
+                        pass
                     logger.info("photo_received_deeplink", extra={"user_id": telegram_id, "trend_id": pre_selected_id})
                     return
+        # Диплинк на тематику: показать сразу тренды этой тематики (первая страница)
+        preselected_theme_id = data.get("preselected_theme_id")
+        if preselected_theme_id:
+            with get_db_session() as db2:
+                theme_svc = ThemeService(db2)
+                trend_svc = TrendService(db2)
+                theme = theme_svc.get(preselected_theme_id)
+                if theme and theme.enabled:
+                    trends = trend_svc.list_active_by_theme(preselected_theme_id, audience)
+                    if trends:
+                        total_pages = (len(trends) + TRENDS_PER_PAGE - 1) // TRENDS_PER_PAGE
+                        trends_page = trends[:TRENDS_PER_PAGE]
+                        trends_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in trends_page]
+                        theme_name_display = f"{theme.emoji or ''} {theme.name}".strip()
+                        await state.set_state(BotStates.waiting_for_trend)
+                        await state.update_data(
+                            current_theme_id=preselected_theme_id,
+                            current_theme_page=0,
+                            preselected_theme_id=None,
+                        )
+                        await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
+                        caption = tr(
+                            "flow.theme_page_caption",
+                            "Тематика: {theme_name} — стр. {current} из {total}",
+                            theme_name=theme_name_display,
+                            current=1,
+                            total=total_pages,
+                        )
+                        sent = await message.answer(
+                            caption,
+                            reply_markup=trends_in_theme_keyboard(preselected_theme_id, trends_data, 0, total_pages),
+                        )
+                        await state.update_data(last_bot_message_id=sent.message_id)
+                        logger.info("photo_received_deeplink_theme", extra={"user_id": telegram_id, "theme_id": preselected_theme_id})
+                        return
         await state.set_state(BotStates.waiting_for_trend)
-        await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-        caption = t("flow.photo_accepted_choose_theme", "✅ Фото принято\n\nМы используем его, чтобы сохранить вашу внешность и стиль.\nВыберите тематику или придумайте свой образ 👇")
-        sent = await message.answer(
-            caption,
-            reply_markup=themes_keyboard(themes_data),
+        await state.update_data(preselected_theme_id=None)
+        await _try_delete_messages(
+            bot, message.chat.id,
+            data.get("photo_request_message_id"),
+            data.get("last_bot_message_id"),
         )
-        await state.update_data(last_bot_message_id=sent.message_id)
+        caption = t("flow.photo_accepted_choose_theme", PHOTO_ACCEPTED_CAPTION_DEFAULT)
+        if os.path.exists(SUCCESS_IMAGE_PATH):
+            try:
+                photo_path, is_temp = path_for_telegram_photo(SUCCESS_IMAGE_PATH)
+                sent = await message.answer_photo(
+                    photo=FSInputFile(photo_path),
+                    caption=caption,
+                    reply_markup=themes_keyboard(themes_data),
+                )
+                if is_temp and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning("success_photo_failed", extra={"path": SUCCESS_IMAGE_PATH, "error": str(e)})
+                sent = await message.answer(caption, reply_markup=themes_keyboard(themes_data))
+        else:
+            sent = await message.answer(caption, reply_markup=themes_keyboard(themes_data))
+        await state.update_data(last_bot_message_id=sent.message_id, photo_request_message_id=None)
         logger.info("photo_received", extra={"user_id": telegram_id})
     except Exception:
         logger.exception("Error in handle_photo_step1", extra={"user_id": telegram_id})
@@ -2218,42 +2669,81 @@ async def handle_photo_as_document_step1(message: Message, state: FSMContext, bo
             with get_db_session() as db:
                 trend = TrendService(db).get(pre_selected_id)
                 if trend and trend.enabled:
-                    await state.set_state(BotStates.waiting_for_format)
-                    await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-                    trend_name = trend.name
-                    trend_emoji = trend.emoji or ""
-                    example_path = _resolve_trend_example_path(getattr(trend, "example_image_path", None), str(trend.id))
-                    if example_path:
-                        try:
-                            sent = await message.answer_photo(
-                                photo=FSInputFile(example_path),
-                                caption=(
-                                    f"✅ Фото принято. Тренд: {trend_emoji} {trend_name}\n\n"
-                                    "Выберите формат кадра:"
-                                ),
-                                reply_markup=format_keyboard(),
-                            )
-                        except Exception:
-                            sent = await message.answer(
-                                f"✅ Фото принято. Тренд: {trend_emoji} {trend_name}\n\nВыберите формат кадра:",
-                                reply_markup=format_keyboard(),
-                            )
-                    else:
-                        sent = await message.answer(
-                            f"✅ Фото принято. Тренд: {trend_emoji} {trend_name}\n\nВыберите формат кадра:",
-                            reply_markup=format_keyboard(),
-                        )
-                    await state.update_data(last_bot_message_id=sent.message_id)
+                    async def _answer_alert_doc(text: str, show_alert: bool = False) -> None:
+                        await message.answer(text, reply_markup=main_menu_keyboard())
+                    ok = await _create_job_and_start_generation(
+                        bot=bot,
+                        state=state,
+                        format_key=DEFAULT_ASPECT_RATIO,
+                        chat_id=message.chat.id,
+                        message_ids_to_delete=data.get("last_bot_message_id"),
+                        from_user=message.from_user,
+                        answer_alert=_answer_alert_doc,
+                        send_progress_to_chat_id=message.chat.id,
+                    )
                     logger.info("photo_received_as_document_deeplink", extra={"user_id": telegram_id, "trend_id": pre_selected_id})
                     return
+        preselected_theme_id = data.get("preselected_theme_id")
+        if preselected_theme_id:
+            with get_db_session() as db2:
+                theme_svc = ThemeService(db2)
+                trend_svc = TrendService(db2)
+                theme = theme_svc.get(preselected_theme_id)
+                if theme and theme.enabled:
+                    trends = trend_svc.list_active_by_theme(preselected_theme_id, audience)
+                    if trends:
+                        total_pages = (len(trends) + TRENDS_PER_PAGE - 1) // TRENDS_PER_PAGE
+                        trends_page = trends[:TRENDS_PER_PAGE]
+                        trends_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in trends_page]
+                        theme_name_display = f"{theme.emoji or ''} {theme.name}".strip()
+                        await state.set_state(BotStates.waiting_for_trend)
+                        await state.update_data(
+                            current_theme_id=preselected_theme_id,
+                            current_theme_page=0,
+                            preselected_theme_id=None,
+                        )
+                        await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
+                        caption = tr(
+                            "flow.theme_page_caption",
+                            "Тематика: {theme_name} — стр. {current} из {total}",
+                            theme_name=theme_name_display,
+                            current=1,
+                            total=total_pages,
+                        )
+                        sent = await message.answer(
+                            caption,
+                            reply_markup=trends_in_theme_keyboard(preselected_theme_id, trends_data, 0, total_pages),
+                        )
+                        await state.update_data(last_bot_message_id=sent.message_id)
+                        logger.info("photo_received_as_document_deeplink_theme", extra={"user_id": telegram_id, "theme_id": preselected_theme_id})
+                        return
         await state.set_state(BotStates.waiting_for_trend)
-        await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
-        caption = t("flow.photo_accepted_choose_theme", "✅ Фото принято\n\nМы используем его, чтобы сохранить вашу внешность и стиль.\nВыберите тематику или придумайте свой образ 👇")
-        sent = await message.answer(
-            caption,
-            reply_markup=themes_keyboard(themes_data),
+        await state.update_data(preselected_theme_id=None)
+        await _try_delete_messages(
+            bot, message.chat.id,
+            data.get("photo_request_message_id"),
+            data.get("last_bot_message_id"),
         )
-        await state.update_data(last_bot_message_id=sent.message_id)
+        caption = t("flow.photo_accepted_choose_theme", PHOTO_ACCEPTED_CAPTION_DEFAULT)
+        if os.path.exists(SUCCESS_IMAGE_PATH):
+            try:
+                photo_path, is_temp = path_for_telegram_photo(SUCCESS_IMAGE_PATH)
+                sent = await message.answer_photo(
+                    photo=FSInputFile(photo_path),
+                    caption=caption,
+                    reply_markup=themes_keyboard(themes_data),
+                )
+                if is_temp and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning("success_photo_failed", extra={"path": SUCCESS_IMAGE_PATH, "error": str(e)})
+                sent = await message.answer(caption, reply_markup=themes_keyboard(themes_data))
+        else:
+            sent = await message.answer(caption, reply_markup=themes_keyboard(themes_data))
+        await state.update_data(last_bot_message_id=sent.message_id, photo_request_message_id=None)
         logger.info("photo_received_as_document", extra={"user_id": telegram_id})
     except Exception:
         logger.exception("Error in handle_photo_as_document_step1", extra={"user_id": telegram_id})
@@ -2316,8 +2806,42 @@ async def select_theme_or_theme_page(callback: CallbackQuery, state: FSMContext,
             total=total_pages,
         )
         kb = trends_in_theme_keyboard(theme_id, trends_data, page, total_pages)
-        await callback.message.edit_text(caption, reply_markup=kb)
-        await state.update_data(current_theme_id=theme_id, current_theme_page=page)
+        current_theme_id = data.get("current_theme_id")
+        opening_from_list = current_theme_id is None or current_theme_id != theme_id
+        if opening_from_list:
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+            instruction_text = t("flow.theme_selected_instruction", THEME_SELECTED_INSTRUCTION)
+            instruction_msg = await callback.message.answer(instruction_text)
+            sent = await callback.message.answer(caption, reply_markup=kb)
+            await state.update_data(
+                current_theme_id=theme_id,
+                current_theme_page=page,
+                last_bot_message_id=sent.message_id,
+                last_instruction_message_id=instruction_msg.message_id,
+            )
+        else:
+            try:
+                await callback.message.edit_text(caption, reply_markup=kb)
+            except TelegramBadRequest as e:
+                if "message is not modified" not in str(e):
+                    raise
+            await state.update_data(current_theme_page=page)
+        telegram_id = str(callback.from_user.id) if callback.from_user else None
+        if telegram_id:
+            try:
+                with get_db_session() as db2:
+                    user = UserService(db2).get_by_telegram_id(telegram_id)
+                    if user:
+                        ProductAnalyticsService(db2).track(
+                            "theme_selected",
+                            user.id,
+                            properties={"button_id": "theme_selected", "theme_id": theme_id, "page": page},
+                        )
+            except Exception:
+                logger.exception("theme_selected track failed")
         await callback.answer()
     except Exception as e:
         logger.exception("Error in select_theme_or_theme_page: %s", e)
@@ -2342,8 +2866,22 @@ async def nav_back_to_themes(callback: CallbackQuery, state: FSMContext, bot: Bo
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
             themes_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in themes]
-        await state.update_data(current_theme_id=None, current_theme_page=None)
-        caption = t("flow.photo_accepted_choose_theme", "✅ Фото принято\n\nВыберите тематику или придумайте свой образ 👇")
+        await state.update_data(
+            current_theme_id=None,
+            current_theme_page=None,
+            selected_trend_id=None,
+            selected_trend_name=None,
+        )
+        caption = t("flow.photo_accepted_choose_theme", PHOTO_ACCEPTED_CAPTION_DEFAULT)
+        telegram_id = str(callback.from_user.id) if callback.from_user else None
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    user = UserService(db).get_by_telegram_id(telegram_id)
+                    if user:
+                        ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "nav_themes"})
+            except Exception:
+                logger.exception("button_click track failed nav_themes")
         await callback.message.edit_text(caption, reply_markup=themes_keyboard(themes_data))
         await callback.answer()
     except Exception as e:
@@ -2398,7 +2936,6 @@ async def select_trend_or_idea(callback: CallbackQuery, state: FSMContext, bot: 
             trend_emoji = trend.emoji
             example_path = _resolve_trend_example_path(getattr(trend, "example_image_path", None), str(trend.id))
             await state.update_data(selected_trend_id=trend_id, selected_trend_name=trend_name)
-            await state.set_state(BotStates.waiting_for_format)
 
             audit.log(
                 actor_type="user",
@@ -2412,32 +2949,26 @@ async def select_trend_or_idea(callback: CallbackQuery, state: FSMContext, bot: 
             if user:
                 ProductAnalyticsService(db).track("trend_viewed", user.id, trend_id=trend_id)
 
-        if example_path:
-            try:
-                photo = FSInputFile(example_path)
-                sent = await callback.message.answer_photo(
-                    photo=photo,
-                    caption=(
-                        f"✅ Тренд: {trend_emoji} {trend_name}\n\n"
-                        "Пример результата 👇\nВыберите формат кадра:"
-                    ),
-                    reply_markup=format_keyboard(),
-                )
-            except Exception as e:
-                logger.warning("Failed to send trend example photo, falling back to text: %s", e)
-                sent = await callback.message.answer(
-                    f"✅ Тренд: {trend_emoji} {trend_name}\n\n"
-                    "Выберите формат кадра:",
-                    reply_markup=format_keyboard(),
-                )
-        else:
-            sent = await callback.message.answer(
-                f"✅ Тренд: {trend_emoji} {trend_name}\n\n"
-                "Выберите формат кадра:",
-                reply_markup=format_keyboard(),
-            )
-        await state.update_data(last_bot_message_id=sent.message_id)
-        await callback.answer()
+        async def answer_alert(text: str, show_alert: bool = False) -> None:
+            await callback.answer(text, show_alert=show_alert)
+
+        to_delete = [
+            data.get("last_instruction_message_id"),
+            data.get("last_bot_message_id"),
+            callback.message.message_id,
+        ]
+        ok = await _create_job_and_start_generation(
+            bot=bot,
+            state=state,
+            format_key=DEFAULT_ASPECT_RATIO,
+            chat_id=callback.message.chat.id,
+            message_ids_to_delete=[mid for mid in to_delete if mid is not None],
+            from_user=callback.from_user,
+            answer_alert=answer_alert,
+            send_progress_to_chat_id=callback.message.chat.id,
+        )
+        if ok:
+            await callback.answer("Генерация запущена!")
     except Exception:
         logger.exception("Error in select_trend_or_idea")
         await callback.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."), show_alert=True)
@@ -2454,17 +2985,37 @@ async def handle_custom_prompt(message: Message, state: FSMContext, bot: Bot):
     if len(prompt) > 2000:
         await message.answer(t("errors.idea_max_length", "Текст слишком длинный. Сократите до 2000 символов."))
         return
-    
+    telegram_id = str(message.from_user.id) if message.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "custom_prompt_submitted",
+                        user.id,
+                        properties={"button_id": "custom_prompt_submitted", "length": len(prompt)},
+                    )
+        except Exception:
+            logger.exception("custom_prompt_submitted track failed")
     data = await state.get_data()
-    await _try_delete_messages(bot, message.chat.id, data.get("last_bot_message_id"), message.message_id)
     await state.update_data(custom_prompt=prompt)
-    await state.set_state(BotStates.waiting_for_format)
-    sent = await message.answer(
-        f"✅ Идея сохранена!\n\n"
-        f"Выберите формат кадра:",
-        reply_markup=format_keyboard(),
+
+    async def _answer_alert_prompt(text: str, show_alert: bool = False) -> None:
+        await message.answer(text, reply_markup=main_menu_keyboard())
+
+    ok = await _create_job_and_start_generation(
+        bot=bot,
+        state=state,
+        format_key=DEFAULT_ASPECT_RATIO,
+        chat_id=message.chat.id,
+        message_ids_to_delete=data.get("last_bot_message_id"),
+        from_user=message.from_user,
+        answer_alert=_answer_alert_prompt,
+        send_progress_to_chat_id=message.chat.id,
     )
-    await state.update_data(last_bot_message_id=sent.message_id)
+    if ok:
+        await message.answer("Генерация запущена!", reply_markup=main_menu_keyboard())
 
 
 # --- Назад к трендам / В меню (с экрана выбора формата) ---
@@ -2510,7 +3061,16 @@ async def nav_back_to_trends(callback: CallbackQuery, state: FSMContext, bot: Bo
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
             themes_data = [{"id": t.id, "name": t.name, "emoji": t.emoji or ""} for t in themes]
-        caption = t("flow.photo_accepted_choose_theme", "Выберите тематику или придумайте свой образ 👇")
+        caption = t("flow.photo_accepted_choose_theme", PHOTO_ACCEPTED_CAPTION_DEFAULT)
+        telegram_id = str(callback.from_user.id) if callback.from_user else None
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    user = UserService(db).get_by_telegram_id(telegram_id)
+                    if user:
+                        ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "nav_trends"})
+            except Exception:
+                logger.exception("button_click track failed nav_trends")
         await callback.message.answer(
             caption,
             reply_markup=themes_keyboard(themes_data),
@@ -2524,6 +3084,18 @@ async def nav_back_to_trends(callback: CallbackQuery, state: FSMContext, bot: Bo
 @router.callback_query(F.data == "nav:menu")
 async def nav_back_to_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
     """Вернуться в главное меню."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "nav_menu"},
+                )
+    except Exception:
+        logger.exception("button_click track failed nav_menu")
     await state.clear()
     await _try_delete_messages(bot, callback.message.chat.id, callback.message.message_id)
     await callback.message.answer(
@@ -2558,13 +3130,17 @@ async def nav_profile(callback: CallbackQuery):
                 remaining = active_session.takes_limit - active_session.takes_used
                 total = active_session.takes_limit
                 if active_session.pack_id == "free_preview":
-                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} бесплатн{'ое фото' if remaining == 1 else 'ых фото'}\nПосле него потребуется пакет."
+                    text += f"Пакет: ✅ {plan_safe}\nОсталось фото: {remaining}\nПосле него потребуется пакет."
                 else:
-                    text += f"Текущий тариф: ✅ {plan_safe}\nОсталось: {remaining} из {total} фото"
-                text += "\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
+                    text += f"Пакет: ✅ {plan_safe}\nОсталось фото: {remaining} из {total}"
+                text += "\n\nСделайте фото или купите пакет,\nчтобы продолжить."
             else:
-                text += "Текущий тариф: —\n\nСделай фото или выбери пакет,\nчтобы открыть больше фотосессий."
-            profile_kb = _profile_keyboard()
+                text += "Пакет: —\n\nКупите пакет, чтобы начать."
+        profile_kb = _profile_keyboard()
+        try:
+            ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "nav_profile"})
+        except Exception:
+            logger.exception("button_click track failed nav_profile")
         await callback.message.answer(text, parse_mode="Markdown", reply_markup=profile_kb)
         await callback.answer()
     except Exception:
@@ -2574,15 +3150,32 @@ async def nav_profile(callback: CallbackQuery):
 
 @router.callback_query(F.data == "profile:payment")
 async def profile_payment(callback: CallbackQuery):
-    """Выбор способа оплаты: Stars или карта."""
+    """Выбор способа пополнения: ЮMoney (первый), Stars, другие способы, перевод на карту."""
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "profile_payment"})
+        except Exception:
+            logger.exception("button_click track failed profile_payment")
     try:
-        text = "Оплатить: Stars в боте или перевод на карту.\n\nВыберите способ:"
+        text = (
+            "Пополнить баланс:\n\n"
+            "• *ЮMoney* — быстрая оплата картой или кошельком в Telegram\n"
+            "• *Stars* — оплата звёздами Telegram\n"
+            "• *Перевод на карту* — если автоматическая оплата не сработала\n\n"
+            "Выберите способ:"
+        )
         kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 ЮMoney", callback_data="shop:open")],
             [InlineKeyboardButton(text="⭐ Stars (в боте)", callback_data="shop:open")],
-            [InlineKeyboardButton(text="💳 Карта (перевод)", callback_data="bank_transfer:start")],
+            [InlineKeyboardButton(text="📘 Другие способы оплаты", callback_data="shop:how_buy_stars")],
+            [InlineKeyboardButton(text="🏦 Перевод на карту (если не сработало)", callback_data="bank_transfer:start")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="nav:profile")],
         ])
-        await callback.message.answer(text, reply_markup=kb)
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=kb)
         await callback.answer()
     except Exception:
         logger.exception("Error in profile_payment")
@@ -2592,15 +3185,24 @@ async def profile_payment(callback: CallbackQuery):
 @router.callback_query(F.data == "profile:support")
 async def profile_support(callback: CallbackQuery):
     """Показать текст поддержки по платежам (как /paysupport)."""
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "profile_support"})
+        except Exception:
+            logger.exception("button_click track failed profile_support")
     try:
         await callback.message.answer(
             t(
                 "cmd.paysupport",
                 "💬 *Поддержка по платежам*\n\n"
-                "Если у вас возникли проблемы с оплатой или начислением генераций:\n\n"
+                "Если у вас возникли проблемы с оплатой или доступом к фото:\n\n"
                 "1. Убедитесь, что у вас достаточно Telegram Stars\n"
                 "2. Проверьте баланс в «👤 Мой профиль»\n"
-                "3. Напишите нам в чат поддержки\n\n"
+                f"3. Напишите нам: @{settings.support_username}\n\n"
                 "Мы обработаем ваш запрос в кратчайшие сроки.\n\n"
                 "⚠️ Telegram support не рассматривает вопросы по покупкам в ботах.",
             ),
@@ -2613,60 +3215,53 @@ async def profile_support(callback: CallbackQuery):
         await callback.answer(t("errors.try_later", "Произошла ошибка. Попробуйте позже."), show_alert=True)
 
 
-# --- Step 3: Format selected, create job and generate ---
-@router.callback_query(F.data.startswith("format:"))
-async def select_format_and_generate(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    """Format selected — create job and start generation."""
-    telegram_id = str(callback.from_user.id)
-    format_key = callback.data.split(":", 1)[1]
-    
-    if format_key not in IMAGE_FORMATS:
-        await callback.answer(t("errors.unknown_format", "Неизвестный формат"), show_alert=True)
-        return
-    
+# --- Step 3: Create job and start generation (format step disabled, always 4:3) ---
+async def _create_job_and_start_generation(
+    *,
+    bot: Bot,
+    state: FSMContext,
+    format_key: str,
+    chat_id: int,
+    message_ids_to_delete: int | list | None,
+    from_user: Any,
+    answer_alert: Any,
+    send_progress_to_chat_id: int,
+) -> bool:
+    """Создать take и запустить генерацию. Возвращает True при успехе, False при ошибке (answer_alert уже вызван)."""
+    telegram_id = str(from_user.id)
     data = await state.get_data()
     photo_file_id = data.get("photo_file_id")
     photo_local_path = data.get("photo_local_path")
-    reference_path = data.get("reference_path")  # флоу «Сделать такую же»: референс (в генерацию не передаём, только identity)
     trend_id = data.get("selected_trend_id")
-    trend_name = data.get("selected_trend_name", "")
     custom_prompt = data.get("custom_prompt")
 
     if not photo_file_id or not photo_local_path:
-        await callback.answer(t("errors.session_expired_photo", "Сессия истекла. Начните заново: отправьте фото."), show_alert=True)
+        await answer_alert(t("errors.session_expired_photo", "Сессия истекла. Начните заново: отправьте фото."), show_alert=True)
         await state.clear()
-        return
-    # Всегда один identity-фото в генерацию (и тренды, и «Сделать такую же»)
+        return False
     input_file_ids = [photo_file_id]
     input_local_paths = [photo_local_path]
-    
     if not trend_id:
-        await callback.answer(t("errors.choose_trend_or_idea", "Выберите тренд или введите свою идею."), show_alert=True)
-        return
-    
+        await answer_alert(t("errors.choose_trend_or_idea", "Выберите тренд или введите свою идею."), show_alert=True)
+        return False
     if trend_id == TREND_CUSTOM_ID and not custom_prompt:
-        await callback.answer(t("errors.enter_idea", "Введите описание своей идеи."), show_alert=True)
-        return
-
-    # Проверка размера файлов до потребления квоты/токенов
+        await answer_alert(t("errors.enter_idea", "Введите описание своей идеи."), show_alert=True)
+        return False
     for path in input_local_paths:
         if os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > settings.max_file_size_mb:
-                await callback.answer(
+                await answer_alert(
                     tr("errors.file_too_large_max", "Файл слишком большой ({size_mb:.1f} МБ). Максимум {max_mb} МБ.", size_mb=size_mb, max_mb=settings.max_file_size_mb),
                     show_alert=True,
                 )
-                return
-    
+                return False
     image_size = IMAGE_FORMATS[format_key]
-    
-    # Idempotency for job creation
-    idempotency_key = f"job:{callback.message.chat.id}:{callback.message.message_id}:{format_key}"
+    _mid = message_ids_to_delete if isinstance(message_ids_to_delete, int) else (message_ids_to_delete[0] if message_ids_to_delete else 0)
+    idempotency_key = f"job:{chat_id}:{_mid}:{format_key}"
     if not IdempotencyStore().check_and_set(idempotency_key):
-        await callback.answer(t("errors.request_processing", "⏳ Запрос уже обрабатывается."))
-        return
-    
+        await answer_alert(t("errors.request_processing", "⏳ Запрос уже обрабатывается."))
+        return False
     try:
         with get_db_session() as db:
             user_service = UserService(db)
@@ -2674,39 +3269,32 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
             take_svc = TakeService(db)
             session_svc = SessionService(db)
             audit = AuditService(db)
-
             user = user_service.get_or_create_user(
                 telegram_id,
-                telegram_username=callback.from_user.username,
-                telegram_first_name=callback.from_user.first_name,
-                telegram_last_name=callback.from_user.last_name,
+                telegram_username=getattr(from_user, "username", None),
+                telegram_first_name=getattr(from_user, "first_name", None),
+                telegram_last_name=getattr(from_user, "last_name", None),
             )
-
             if trend_id != TREND_CUSTOM_ID:
                 trend = trend_service.get(trend_id)
                 if not trend or not trend.enabled:
-                    await callback.answer(t("errors.trend_unavailable", "Тренд недоступен."), show_alert=True)
-                    return
-
+                    await answer_alert(t("errors.trend_unavailable", "Тренд недоступен."), show_alert=True)
+                    return False
             is_copy_flow = bool(data.get("copy_flow_origin"))
             take_type = "COPY" if is_copy_flow else ("CUSTOM" if trend_id == TREND_CUSTOM_ID else "TREND")
             copy_ref = data.get("reference_path") if is_copy_flow else None
-
-            # Determine session context
             session = session_svc.get_active_session(user.id)
             session_id = None
-
             if getattr(user, "is_moderator", False):
                 free_session = session_svc.create_free_preview_session(user.id)
                 session_id = free_session.id
                 ProductAnalyticsService(db).track("collection_started", user.id, session_id=session_id)
             elif session and session.pack_id != "free_preview":
                 if not session_svc.can_take(session):
-                    await callback.answer("📸 Лимит снимков исчерпан. Купите новый пакет.", show_alert=True)
-                    return
+                    await answer_alert("📸 Лимит фото исчерпан. Купите пакет.", show_alert=True)
+                    return False
                 session_id = session.id
             elif (user.free_takes_used or 0) < 1:
-                # Free take -- atomic increment to prevent race conditions
                 from sqlalchemy import update as sa_update, func
                 res = db.execute(
                     sa_update(User)
@@ -2714,17 +3302,15 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
                     .values(free_takes_used=func.coalesce(User.free_takes_used, 0) + 1)
                 )
                 if res.rowcount == 0:
-                    await callback.answer("Бесплатный снимок исчерпан. Купите пакет.", show_alert=True)
-                    return
+                    await answer_alert("Бесплатное фото исчерпано. Купите пакет.", show_alert=True)
+                    return False
                 db.flush()
                 free_session = session_svc.create_free_preview_session(user.id)
                 session_id = free_session.id
                 ProductAnalyticsService(db).track("collection_started", user.id, session_id=session_id)
             else:
-                # No free takes left, no active session — show paywall
-                await callback.answer("Бесплатный снимок исчерпан. Купите пакет.", show_alert=True)
-                return
-
+                await answer_alert("Бесплатное фото исчерпано. Купите пакет.", show_alert=True)
+                return False
             take = take_svc.create_take(
                 user_id=user.id,
                 trend_id=trend_id if trend_id != TREND_CUSTOM_ID else None,
@@ -2737,7 +3323,6 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
                 copy_reference_path=copy_ref,
             )
             created_take_id = take.id
-
             audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
             audit.log(
                 actor_type="user",
@@ -2770,30 +3355,95 @@ async def select_format_and_generate(callback: CallbackQuery, state: FSMContext,
                     trend_id=_tid,
                     take_id=created_take_id,
                 )
-
         from app.core.celery_app import celery_app
-
-        await _try_delete_messages(bot, callback.message.chat.id, data.get("last_bot_message_id"), callback.message.message_id)
-        progress_msg = await callback.message.answer(
+        ids_to_del = [message_ids_to_delete] if isinstance(message_ids_to_delete, int) else (message_ids_to_delete or [])
+        valid_ids = [mid for mid in ids_to_del if mid is not None]
+        await _try_delete_messages(bot, send_progress_to_chat_id, *valid_ids)
+        intro_text = t("progress.generation_intro", GENERATION_INTRO_TEXT)
+        main_kb = main_menu_keyboard()
+        if os.path.exists(GENERATION_INTRO_IMAGE_PATH):
+            try:
+                photo_path, is_temp = path_for_telegram_photo(GENERATION_INTRO_IMAGE_PATH)
+                await bot.send_photo(
+                    send_progress_to_chat_id,
+                    photo=FSInputFile(photo_path),
+                    caption=intro_text,
+                    reply_markup=main_kb,
+                )
+                if is_temp and os.path.isfile(photo_path):
+                    try:
+                        os.unlink(photo_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning("generation_intro_photo_failed", extra={"path": GENERATION_INTRO_IMAGE_PATH, "error": str(e)})
+                await bot.send_message(send_progress_to_chat_id, intro_text, reply_markup=main_kb)
+        else:
+            await bot.send_message(send_progress_to_chat_id, intro_text, reply_markup=main_kb)
+        progress_msg = await bot.send_message(
+            send_progress_to_chat_id,
             t("progress.take_step_1", "⏳ Генерация снимка [🟩⬜⬜] 1/3"),
         )
-
         celery_app.send_task(
             "app.workers.tasks.generate_take.generate_take",
             args=[created_take_id],
             kwargs={
-                "status_chat_id": str(callback.message.chat.id),
+                "status_chat_id": str(send_progress_to_chat_id),
                 "status_message_id": progress_msg.message_id,
             },
         )
-
         await state.clear()
-        await callback.answer("Генерация запущена!")
         logger.info("take_created", extra={"user_id": telegram_id, "take_id": created_take_id})
+        return True
     except Exception:
-        logger.exception("Error in select_format_and_generate", extra={"user_id": telegram_id})
-        await callback.answer(t("errors.try_again", "Ошибка. Попробуйте ещё раз."), show_alert=True)
+        logger.exception("Error in _create_job_and_start_generation", extra={"user_id": telegram_id})
+        await answer_alert(t("errors.try_again", "Ошибка. Попробуйте ещё раз."), show_alert=True)
         await state.clear()
+        return False
+
+
+@router.callback_query(F.data.startswith("format:"))
+async def select_format_and_generate(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Format selected (legacy: кнопки формата оставлены для совместимости) — create job and start generation."""
+    format_key = callback.data.split(":", 1)[1]
+    if format_key not in IMAGE_FORMATS:
+        await callback.answer(t("errors.unknown_format", "Неизвестный формат"), show_alert=True)
+        return
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "format_selected",
+                        user.id,
+                        properties={"button_id": "format_selected", "format": format_key},
+                    )
+        except Exception:
+            logger.exception("format_selected track failed")
+    data = await state.get_data()
+
+    async def answer_alert(text: str, show_alert: bool = False) -> None:
+        await callback.answer(text, show_alert=show_alert)
+
+    to_delete = [
+        data.get("last_instruction_message_id"),
+        data.get("last_bot_message_id"),
+        callback.message.message_id,
+    ]
+    ok = await _create_job_and_start_generation(
+        bot=bot,
+        state=state,
+        format_key=format_key,
+        chat_id=callback.message.chat.id,
+        message_ids_to_delete=[mid for mid in to_delete if mid is not None],
+        from_user=callback.from_user,
+        answer_alert=answer_alert,
+        send_progress_to_chat_id=callback.message.chat.id,
+    )
+    if ok:
+        await callback.answer("Генерация запущена!")
 
 
 # --- Попробовать ещё раз: перегенерация с теми же параметрами ---
@@ -2818,13 +3468,21 @@ async def regenerate_same(callback: CallbackQuery, state: FSMContext, bot: Bot):
             if not job or str(job.user_id) != str(user.id):
                 await callback.answer(t("errors.job_not_found", "Кадр не найден."), show_alert=True)
                 return
+            try:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "regenerate", "job_id": job_id},
+                )
+            except Exception:
+                logger.exception("button_click track failed regenerate")
             if job.status not in {"SUCCEEDED", "FAILED"}:
                 await callback.answer(t("errors.wait_current_generation", "Подождите завершения текущей генерации."), show_alert=True)
                 return
             file_ids = list(job.input_file_ids or [])
             if "ref" in file_ids:
                 await callback.answer(
-                    "Перегенерация для этого кадра недоступна. Загрузите фото заново через меню.",
+                    "Перегенерация для этого фото недоступна. Загрузите фото заново через меню.",
                     show_alert=True,
                 )
                 return
@@ -2898,18 +3556,20 @@ async def regenerate_same(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
             if not used_free_quota and not used_copy_quota:
                 if not user_service.can_reserve(user, settings.generation_cost_tokens):
+                    balance_rejected_total.inc()
                     sec = SecuritySettingsService(db).get_or_create()
                     if is_copy_flow:
                         limit = getattr(sec, "copy_generations_per_user", 1)
-                        msg = f"Бесплатная генерация «Сделать такую же» ({limit}/аккаунт) исчерпана. Пополните баланс."
+                        msg = f"Бесплатное фото «Сделать такую же» ({limit}/аккаунт) исчерпано. Купите пакет."
                     else:
                         limit = getattr(sec, "free_generations_per_user", 3)
-                        msg = f"Бесплатные генерации ({limit}/аккаунт) исчерпаны. Пополните баланс токенов."
+                        msg = f"Бесплатные фото ({limit}/аккаунт) исчерпаны. Купите пакет."
                     await callback.answer(msg, show_alert=True)
                     return
                 new_job_id = str(uuid4())
                 if not user_service.hold_tokens(user, new_job_id, settings.generation_cost_tokens):
-                    await callback.answer(t("errors.reserve_tokens_failed", "Не удалось зарезервировать токены."), show_alert=True)
+                    balance_rejected_total.inc()
+                    await callback.answer(t("errors.reserve_tokens_failed", "Недостаточно доступа. Купите пакет."), show_alert=True)
                     return
             else:
                 new_job_id = None
@@ -2960,6 +3620,7 @@ async def regenerate_same(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 "status_message_id": progress_msg.message_id,
             },
         )
+        jobs_created_total.labels(trend_id=trend_id or "unknown").inc()
         await state.clear()
         await callback.answer(t("errors.regenerate_launched", "Генерация запущена!"))
         logger.info("job_regenerate", extra={"user_id": telegram_id, "job_id": created_job_id, "regenerate_of": job_id})
@@ -2972,15 +3633,37 @@ async def regenerate_same(callback: CallbackQuery, state: FSMContext, bot: Bot):
 # Магазин — покупка пакетов генераций за Stars
 # ===========================================
 
-@router.message(lambda m: (m.text or "").strip() == t("menu.btn.shop", "🛒 Купить тариф"))
+@router.message(lambda m: (m.text or "").strip() == t("menu.btn.shop", "🛒 Купить пакет"))
 async def shop_menu_text(message: Message):
     """Открыть магазин по нажатию кнопки в меню."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_or_create_user(
+                    telegram_id,
+                    telegram_username=message.from_user.username,
+                    telegram_first_name=message.from_user.first_name,
+                    telegram_last_name=message.from_user.last_name,
+                )
+                ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "menu_shop"})
+        except Exception:
+            logger.exception("button_click track failed menu_shop")
     await _show_shop(message)
 
 
 @router.callback_query(F.data == "shop:open")
 async def shop_menu_callback(callback: CallbackQuery):
     """Открыть магазин по нажатию инлайн-кнопки."""
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "shop_open"})
+        except Exception:
+            logger.exception("button_click track failed shop_open")
     await _show_shop(callback.message, edit=False)
     await callback.answer()
 
@@ -2988,20 +3671,29 @@ async def shop_menu_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "shop:how_buy_stars")
 async def shop_how_buy_stars(callback: CallbackQuery):
     """Инструкция «Как купить Stars» + кнопка оплаты картой."""
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "shop_how_buy_stars"})
+        except Exception:
+            logger.exception("button_click track failed shop_how_buy_stars")
     try:
         text = t(
             "shop.how_buy_stars",
             "📘 *Как купить Telegram Stars*\n\n"
-            "1. Откройте любой тариф в боте и нажмите на него.\n"
+            "1. Откройте любой пакет в боте и нажмите на него.\n"
             "2. В открывшемся окне оплаты выберите способ — *Stars* (звёзды).\n"
             "3. Если Stars нет в списке — пополните баланс Stars в настройках Telegram: "
             "Настройки → Telegram Stars (или через оплату в другом боте).\n"
-            "4. Подтвердите оплату — генерации зачислятся автоматически.\n\n"
+            "4. Подтвердите оплату — фото зачислятся на баланс автоматически.\n\n"
             "Не получается оплатить Stars? Можно оплатить *переводом на карту* — нажмите кнопку ниже.",
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить картой (перевод)", callback_data="bank_transfer:start")],
-            [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="shop:open")],
+            [InlineKeyboardButton(text="◀️ Назад к пакетам", callback_data="shop:open")],
         ])
         await callback.message.answer(text, parse_mode="Markdown", reply_markup=kb)
         await callback.answer()
@@ -3011,7 +3703,7 @@ async def shop_how_buy_stars(callback: CallbackQuery):
 
 
 async def _show_shop(message: Message, edit: bool = False):
-    """Экран «Выбор фотосессии» — баланс + тарифы (Avatar → Dating → Creator → Trial). Outcome-first."""
+    """Экран магазина — баланс + пакеты (Neo Start → Neo Pro → Neo Unlimited → Пробный). Outcome-first."""
     try:
         telegram_id = str(message.from_user.id) if message.from_user else ""
         with get_db_session() as db:
@@ -3021,7 +3713,7 @@ async def _show_shop(message: Message, edit: bool = False):
             text, kb_dict = build_balance_tariffs_message(db, telegram_id)
 
         if kb_dict is None:
-            await message.answer(t("shop.unavailable", "Тарифы временно недоступны."), reply_markup=main_menu_keyboard())
+            await message.answer(t("shop.unavailable", "Пакеты временно недоступны."), reply_markup=main_menu_keyboard())
             return
 
         rows = kb_dict.get("inline_keyboard", [])
@@ -3054,9 +3746,12 @@ async def _show_shop(message: Message, edit: bool = False):
         await message.answer(t("shop.load_error", "Ошибка загрузки."), reply_markup=main_menu_keyboard())
 
 
+# Обработчик buy:{pack_id} — прямая отправка invoice за Stars. В текущем UI магазина
+# используются только кнопки paywall:{pack_id} (экран выбора способа оплаты). Оставлен
+# для обратной совместимости со старыми сообщениями в чатах пользователей.
 @router.callback_query(F.data.startswith("buy:"))
 async def buy_pack(callback: CallbackQuery, bot: Bot):
-    """Пользователь выбрал пакет — отправляем invoice."""
+    """Пользователь выбрал пакет — отправляем invoice (Stars). Legacy path; основной UI — paywall:."""
     pack_id = callback.data.split(":", 1)[1]
     telegram_id = str(callback.from_user.id)
 
@@ -3078,9 +3773,25 @@ async def buy_pack(callback: CallbackQuery, bot: Bot):
 
             payload = payment_service.build_payload(pack.id, user.id)
             pack_title = f"{pack.emoji} {pack.name}"
-            pack_desc = f"{pack.tokens} генераций без watermark. {pack.description}"
+            pack_desc = f"{pack.tokens} фото без водяного знака. {pack.description}"
             pack_label = pack.name
             pack_stars = pack.stars_price
+
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                rate = getattr(settings, "star_to_rub", 1.3)
+                ProductAnalyticsService(db).track(
+                    "pay_initiated",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={
+                        "price_stars": pack_stars,
+                        "price_rub": round((pack_stars or 0) * rate, 2),
+                        "flow": "buy_legacy",
+                    },
+                )
+                pay_initiated_total.labels(pack_id=pack_id).inc()
 
         await bot.send_invoice(
             chat_id=callback.message.chat.id,
@@ -3102,7 +3813,7 @@ async def buy_pack(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("unlock_tokens:"))
 async def unlock_photo_with_tokens(callback: CallbackQuery, bot: Bot):
-    """Разблокировать фото с watermark за токены из баланса (без Stars)."""
+    """Разблокировать фото с водяным знаком за фото с баланса (без Stars)."""
     job_id = callback.data.split(":", 1)[1]
     telegram_id = str(callback.from_user.id)
 
@@ -3131,13 +3842,13 @@ async def unlock_photo_with_tokens(callback: CallbackQuery, bot: Bot):
             # Списываем токены из баланса
             unlock_cost = settings.unlock_cost_tokens
             if not user_service.debit_tokens_for_unlock(user, job_id, unlock_cost):
-                await callback.answer("Недостаточно токенов. Используйте оплату Stars.", show_alert=True)
+                await callback.answer("Недостаточно доступа. Купите пакет.", show_alert=True)
                 return
 
             # Записать в payments для единой аналитики (pack_id=unlock_tokens)
             payment_service.record_unlock_tokens(user.id, job_id, unlock_cost)
 
-            # Отправить оригинал без watermark; обновить job (источник истины оплаты)
+            # Отправить оригинал без водяного знака; обновить job (источник истины оплаты)
             original_path = job.output_path_original
             job.is_preview = False
             job.unlocked_at = datetime.now(timezone.utc)
@@ -3159,7 +3870,7 @@ async def unlock_photo_with_tokens(callback: CallbackQuery, bot: Bot):
             photo = FSInputFile(original_path)
             await callback.message.answer_document(
                 document=photo,
-                caption=t("success.unlock_caption", "🔓 Фото разблокировано! Вот ваш кадр в полном качестве (без сжатия)."),
+                caption=t("success.unlock_caption", "🔓 Фото разблокировано! Вот ваше фото в полном качестве (без сжатия)."),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [
                         InlineKeyboardButton(text=t("success.btn.menu", "📋 В меню"), callback_data="success_action:menu"),
@@ -3180,7 +3891,7 @@ async def unlock_photo_with_tokens(callback: CallbackQuery, bot: Bot):
                 preview_to_pay_latency_seconds=latency,
             )
         else:
-            await callback.answer("Файл не найден. Обратитесь в /paysupport.", show_alert=True)
+            await callback.answer(f"Файл не найден. Обратитесь в поддержку: @{settings.support_username}.", show_alert=True)
         logger.info("unlock_with_tokens", extra={"user_id": telegram_id, "job_id": job_id})
     except Exception:
         logger.exception("Error in unlock_photo_with_tokens")
@@ -3215,6 +3926,7 @@ async def unlock_photo_with_hd_credits(callback: CallbackQuery, bot: Bot):
 
             ref_svc = ReferralService(db)
             if not ref_svc.spend_credits(user, 1):
+                balance_rejected_total.inc()
                 await callback.answer("Недостаточно бонусов 4K или есть долг.", show_alert=True)
                 return
 
@@ -3240,7 +3952,7 @@ async def unlock_photo_with_hd_credits(callback: CallbackQuery, bot: Bot):
             photo = FSInputFile(original_path)
             await callback.message.answer_document(
                 document=photo,
-                caption="🎁 Фото разблокировано за бонус 4K! Вот ваш кадр в полном качестве.",
+                caption="🎁 Фото разблокировано за бонус 4K! Вот ваше фото в полном качестве.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [
                         InlineKeyboardButton(text=t("success.btn.menu", "📋 В меню"), callback_data="success_action:menu"),
@@ -3261,7 +3973,7 @@ async def unlock_photo_with_hd_credits(callback: CallbackQuery, bot: Bot):
                 preview_to_pay_latency_seconds=latency,
             )
         else:
-            await callback.answer("Файл не найден. Обратитесь в /paysupport.", show_alert=True)
+            await callback.answer(f"Файл не найден. Обратитесь в поддержку: @{settings.support_username}.", show_alert=True)
         logger.info("unlock_with_hd_credits", extra={"user_id": telegram_id, "job_id": job_id})
     except Exception:
         logger.exception("Error in unlock_photo_with_hd_credits")
@@ -3270,7 +3982,7 @@ async def unlock_photo_with_hd_credits(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("unlock:"))
 async def unlock_photo(callback: CallbackQuery, bot: Bot):
-    """Разблокировать фото с watermark — отправить invoice на unlock_cost_stars."""
+    """Разблокировать фото с водяным знаком — отправить invoice на unlock_cost_stars."""
     job_id = callback.data.split(":", 1)[1]
     telegram_id = str(callback.from_user.id)
 
@@ -3292,15 +4004,35 @@ async def unlock_photo(callback: CallbackQuery, bot: Bot):
                 await callback.answer(t("pay.already_full", "Это фото уже в полном качестве."), show_alert=True)
                 return
 
+            if payment_service.has_unlock_payment_for_job(job_id):
+                await callback.answer(
+                    t("pay.unlock_already_paid", f"Это фото уже оплачено. Если не получили файл — напишите в поддержку: @{settings.support_username}."),
+                    show_alert=True,
+                )
+                return
+
             payload = payment_service.build_payload("unlock", user.id, job_id=job_id)
 
         cost = settings.unlock_cost_stars
         rate = getattr(settings, "star_to_rub", 1.3)
         cost_str = format_stars_rub(cost, rate)
+
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "pay_initiated",
+                    user.id,
+                    pack_id="unlock",
+                    job_id=job_id,
+                    properties={"price_stars": cost, "price_rub": round(cost * rate, 2), "flow": "unlock"},
+                )
+                pay_initiated_total.labels(pack_id="unlock").inc()
+
         await bot.send_invoice(
             chat_id=callback.message.chat.id,
             title=t("unlock.invoice_title", "🔓 Разблокировать фото"),
-            description=tr("unlock.invoice_description", "Получить фото без watermark в полном качестве ({cost})", cost=cost_str),
+            description=tr("unlock.invoice_description", "Получить фото без водяного знака в полном качестве ({cost})", cost=cost_str),
             payload=payload,
             currency="XTR",
             prices=[LabeledPrice(label=t("unlock.invoice_label", "Разблокировка"), amount=cost)],
@@ -3317,68 +4049,100 @@ async def unlock_photo(callback: CallbackQuery, bot: Bot):
 
 @router.pre_checkout_query()
 async def handle_pre_checkout(pre_checkout: PreCheckoutQuery, bot: Bot):
-    """Валидация платежа перед списанием Stars."""
+    """Валидация платежа перед списанием (Stars или ЮMoney)."""
     telegram_id = str(pre_checkout.from_user.id)
     payload = pre_checkout.invoice_payload
+    total_amount = getattr(pre_checkout, "total_amount", None)
+    currency = getattr(pre_checkout, "currency", None)
 
     try:
         with get_db_session() as db:
             payment_service = PaymentService(db)
-            ok, error_msg = payment_service.validate_pre_checkout(payload, telegram_id)
+            ok, error_msg = payment_service.validate_pre_checkout(
+                payload, telegram_id, total_amount=total_amount, currency=currency
+            )
 
         if ok:
             await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
-            logger.info("pre_checkout_approved", extra={"user": telegram_id, "payload": payload})
+            logger.info(
+                "pre_checkout_approved",
+                extra={"user": telegram_id, "payload": payload, "total_amount": total_amount},
+            )
         else:
             await bot.answer_pre_checkout_query(
                 pre_checkout.id, ok=False, error_message=error_msg
             )
+            _reason = "other"
+            if error_msg:
+                em = error_msg.lower()
+                if "позже" in em or "rate" in em or "много" in em:
+                    _reason = "rate_limit"
+                elif "сумм" in em or "amount" in em or "неверн" in em:
+                    _reason = "wrong_amount"
+                elif "не найден" in em or "not found" in em:
+                    _reason = "user_not_found"
+                elif "недоступен" in em or "unavailable" in em:
+                    _reason = "pack_unavailable"
+                elif "блокирован" in em or "blocked" in em:
+                    _reason = "blocked"
+                elif "уже использован" in em or "trial" in em:
+                    _reason = "trial_used"
+            pay_pre_checkout_rejected_total.labels(reason=_reason).inc()
             logger.warning(
                 "pre_checkout_rejected",
-                extra={"user": telegram_id, "payload": payload, "reason": error_msg},
+                extra={
+                    "user": telegram_id,
+                    "payload": payload,
+                    "reason": error_msg,
+                    "total_amount": total_amount,
+                },
             )
+            payment_method = "yoomoney" if payload.startswith("yoomoney_session:") else "stars"
             with get_db_session() as db:
                 user = UserService(db).get_by_telegram_id(telegram_id)
                 if user:
                     ProductAnalyticsService(db).track(
                         "pay_failed",
                         user.id,
-                        properties={"reason": error_msg or "rejected", "payment_method": "stars"},
+                        properties={"reason": error_msg or "rejected", "payment_method": payment_method},
                     )
     except Exception:
         logger.exception("Error in pre_checkout")
+        pay_pre_checkout_rejected_total.labels(reason="internal_error").inc()
         await bot.answer_pre_checkout_query(
             pre_checkout.id, ok=False, error_message="Внутренняя ошибка. Попробуйте позже."
         )
+        payment_method = "yoomoney" if payload.startswith("yoomoney_session:") else "stars"
         with get_db_session() as db:
             user = UserService(db).get_by_telegram_id(telegram_id)
             if user:
                 ProductAnalyticsService(db).track(
                     "pay_failed",
                     user.id,
-                    properties={"reason": "internal_error", "payment_method": "stars"},
+                    properties={"reason": "internal_error", "payment_method": payment_method},
                 )
 
 
 @router.message(F.successful_payment)
 async def handle_successful_payment(message: Message, state: FSMContext, bot: Bot):
-    """Обработка успешного платежа — начисление токенов."""
+    """Обработка успешного платежа — начисление токенов (Stars или ЮMoney)."""
     payment_info = message.successful_payment
     telegram_id = str(message.from_user.id)
     payload = payment_info.invoice_payload
     charge_id = payment_info.telegram_payment_charge_id
     provider_charge_id = payment_info.provider_payment_charge_id
+    payment_committed = True  # по умолчанию не рефандим; в legacy-ветке сбрасываем в False и ставим True в finally
 
     try:
-        # Handle session-based payloads first
-        if payload.startswith("session:") or payload.startswith("upgrade:"):
+        # Handle session-based payloads first (Stars session/upgrade and YooMoney session)
+        if payload.startswith("session:") or payload.startswith("upgrade:") or payload.startswith("yoomoney_session:"):
             with get_db_session() as db:
                 payment_service = PaymentService(db)
                 audit = AuditService(db)
 
                 if payload.startswith("session:"):
                     pack_id = payload.split(":", 1)[1]
-                    payment_obj, session = payment_service.process_session_purchase(
+                    payment_obj, session, trial_flag, attached_free_takes = payment_service.process_session_purchase(
                         telegram_user_id=telegram_id,
                         telegram_payment_charge_id=charge_id,
                         provider_payment_charge_id=provider_charge_id,
@@ -3386,6 +4150,19 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                         stars_amount=payment_info.total_amount,
                         payload=payload,
                     )
+                    if trial_flag == "trial_already_used":
+                        try:
+                            await bot.refund_star_payment(
+                                user_id=message.from_user.id,
+                                telegram_payment_charge_id=charge_id,
+                            )
+                        except Exception:
+                            logger.exception("trial_refund_failed", extra={"charge_id": charge_id})
+                        await message.answer(
+                            t("payment.trial_refunded", "Пробный пакет уже был использован. Средства возвращены на ваш счёт Stars."),
+                            reply_markup=main_menu_keyboard(),
+                        )
+                        return
                     if payment_obj and session:
                         pack = payment_service.get_pack(pack_id)
                         hd_svc = HDBalanceService(db)
@@ -3412,27 +4189,134 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                                 "currency": "XTR",
                             },
                         )
+                        pay_success_total.labels(pack_id=pack_id, payment_method="stars").inc()
+                        payment_amount_stars_total.labels(pack_id=pack_id).inc(payment_info.total_amount)
 
-                        remaining = session.takes_limit - session.takes_used
+                        remaining_display = session.takes_limit if (attached_free_takes and attached_free_takes > 0) else (session.takes_limit - session.takes_used)
                         if is_collection:
                             await state.set_state(BotStates.waiting_for_photo)
                             await message.answer(
                                 f"✅ Коллекция {pack.emoji} {pack.name} активирована!\n\n"
-                                f"Отправьте одно фото — по нему будут созданы все образы коллекции.",
+                                f"Отправьте одно фото — по нему будут созданы все фото коллекции.",
                                 reply_markup=main_menu_keyboard(),
                             )
                         else:
-                            await message.answer(
-                                f"✅ Пакет {pack.emoji} {pack.name} активирован!\n\n"
-                                f"Снимков: {remaining}\n"
-                                f"4K без watermark: {balance['total']}\n\n"
-                                f"Отправьте фото для первого снимка!",
-                                reply_markup=main_menu_keyboard(),
-                            )
+                            try:
+                                text, reply_markup = _pack_activated_message_and_keyboard(
+                                    db, telegram_id, pack.emoji, pack.name, remaining_display
+                                )
+                                await message.answer(text, reply_markup=reply_markup)
+                            except Exception:
+                                logger.exception(
+                                    "pack_activated_message_keyboard_error",
+                                    extra={"telegram_id": telegram_id, "pack_id": pack_id},
+                                )
+                                fallback_text = (
+                                    f"🎉 Поздравляем! Пакет {pack.emoji} {pack.name} активирован.\n\n"
+                                    f"Осталось фото: {remaining_display}"
+                                )
+                                await message.answer(
+                                    fallback_text,
+                                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                        [InlineKeyboardButton(text=t("nav.btn.menu", "📋 В меню"), callback_data="nav:menu")],
+                                    ]),
+                                )
                     elif payment_obj:
                         await message.answer("✅ Платёж уже обработан.")
                     else:
-                        await message.answer("⚠️ Ошибка обработки. Обратитесь в /paysupport.")
+                        await message.answer(f"⚠️ Ошибка обработки. Обратитесь в поддержку: @{settings.support_username}.")
+
+                elif payload.startswith("yoomoney_session:"):
+                    pack_id = payload.split(":", 1)[1]
+                    amount_kopecks = payment_info.total_amount
+                    payment_obj, session, trial_flag, attached_free_takes = payment_service.process_session_purchase_yoomoney(
+                        telegram_user_id=telegram_id,
+                        provider_payment_charge_id=provider_charge_id or charge_id,
+                        pack_id=pack_id,
+                        amount_kopecks=amount_kopecks,
+                        payload=payload,
+                    )
+                    if trial_flag == "trial_already_used":
+                        logger.warning(
+                            "yoomoney_trial_already_used_manual_refund_needed",
+                            extra={
+                                "telegram_id": telegram_id,
+                                "charge_id": charge_id,
+                                "provider_charge_id": provider_charge_id,
+                                "pack_id": pack_id,
+                                "amount_kopecks": amount_kopecks,
+                            },
+                        )
+                        await message.answer(
+                            t("payment.trial_refunded_yoomoney", f"Пробный пакет уже был использован. Обратитесь в поддержку: @{settings.support_username} — мы вернём средства на карту."),
+                            reply_markup=main_menu_keyboard(),
+                        )
+                        return
+                    if payment_obj and session:
+                        pack = payment_service.get_pack(pack_id)
+                        audit.log(
+                            actor_type="user",
+                            actor_id=telegram_id,
+                            action="pay_success",
+                            entity_type="payment",
+                            entity_id=charge_id,
+                            payload={"pack_id": pack_id, "session_id": session.id, "payment_method": "yoomoney"},
+                        )
+                        user = db.query(User).filter(User.telegram_id == telegram_id).one_or_none()
+                        if user:
+                            ProductAnalyticsService(db).track(
+                                "pay_success",
+                                user.id,
+                                pack_id=pack_id,
+                                properties={
+                                    "pack_id": pack_id,
+                                    "price": amount_kopecks / 100,
+                                    "payment_method": "yoomoney",
+                                    "currency": "RUB",
+                                },
+                            )
+                            pay_success_total.labels(pack_id=pack_id, payment_method="yoomoney").inc()
+                            ProductAnalyticsService(db).track(
+                                "yoomoney_payment_succeeded",
+                                user.id,
+                                pack_id=pack_id,
+                                properties={"amount_kopecks": amount_kopecks},
+                            )
+                        remaining_display = session.takes_limit if (attached_free_takes and attached_free_takes > 0) else (session.takes_limit - session.takes_used)
+                        is_collection = getattr(pack, "pack_subtype", "standalone") == "collection" and pack.playlist
+                        if is_collection:
+                            await state.set_state(BotStates.waiting_for_photo)
+                            await message.answer(
+                                f"✅ Коллекция {pack.emoji} {pack.name} активирована!\n\n"
+                                f"Отправьте одно фото — по нему будут созданы все фото коллекции.",
+                                reply_markup=main_menu_keyboard(),
+                            )
+                        else:
+                            try:
+                                text, reply_markup = _pack_activated_message_and_keyboard(
+                                    db, telegram_id, pack.emoji, pack.name, remaining_display
+                                )
+                                await message.answer(text, reply_markup=reply_markup)
+                            except Exception:
+                                logger.exception(
+                                    "pack_activated_message_keyboard_error",
+                                    extra={"telegram_id": telegram_id, "pack_id": pack_id},
+                                )
+                                fallback_text = (
+                                    f"🎉 Поздравляем! Пакет {pack.emoji} {pack.name} активирован.\n\n"
+                                    f"Осталось фото: {remaining_display}"
+                                )
+                                await message.answer(
+                                    fallback_text,
+                                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                        [InlineKeyboardButton(text=t("nav.btn.menu", "📋 В меню"), callback_data="nav:menu")],
+                                    ]),
+                                )
+                    elif payment_obj:
+                        await message.answer("✅ Платёж уже обработан.")
+                    else:
+                        await message.answer(f"⚠️ Ошибка обработки. Обратитесь в поддержку: @{settings.support_username}.")
+                    return
 
                 elif payload.startswith("upgrade:"):
                     parts = payload.split(":")
@@ -3471,19 +4355,20 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                                 "currency": "XTR",
                             },
                         )
+                        pay_success_total.labels(pack_id=new_pack_id, payment_method="stars").inc()
+                        payment_amount_stars_total.labels(pack_id=new_pack_id).inc(payment_info.total_amount)
 
                         remaining = new_session.takes_limit - new_session.takes_used
                         await message.answer(
                             f"⬆️ Апгрейд до {pack.emoji} {pack.name}!\n\n"
-                            f"Снимков: {remaining}\n"
-                            f"4K без watermark: {balance['total']}\n\n"
-                            f"Продолжайте съёмку!",
+                            f"Осталось фото: {remaining}\n\n"
+                            f"Продолжайте!",
                             reply_markup=main_menu_keyboard(),
                         )
                     elif payment_obj:
                         await message.answer("✅ Платёж уже обработан.")
                     else:
-                        await message.answer("⚠️ Ошибка обработки. Обратитесь в /paysupport.")
+                        await message.answer(f"⚠️ Ошибка обработки. Обратитесь в поддержку: @{settings.support_username}.")
 
             return
 
@@ -3497,83 +4382,273 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
 
         if not pack_id and not job_id_unlock:
             logger.warning("successful_payment_invalid_payload", extra={"telegram_id": telegram_id, "charge_id": charge_id})
-            await message.answer(t("payment.unknown_order", "Не удалось определить заказ по платежу. Напишите в /paysupport и укажите время платежа — разберём вручную."))
+            await message.answer(t("payment.unknown_order", f"Не удалось определить заказ по платежу. Напишите @{settings.support_username} и укажите время платежа — разберём вручную."))
             return
 
-        with get_db_session() as db:
-            payment_service = PaymentService(db)
-            user_service = UserService(db)
-            audit = AuditService(db)
+        unlock_delivery_context = None  # (job_id, telegram_id, output_path, user_id, cost, charge_id) — доставка после commit
+        payment_committed = False  # для except: рефанд только если платёж не сохраняли
+        try:
+            with get_db_session() as db:
+                payment_service = PaymentService(db)
+                user_service = UserService(db)
+                audit = AuditService(db)
 
-            if pack_id == "unlock":
-                # Разблокировка фото
-                cost = settings.unlock_cost_stars
-                payment = payment_service.credit_tokens(
-                    telegram_user_id=telegram_id,
-                    telegram_payment_charge_id=charge_id,
-                    provider_payment_charge_id=provider_charge_id,
-                    pack_id="unlock",
-                    stars_amount=cost,
-                    tokens_granted=0,  # не начисляем токены при unlock
-                    payload=payload,
-                    job_id=job_id_unlock,
-                )
-                if payment and job_id_unlock:
-                    # Отправить оригинал без watermark; owner check
+                if pack_id == "unlock":
+                    # Разблокировка фото: проверка владельца и наличия файла до credit_tokens
                     user = user_service.get_by_telegram_id(telegram_id)
                     job = db.query(Job).filter(Job.job_id == job_id_unlock).one_or_none()
-                    if job and user and job.user_id != user.id:
-                        logger.warning("unlock_payment_owner_mismatch", extra={"job_id": job_id_unlock, "telegram_id": telegram_id})
-                    if job and job.output_path_original and user and job.user_id == user.id:
-                        preview_created_at = job.updated_at
-                        from app.services.telegram.client import TelegramClient
-                        tg = TelegramClient()
+                    if not job or not user or job.user_id != user.id:
+                        logger.warning(
+                            "unlock_payment_owner_mismatch",
+                            extra={"job_id": job_id_unlock, "telegram_id": telegram_id, "charge_id": charge_id},
+                        )
                         try:
-                            tg.send_document(
-                                user.telegram_id,
-                                job.output_path_original,
-                                caption=t("success.unlock_caption", "🔓 Фото разблокировано! Вот ваш кадр в полном качестве (без сжатия)."),
-                                reply_markup={
-                                    "inline_keyboard": [
-                                        [
-                                            {"text": t("success.btn.menu", "📋 В меню"), "callback_data": "success_action:menu"},
-                                            {"text": t("success.btn.more", "🔄 Сделать ещё"), "callback_data": "success_action:more"},
-                                        ]
-                                    ]
+                            await bot.refund_star_payment(
+                                user_id=message.from_user.id,
+                                telegram_payment_charge_id=charge_id,
+                            )
+                        except Exception:
+                            logger.exception("unlock_refund_failed", extra={"charge_id": charge_id})
+                        await message.answer(
+                            t("payment.unlock_refunded", "Ошибка заказа. Средства возвращены."),
+                            reply_markup=main_menu_keyboard(),
+                        )
+                        return
+                    elif not job.output_path_original:
+                        logger.warning(
+                            "unlock_payment_file_not_ready_refunding",
+                            extra={"job_id": job_id_unlock, "telegram_id": telegram_id, "charge_id": charge_id},
+                        )
+                        try:
+                            await bot.refund_star_payment(
+                                user_id=message.from_user.id,
+                                telegram_payment_charge_id=charge_id,
+                            )
+                            await message.answer(
+                                t("payment.unlock_file_not_ready_refunded", f"Файл ещё не готов. Средства возвращены на ваш счёт Stars. Попробуйте разблокировать позже или напишите @{settings.support_username}."),
+                                reply_markup=main_menu_keyboard(),
+                            )
+                        except Exception:
+                            logger.exception("unlock_refund_failed", extra={"charge_id": charge_id})
+                            await message.answer(
+                                t("payment.unlock_file_not_ready", f"Оплата принята, но файл ещё не готов. Обратитесь в поддержку: @{settings.support_username} — мы вернём средства вручную."),
+                                reply_markup=main_menu_keyboard(),
+                            )
+                        return
+                    if getattr(job, "unlocked_at", None) or payment_service.has_unlock_payment_for_job(job_id_unlock):
+                        logger.warning(
+                            "unlock_payment_already_unlocked",
+                            extra={"job_id": job_id_unlock, "telegram_id": telegram_id, "charge_id": charge_id},
+                        )
+                        try:
+                            await bot.refund_star_payment(
+                                user_id=message.from_user.id,
+                                telegram_payment_charge_id=charge_id,
+                            )
+                        except Exception:
+                            logger.exception("unlock_refund_failed", extra={"charge_id": charge_id})
+                        await message.answer(
+                            t("payment.unlock_already_refunded", "Фото уже разблокировано. Средства возвращены на ваш счёт Stars."),
+                            reply_markup=main_menu_keyboard(),
+                        )
+                        return
+                    cost = settings.unlock_cost_stars
+                    payment = payment_service.credit_tokens(
+                        telegram_user_id=telegram_id,
+                        telegram_payment_charge_id=charge_id,
+                        provider_payment_charge_id=provider_charge_id,
+                        pack_id="unlock",
+                        stars_amount=cost,
+                        tokens_granted=0,  # не начисляем токены при unlock
+                        payload=payload,
+                        job_id=job_id_unlock,
+                    )
+                    if not payment:
+                        await message.answer(
+                            t("payment.credit_error", f"⚠️ Оплата получена, но произошла ошибка начисления.\nОбратитесь в поддержку: @{settings.support_username} — мы решим вопрос."),
+                            reply_markup=main_menu_keyboard(),
+                        )
+                        return
+                    unlock_delivery_context = (
+                        job_id_unlock,
+                        telegram_id,
+                        job.output_path_original,
+                        user.id,
+                        cost,
+                        charge_id,
+                    )
+                else:
+                    # Покупка пакета генераций
+                    pack = payment_service.get_pack(pack_id)
+                    if not pack:
+                        logger.error("payment_pack_not_found", extra={"pack_id": pack_id})
+                        await message.answer(t("payment.pack_not_found", f"Ошибка: пакет не найден. Обратитесь в поддержку: @{settings.support_username}."))
+                        return
+
+                    payment = payment_service.credit_tokens(
+                        telegram_user_id=telegram_id,
+                        telegram_payment_charge_id=charge_id,
+                        provider_payment_charge_id=provider_charge_id,
+                        pack_id=pack.id,
+                        stars_amount=pack.stars_price,
+                        tokens_granted=pack.tokens,
+                        payload=payload,
+                    )
+
+                    if payment:
+                        user = user_service.get_by_telegram_id(telegram_id)
+                        balance = user.token_balance if user else "?"
+                        await message.answer(
+                            tr(
+                                "payment.pack_success",
+                                "✅ Пакет *{emoji} {name}* активирован!\n\nНачислено: *{tokens}* фото\nВаш баланс: *{balance}* фото\n\nТеперь ваши фото будут без водяного знака!",
+                                emoji=pack.emoji,
+                                name=pack.name,
+                                tokens=pack.tokens,
+                                balance=balance,
+                            ),
+                            parse_mode="Markdown",
+                            reply_markup=main_menu_keyboard(),
+                        )
+                        audit.log(
+                            actor_type="user",
+                            actor_id=telegram_id,
+                            action="payment_pack",
+                            entity_type="payment",
+                            entity_id=charge_id,
+                            payload={"pack_id": pack.id, "stars": pack.stars_price, "tokens": pack.tokens},
+                        )
+                        if user:
+                            ProductAnalyticsService(db).track(
+                                "pay_success",
+                                user.id,
+                                pack_id=pack.id,
+                                properties={
+                                    "pack_id": pack.id,
+                                    "price": pack.stars_price,
+                                    "payment_method": "stars",
+                                    "currency": "XTR",
                                 },
                             )
-                            job.is_preview = False
-                            job.unlocked_at = datetime.now(timezone.utc)
-                            job.unlock_method = "stars"
-                            db.add(job)
-                            latency = (datetime.now(timezone.utc) - preview_created_at).total_seconds() if preview_created_at else None
-                            paywall_record_unlock(
-                                job_id=job_id_unlock,
-                                user_id=user.id,
-                                method="stars",
-                                price_stars=cost,
-                                price_tokens=0,
-                                pack_id="unlock",
-                                receipt_id=charge_id,
-                                preview_to_pay_latency_seconds=latency,
-                            )
-                        finally:
-                            tg.close()
-                    elif user:
-                        await message.answer(t("payment.unlock_send_error", "Оплата прошла, но не удалось отправить фото. Напишите в /paysupport с описанием — мы вышлем кадр вручную."))
+                        pay_success_total.labels(pack_id=pack.id, payment_method="stars").inc()
+                        payment_amount_stars_total.labels(pack_id=pack.id).inc(pack.stars_price or 0)
+                        logger.info(
+                            "pack_payment_completed",
+                            extra={
+                                "user": telegram_id,
+                                "pack": pack.id,
+                                "stars": pack.stars_price,
+                                "tokens": pack.tokens,
+                                "charge_id": charge_id,
+                            },
+                        )
 
-                audit.log(
-                    actor_type="user",
-                    actor_id=telegram_id,
-                    action="payment_unlock",
-                    entity_type="payment",
-                    entity_id=charge_id,
-                    payload={"job_id": job_id_unlock, "stars": cost},
+                        # Referral: mark wow-moment + create bonus for referrer
+                        if user and not getattr(user, "has_purchased_hd", False):
+                            user.has_purchased_hd = True
+                            db.add(user)
+
+                        if user and payment and getattr(user, "referred_by_user_id", None):
+                            try:
+                                ref_svc = ReferralService(db)
+                                referrer = db.query(User).filter(User.id == user.referred_by_user_id).one_or_none()
+                                if referrer:
+                                    bonus = ref_svc.create_bonus(referrer, user, payment)
+                                    if bonus:
+                                        audit.log(
+                                            actor_type="system",
+                                            actor_id="referral",
+                                            action="referral_first_pay_success",
+                                            entity_type="payment",
+                                            entity_id=payment.id,
+                                            payload={
+                                                "referrer_id": referrer.id,
+                                                "referral_id": user.id,
+                                                "pack_stars": pack.stars_price,
+                                                "bonus_credits": bonus.hd_credits_amount,
+                                            },
+                                        )
+                                        audit.log(
+                                            actor_type="system",
+                                            actor_id="referral",
+                                            action="referral_bonus_pending",
+                                            entity_type="referral_bonus",
+                                            entity_id=bonus.id,
+                                            payload={"referrer_id": referrer.id, "credits": bonus.hd_credits_amount},
+                                        )
+                                        referrer_tg_id = referrer.telegram_id
+                                        bonus_credits = bonus.hd_credits_amount
+                                        try:
+                                            from app.services.telegram.client import TelegramClient as TgClient
+                                            tg_notify = TgClient()
+                                            try:
+                                                tg_notify.send_message(
+                                                    referrer_tg_id,
+                                                    f"🎉 Подруга купила пакет! Твой бонус ({bonus_credits} 4K) в обработке.\n"
+                                                    f"Будет доступен через 12–24 часа.",
+                                                )
+                                            finally:
+                                                tg_notify.close()
+                                        except Exception:
+                                            logger.exception("referral_pending_notify_fail")
+                            except Exception:
+                                logger.exception("referral_bonus_creation_error")
+
+                    else:
+                        await message.answer(
+                            t("payment.credit_error", f"⚠️ Оплата получена, но произошла ошибка начисления.\nОбратитесь в поддержку: @{settings.support_username} — мы решим вопрос."),
+                            reply_markup=main_menu_keyboard(),
+                        )
+        finally:
+            payment_committed = True
+
+        if unlock_delivery_context:
+            (job_id_unlock, _telegram_id, output_path, user_id, cost, charge_id) = unlock_delivery_context
+            from app.services.telegram.client import TelegramClient as TgClientUnlock
+            tg = TgClientUnlock()
+            try:
+                tg.send_document(
+                    int(_telegram_id),
+                    output_path,
+                    caption=t("success.unlock_caption", "🔓 Фото разблокировано! Вот ваше фото в полном качестве (без сжатия)."),
+                    reply_markup={
+                        "inline_keyboard": [
+                            [
+                                {"text": t("success.btn.menu", "📋 В меню"), "callback_data": "success_action:menu"},
+                                {"text": t("success.btn.more", "🔄 Сделать ещё"), "callback_data": "success_action:more"},
+                            ]
+                        ]
+                    },
                 )
-                if user:
-                    ProductAnalyticsService(db).track(
+                with get_db_session() as db2:
+                    job = db2.query(Job).filter(Job.job_id == job_id_unlock).one_or_none()
+                    if job:
+                        job.is_preview = False
+                        job.unlocked_at = datetime.now(timezone.utc)
+                        job.unlock_method = "stars"
+                        db2.add(job)
+                    paywall_record_unlock(
+                        job_id=job_id_unlock,
+                        user_id=user_id,
+                        method="stars",
+                        price_stars=cost,
+                        price_tokens=0,
+                        pack_id="unlock",
+                        receipt_id=charge_id,
+                        preview_to_pay_latency_seconds=None,
+                    )
+                    audit2 = AuditService(db2)
+                    audit2.log(
+                        actor_type="user",
+                        actor_id=_telegram_id,
+                        action="payment_unlock",
+                        entity_type="payment",
+                        entity_id=charge_id,
+                        payload={"job_id": job_id_unlock, "stars": cost},
+                    )
+                    ProductAnalyticsService(db2).track(
                         "pay_success",
-                        user.id,
+                        user_id,
                         pack_id="unlock",
                         properties={
                             "pack_id": "unlock",
@@ -3582,134 +4657,43 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
                             "currency": "XTR",
                         },
                     )
+                    pay_success_total.labels(pack_id="unlock", payment_method="stars").inc()
+                    payment_amount_stars_total.labels(pack_id="unlock").inc(cost)
                 logger.info(
                     "unlock_payment_completed",
-                    extra={"user": telegram_id, "job_id": job_id_unlock, "charge_id": charge_id},
+                    extra={"user": _telegram_id, "job_id": job_id_unlock, "charge_id": charge_id},
                 )
-            else:
-                # Покупка пакета генераций
-                pack = payment_service.get_pack(pack_id)
-                if not pack:
-                    logger.error("payment_pack_not_found", extra={"pack_id": pack_id})
-                    await message.answer(t("payment.pack_not_found", "Ошибка: пакет не найден. Обратитесь в /paysupport."))
-                    return
-
-                payment = payment_service.credit_tokens(
-                    telegram_user_id=telegram_id,
-                    telegram_payment_charge_id=charge_id,
-                    provider_payment_charge_id=provider_charge_id,
-                    pack_id=pack.id,
-                    stars_amount=pack.stars_price,
-                    tokens_granted=pack.tokens,
-                    payload=payload,
+            except Exception:
+                logger.exception(
+                    "unlock_delivery_failed",
+                    extra={"job_id": job_id_unlock, "charge_id": charge_id, "telegram_id": _telegram_id},
                 )
+                await message.answer(
+                    t("payment.unlock_send_error", f"Оплата принята. Не удалось отправить фото — напишите в поддержку: @{settings.support_username}."),
+                    reply_markup=main_menu_keyboard(),
+                )
+            finally:
+                tg.close()
 
-                if payment:
-                    user = user_service.get_by_telegram_id(telegram_id)
-                    balance = user.token_balance if user else "?"
-                    await message.answer(
-                        tr(
-                            "payment.pack_success",
-                            "✅ Пакет *{emoji} {name}* активирован!\n\nНачислено: *{tokens}* генераций\nВаш баланс: *{balance}* генераций\n\nТеперь ваши фото будут без watermark!",
-                            emoji=pack.emoji,
-                            name=pack.name,
-                            tokens=pack.tokens,
-                            balance=balance,
-                        ),
-                        parse_mode="Markdown",
-                        reply_markup=main_menu_keyboard(),
-                    )
-                    audit.log(
-                        actor_type="user",
-                        actor_id=telegram_id,
-                        action="payment_pack",
-                        entity_type="payment",
-                        entity_id=charge_id,
-                        payload={"pack_id": pack.id, "stars": pack.stars_price, "tokens": pack.tokens},
-                    )
-                    if user:
-                        ProductAnalyticsService(db).track(
-                            "pay_success",
-                            user.id,
-                            pack_id=pack.id,
-                            properties={
-                                "pack_id": pack.id,
-                                "price": pack.stars_price,
-                                "payment_method": "stars",
-                                "currency": "XTR",
-                            },
-                        )
-                    logger.info(
-                        "pack_payment_completed",
-                        extra={
-                            "user": telegram_id,
-                            "pack": pack.id,
-                            "stars": pack.stars_price,
-                            "tokens": pack.tokens,
-                            "charge_id": charge_id,
-                        },
-                    )
-
-                    # Referral: mark wow-moment + create bonus for referrer
-                    if user and not getattr(user, "has_purchased_hd", False):
-                        user.has_purchased_hd = True
-                        db.add(user)
-
-                    if user and payment and getattr(user, "referred_by_user_id", None):
-                        try:
-                            ref_svc = ReferralService(db)
-                            referrer = db.query(User).filter(User.id == user.referred_by_user_id).one_or_none()
-                            if referrer:
-                                bonus = ref_svc.create_bonus(referrer, user, payment)
-                                if bonus:
-                                    audit.log(
-                                        actor_type="system",
-                                        actor_id="referral",
-                                        action="referral_first_pay_success",
-                                        entity_type="payment",
-                                        entity_id=payment.id,
-                                        payload={
-                                            "referrer_id": referrer.id,
-                                            "referral_id": user.id,
-                                            "pack_stars": pack.stars_price,
-                                            "bonus_credits": bonus.hd_credits_amount,
-                                        },
-                                    )
-                                    audit.log(
-                                        actor_type="system",
-                                        actor_id="referral",
-                                        action="referral_bonus_pending",
-                                        entity_type="referral_bonus",
-                                        entity_id=bonus.id,
-                                        payload={"referrer_id": referrer.id, "credits": bonus.hd_credits_amount},
-                                    )
-                                    referrer_tg_id = referrer.telegram_id
-                                    bonus_credits = bonus.hd_credits_amount
-                                    try:
-                                        from app.services.telegram.client import TelegramClient as TgClient
-                                        tg_notify = TgClient()
-                                        try:
-                                            tg_notify.send_message(
-                                                referrer_tg_id,
-                                                f"🎉 Подруга купила пакет! Твой бонус ({bonus_credits} 4K) в обработке.\n"
-                                                f"Будет доступен через 12–24 часа.",
-                                            )
-                                        finally:
-                                            tg_notify.close()
-                                    except Exception:
-                                        logger.exception("referral_pending_notify_fail")
-                        except Exception:
-                            logger.exception("referral_bonus_creation_error")
-
-                else:
-                    await message.answer(
-                        t("payment.credit_error", "⚠️ Оплата получена, но произошла ошибка начисления.\nОбратитесь в /paysupport — мы решим вопрос."),
-                        reply_markup=main_menu_keyboard(),
-                    )
     except Exception:
         logger.exception("Error in successful_payment", extra={"charge_id": charge_id})
+        if not payment_committed and not payload.startswith("yoomoney_session:"):
+            try:
+                await bot.refund_star_payment(
+                    user_id=message.from_user.id,
+                    telegram_payment_charge_id=charge_id,
+                )
+                logger.info(
+                    "payment_failed_refund_attempt",
+                    extra={"charge_id": charge_id, "telegram_id": getattr(message.from_user, "id", None)},
+                )
+            except Exception as ref_e:
+                logger.exception(
+                    "payment_failed_refund_error",
+                    extra={"charge_id": charge_id, "error": str(ref_e)},
+                )
         await message.answer(
-            t("payment.generic_error", "⚠️ Произошла ошибка при обработке платежа.\nОбратитесь в /paysupport."),
+            t("payment.generic_error", f"⚠️ Произошла ошибка при обработке платежа.\nОбратитесь в поддержку: @{settings.support_username}."),
             reply_markup=main_menu_keyboard(),
         )
 
@@ -3721,15 +4705,28 @@ async def handle_successful_payment(message: Message, state: FSMContext, bot: Bo
 @router.message(Command("paysupport"))
 async def cmd_paysupport(message: Message):
     """Поддержка по платежам (требование Telegram для ботов с оплатой)."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
     try:
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    user = UserService(db).get_or_create_user(
+                        telegram_id,
+                        telegram_username=message.from_user.username,
+                        telegram_first_name=message.from_user.first_name,
+                        telegram_last_name=message.from_user.last_name,
+                    )
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "paysupport"})
+            except Exception:
+                logger.exception("button_click track failed paysupport")
         await message.answer(
             t(
                 "cmd.paysupport",
                 "💬 *Поддержка по платежам*\n\n"
-                "Если у вас возникли проблемы с оплатой или начислением генераций:\n\n"
+                "Если у вас возникли проблемы с оплатой или доступом к фото:\n\n"
                 "1. Убедитесь, что у вас достаточно Telegram Stars\n"
                 "2. Проверьте баланс в «👤 Мой профиль»\n"
-                "3. Напишите нам в чат поддержки\n\n"
+                f"3. Напишите нам: @{settings.support_username}\n\n"
                 "Мы обработаем ваш запрос в кратчайшие сроки.\n\n"
                 "⚠️ Telegram support не рассматривает вопросы по покупкам в ботах.",
             ),
@@ -3744,15 +4741,28 @@ async def cmd_paysupport(message: Message):
 @router.message(Command("terms"))
 async def cmd_terms(message: Message):
     """Условия использования (требование Telegram для ботов с оплатой)."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
     try:
+        if telegram_id:
+            try:
+                with get_db_session() as db:
+                    user = UserService(db).get_or_create_user(
+                        telegram_id,
+                        telegram_username=message.from_user.username,
+                        telegram_first_name=message.from_user.first_name,
+                        telegram_last_name=message.from_user.last_name,
+                    )
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "terms"})
+            except Exception:
+                logger.exception("button_click track failed terms")
         await message.answer(
             t(
                 "cmd.terms",
-                "📄 *Условия использования NanoBanan*\n\n"
-                "1. Генерации приобретаются за Telegram Stars.\n"
-                "2. Бесплатные генерации дают результат с watermark (превью).\n"
-                "3. Оплаченные генерации дают полное качество без watermark.\n"
-                "4. Возврат Stars возможен до использования генераций.\n"
+                "📄 *Условия использования NeoBanana*\n\n"
+                "1. Пакеты фото приобретаются за Telegram Stars.\n"
+                "2. Бесплатные превью — с водяным знаком.\n"
+                "3. Оплаченный пакет даёт фото в полном качестве без водяного знака.\n"
+                "4. Возврат Stars возможен до использования фото из пакета.\n"
                 "5. Администрация вправе отказать в обслуживании при нарушении правил.\n"
                 "6. Все сгенерированные изображения — результат работы ИИ.\n\n"
                 "Используя бота, вы соглашаетесь с этими условиями.",
@@ -3774,8 +4784,18 @@ async def cmd_terms(message: Message):
 )
 async def handle_error_recovery(callback: CallbackQuery, state: FSMContext):
     """После генерации (успех или ошибка): вернуться в меню или сгенерировать ещё."""
-    await state.clear()
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
     action = callback.data.split(":", 1)[-1]  # menu, retry или more
+    button_id = "success_menu" if callback.data == "success_action:menu" else "success_more" if callback.data == "success_action:more" else "error_menu" if action == "menu" else "error_retry"
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": button_id})
+        except Exception:
+            logger.exception("button_click track failed handle_error_recovery")
+    await state.clear()
     if action == "menu":
         await callback.message.answer(
             t("action.choose", "Выберите действие:"),
@@ -3839,6 +4859,14 @@ async def error_choose_trend(callback: CallbackQuery, state: FSMContext, bot: Bo
             if not user or not job or str(job.user_id) != str(user.id):
                 await callback.answer(t("errors.job_not_found", "Кадр не найден."), show_alert=True)
                 return
+            try:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "error_choose_trend", "job_id": failed_job_id},
+                )
+            except Exception:
+                logger.exception("button_click track failed error_choose_trend")
 
             file_ids = list(job.input_file_ids or [])
             if "ref" in file_ids:
@@ -3903,8 +4931,17 @@ async def error_choose_trend(callback: CallbackQuery, state: FSMContext, bot: Bo
 
 @router.callback_query(F.data == "bank_transfer:start")
 async def bank_transfer_start(callback: CallbackQuery, state: FSMContext):
-    """Шаг 1: описание оплаты переводом + 3 кнопки тарифов (тексты и включение из БД)."""
+    """Шаг 1: описание оплаты переводом + кнопки пакетов (тексты и включение из БД)."""
+    telegram_id = str(callback.from_user.id)
     try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "bank_transfer"},
+                )
         with get_db_session() as db:
             bank_svc = BankTransferSettingsService(db)
             effective = bank_svc.get_effective()
@@ -3953,11 +4990,24 @@ def _generate_receipt_code() -> str:
 
 @router.callback_query(F.data.startswith("bank_pack:"))
 async def bank_pack_selected(callback: CallbackQuery, state: FSMContext):
-    """Шаг 2: пользователь выбрал тариф — показываем реквизиты и ждём чек (из БД)."""
+    """Шаг 2: пользователь выбрал пакет — показываем реквизиты и ждём чек (из БД)."""
     pack_id = callback.data.split(":", 1)[1]
     if pack_id not in PRODUCT_LADDER_IDS:
         await callback.answer("Пакет недоступен.", show_alert=True)
         return
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "button_click",
+                        user.id,
+                        properties={"button_id": f"bank_pack_{pack_id}", "pack_id": pack_id},
+                    )
+        except Exception:
+            logger.exception("button_click track failed bank_pack")
     try:
         with get_db_session() as db:
             payment_service = PaymentService(db)
@@ -3970,6 +5020,26 @@ async def bank_pack_selected(callback: CallbackQuery, state: FSMContext):
             pack_name = f"{pack.emoji} {pack.name}"
             tokens = pack.tokens
             stars_price = pack.stars_price
+            user = UserService(db).get_or_create_user(
+                str(callback.from_user.id),
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+            if user:
+                ProductAnalyticsService(db).track(
+                    "pack_selected",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"pack_id": pack_id, "flow": "bank_transfer"},
+                )
+                rate_bt = getattr(settings, "star_to_rub", 1.3)
+                ProductAnalyticsService(db).track(
+                    "pay_initiated",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"method": "bank_transfer", "price_stars": stars_price, "price_rub": round((stars_price or 0) * rate_bt, 2)},
+                )
 
         rate = getattr(settings, "star_to_rub", 1.3)
         expected_rub = round(stars_price * rate)
@@ -4015,9 +5085,18 @@ async def bank_pack_selected(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "bank_transfer:cancel")
 async def bank_transfer_cancel(callback: CallbackQuery, state: FSMContext):
     """Отмена оплаты переводом."""
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "bank_transfer_cancel"})
+        except Exception:
+            logger.exception("button_click track failed bank_transfer_cancel")
     await state.clear()
     await callback.message.answer(
-        "Оплата отменена. Вы можете купить генерации за Stars в магазине.",
+        "Оплата отменена. Вы можете купить пакет за Stars в магазине.",
         reply_markup=main_menu_keyboard(),
     )
     await callback.answer()
@@ -4026,6 +5105,15 @@ async def bank_transfer_cancel(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "bank_transfer:retry")
 async def bank_transfer_retry(callback: CallbackQuery, state: FSMContext):
     """Сброс счётчика попыток после 3 неудач — можно отправить чек снова."""
+    telegram_id = str(callback.from_user.id) if callback.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "bank_transfer_retry"})
+        except Exception:
+            logger.exception("button_click track failed bank_transfer_retry")
     await state.update_data(bank_receipt_attempts=0)
     try:
         await callback.message.edit_text(
@@ -4177,6 +5265,20 @@ async def _process_bank_receipt(message: Message, state: FSMContext, file_path: 
 
     # --- Rate limit (6.4) ---
     if not _check_receipt_rate_limit(telegram_id):
+        with get_db_session() as db:
+            _create_receipt_log(
+                db,
+                telegram_user_id=telegram_id,
+                file_path=file_path,
+                raw_vision_response="",
+                regex_pattern="",
+                extracted_amount_rub=None,
+                expected_rub=float(expected_rub),
+                match_success=False,
+                pack_id=pack_id,
+                rejection_reason="rate_limited",
+            )
+            db.commit()
         await message.answer(
             "⚠️ Слишком много попыток. Пожалуйста, подождите час и попробуйте снова."
         )
@@ -4281,21 +5383,60 @@ async def _process_bank_receipt(message: Message, state: FSMContext, file_path: 
         if overall_success:
             reference = str(uuid4())
             payment_id_created = None
+            is_session_pack = pack_id in PRODUCT_LADDER_IDS
+            session_balance_line: str | None = None
+            session_takes_limit: int | None = None
+
             with get_db_session() as db:
                 payment_service = PaymentService(db)
-                payment = payment_service.credit_tokens_manual(
-                    telegram_user_id=telegram_id,
-                    pack_id=pack_id,
-                    stars_amount=stars,
-                    tokens_granted=tokens,
-                    reference=reference,
-                )
-                if payment:
-                    payment_id_created = payment.id
-                    user = db.query(User).filter(User.telegram_id == telegram_id).one_or_none()
-                    balance = user.token_balance if user else tokens
+                if is_session_pack:
+                    payment, session, trial_error, attached_free_takes = payment_service.process_session_purchase_bank_transfer(
+                        telegram_user_id=telegram_id,
+                        pack_id=pack_id,
+                        amount_rub=float(amount),
+                        reference=reference,
+                    )
+                    if trial_error == "trial_already_used":
+                        db.rollback()
+                        with get_db_session() as db_log:
+                            _create_receipt_log(
+                                db_log,
+                                telegram_user_id=telegram_id,
+                                file_path=file_path,
+                                match_success=False,
+                                rejection_reason="trial_already_used",
+                                **log_kwargs,
+                            )
+                            db_log.commit()
+                        await state.clear()
+                        await wait_msg.edit_text(
+                            f"Пробный пакет уже был использован. Обратитесь в поддержку: @{settings.support_username} — мы вернём средства на карту.",
+                            parse_mode="Markdown",
+                        )
+                        logger.warning(
+                            "bank_transfer_trial_already_used",
+                            extra={"user_id": telegram_id, "pack_id": pack_id},
+                        )
+                        return
+                    if payment:
+                        payment_id_created = payment.id
+                    if session:
+                        if attached_free_takes and attached_free_takes > 0:
+                            remaining_display = session.takes_limit
+                            session_balance_line = f"Осталось фото: {remaining_display} из {session.takes_limit}"
+                        else:
+                            session_balance_line = get_balance_line(db, telegram_id)
+                        session_takes_limit = session.takes_limit
                 else:
-                    balance = tokens
+                    payment = payment_service.credit_tokens_manual(
+                        telegram_user_id=telegram_id,
+                        pack_id=pack_id,
+                        stars_amount=stars,
+                        tokens_granted=tokens,
+                        reference=reference,
+                    )
+                    if payment:
+                        payment_id_created = payment.id
                 _create_receipt_log(
                     db,
                     telegram_user_id=telegram_id,
@@ -4310,9 +5451,20 @@ async def _process_bank_receipt(message: Message, state: FSMContext, file_path: 
             _mark_fingerprint_used(fingerprint, telegram_id)
 
             await state.clear()
-            success_text = effective["success_message"].format(
-                pack_name=pack_name, tokens=tokens, balance=balance
-            )
+            if is_session_pack and session_balance_line is not None and session_takes_limit is not None:
+                success_text = effective["success_message"].format(
+                    pack_name=pack_name,
+                    tokens=session_takes_limit,
+                    balance=session_balance_line,
+                )
+            else:
+                user = None
+                with get_db_session() as db:
+                    user = db.query(User).filter(User.telegram_id == telegram_id).one_or_none()
+                balance = user.token_balance if user else tokens
+                success_text = effective["success_message"].format(
+                    pack_name=pack_name, tokens=tokens, balance=balance
+                )
             await wait_msg.edit_text(success_text, parse_mode="Markdown")
             logger.info(
                 "bank_transfer_success",
@@ -4333,7 +5485,7 @@ async def _process_bank_receipt(message: Message, state: FSMContext, file_path: 
             if attempts >= BANK_RECEIPT_MAX_ATTEMPTS:
                 support_text = (
                     f"❌ *Не удалось подтвердить оплату* (попытка {attempts}).\n\n"
-                    "Обратитесь в поддержку: /paysupport — укажите время перевода и приложите чек, мы проверим вручную.\n\n"
+                    f"Обратитесь в поддержку: @{settings.support_username} — укажите время перевода и приложите чек, мы проверим вручную.\n\n"
                     "Или попробуйте отправить чек ещё раз."
                 )
                 retry_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -4386,6 +5538,19 @@ async def _process_bank_receipt(message: Message, state: FSMContext, file_path: 
 @router.message(BotStates.bank_transfer_waiting_receipt, F.photo)
 async def bank_receipt_photo(message: Message, state: FSMContext, bot: Bot):
     """Приём чека как фото."""
+    telegram_id = str(message.from_user.id) if message.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "bank_receipt_uploaded",
+                        user.id,
+                        properties={"button_id": "bank_receipt_uploaded", "type": "photo"},
+                    )
+        except Exception:
+            logger.exception("bank_receipt_uploaded track failed")
     try:
         photo = message.photo[-1]  # наибольшее разрешение
         file = await bot.get_file(photo.file_id)
@@ -4426,6 +5591,19 @@ async def bank_receipt_document(message: Message, state: FSMContext, bot: Bot):
             )
         return
 
+    telegram_id = str(message.from_user.id) if message.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "bank_receipt_uploaded",
+                        user.id,
+                        properties={"button_id": "bank_receipt_uploaded", "type": "document"},
+                    )
+        except Exception:
+            logger.exception("bank_receipt_uploaded track failed")
     try:
         file = await bot.get_file(doc.file_id)
         receipt_dir = os.path.join(settings.storage_base_path, "receipts")
@@ -4484,7 +5662,7 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
             take = take_svc.get_take(take_id)
             if not take:
-                await callback.answer("❌ Снимок не найден", show_alert=True)
+                await callback.answer("❌ Фото не найдено", show_alert=True)
                 return
 
             user = user_service.get_or_create_user(
@@ -4536,6 +5714,11 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
             variant_position = {"A": 1, "B": 2, "C": 3}.get(variant, 0)
             _trend_id = getattr(take, "trend_id", None)
             ProductAnalyticsService(db).track(
+                "button_click",
+                user.id,
+                properties={"button_id": f"variant_{variant.lower()}"},
+            )
+            ProductAnalyticsService(db).track(
                 "favorite_selected",
                 user.id,
                 session_id=take.session_id,
@@ -4543,6 +5726,7 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 take_id=take_id,
                 properties={"variant_id": variant, "variant_position": variant_position},
             )
+            favorite_selected_total.inc()
             if _trend_id:
                 ProductAnalyticsService(db).track(
                     "trend_favorite_selected",
@@ -4554,11 +5738,18 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 )
             session_id = take.session_id
             user_is_moderator = getattr(user, "is_moderator", False)
+            session_svc = SessionService(db)
+            active_session = session_svc.get_active_session(user.id)
+            has_active_paid_remaining = bool(
+                active_session
+                and (str(active_session.pack_id or "").strip().lower() != "free_preview")
+                and ((active_session.takes_limit or 0) - (active_session.takes_used or 0) > 0)
+            )
             fav_id = str(fav.id) if fav else None
             hd_svc = HDBalanceService(db)
             balance = hd_svc.get_balance(user)
 
-            trend_label = "Снимок"
+            trend_label = "Фото"
             if getattr(take, "trend_id", None):
                 trend = TrendService(db).get(take.trend_id)
                 if trend:
@@ -4574,50 +5765,176 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 if session and session.pack_id == "free_preview":
                     is_free = True
 
-        if (is_free or not session_id) and not user_is_moderator:
-            await _show_paywall_after_free_take(callback.message, telegram_id, take_id, variant)
-        else:
-            is_collection = False
-            collection_info = ""
-            if session_id:
-                with get_db_session() as db:
-                    session_svc = SessionService(db)
-                    session = session_svc.get_session(session_id)
-                    if session and session_svc.is_collection(session):
-                        is_collection = True
-                        fav_svc_c = FavoriteService(db)
-                        fav_count_c = fav_svc_c.count_favorites(session.id)
-                        selected_c = fav_svc_c.count_selected_for_hd(session.id)
-                        hd_rem_c = session_svc.hd_remaining(session)
-                        collection_info = (
-                            f"\n\nВсего превью: {session.takes_used * 3}/{session.takes_limit * 3}\n"
-                            f"4K осталось: {hd_rem_c} | В избранном: {fav_count_c} (для 4K: {selected_c})"
+        if (is_free or not session_id) and not user_is_moderator and not has_active_paid_remaining:
+            # Оплата по ссылке ЮKassa за разблокировку одного фото (вариант A/B/C)
+            yookassa = YooKassaClient()
+            if not yookassa.is_configured():
+                logger.info(
+                    "choose_variant_yookassa_not_configured",
+                    extra={"telegram_id": telegram_id, "take_id": take_id, "variant": variant},
+                )
+                await callback.message.answer(
+                    "⚠️ Возникла временная ошибка при оплате.\n\n"
+                    "Мы уже исправляем её.\n\n"
+                    "Нажмите «Помощь» —\n"
+                    "поддержка ответит оперативно\n"
+                    "и поможет завершить оплату.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🆘 Помощь", callback_data="profile:support")],
+                        [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                    ]),
+                )
+                return
+            # Чистый переход: только ссылка на оплату, без меню тарифов
+            with get_db_session() as db:
+                    ok, err = validate_can_create_unlock(db, telegram_id, take_id, variant)
+                    if not ok:
+                        await callback.message.answer(f"❌ {err}")
+                        return
+                    unlock_svc = UnlockOrderService(db)
+                    existing_paid = unlock_svc.get_order_with_paid_or_delivered(telegram_id, take_id, variant)
+                    if existing_paid:
+                        take_for_path = TakeService(db).get_take(take_id)
+                        sent = False
+                        if take_for_path:
+                            _, original_path = TakeService(db).get_variant_paths(take_for_path, variant)
+                            if original_path and os.path.exists(original_path):
+                                from app.services.telegram.client import TelegramClient as TgClient
+                                tg = TgClient()
+                                try:
+                                    from app.services.unlock_order.service import unlock_photo_display_filename
+                                    tg.send_document(
+                                        int(telegram_id),
+                                        original_path,
+                                        caption=(
+                                            "🎉 Отличный выбор!\n\n"
+                                            "Вот ваш снимок\n"
+                                            "без водяных знаков\n"
+                                            "и в полном качестве.\n\n"
+                                            "Сохраните его —\n"
+                                            "он идеально подойдёт\n"
+                                            "для соцсетей."
+                                        ),
+                                        filename=unlock_photo_display_filename(existing_paid.id, original_path),
+                                    )
+                                    sent = True
+                                finally:
+                                    tg.close()
+                        if sent:
+                            await callback.message.answer(
+                                "Фото уже разблокировано. Отправили ещё раз в чат.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                                ]),
+                            )
+                        else:
+                            await callback.message.answer(
+                                "Файл временно недоступен. Попробуйте нажать «Получить фото снова» позже.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="🔄 Получить фото снова", callback_data=f"unlock_resend:{existing_paid.id}")],
+                                    [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                                ]),
+                            )
+                        return
+                    order, is_new = unlock_svc.create_or_get_pending_order(telegram_id, take_id, variant)
+                    if not is_new and order.confirmation_url:
+                        await callback.message.answer(
+                            "Перейдите по ссылке для оплаты:",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="💳 Перейти к оплате", url=order.confirmation_url)],
+                                [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                            ]),
                         )
-
+                        return
+                    bot_username = (getattr(settings, "telegram_bot_username", None) or "").strip()
+                    if not bot_username:
+                        logger.info(
+                            "choose_variant_no_bot_username",
+                            extra={"telegram_id": telegram_id, "take_id": take_id},
+                        )
+                        await callback.message.answer(
+                            "⚠️ Возникла временная ошибка при оплате.\n\n"
+                            "Мы уже исправляем её.\n\n"
+                            "Нажмите «Помощь» —\n"
+                            "поддержка ответит оперативно\n"
+                            "и поможет завершить оплату.",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="🆘 Помощь", callback_data="profile:support")],
+                                [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                            ]),
+                        )
+                        return
+                    return_url = f"https://t.me/{bot_username}?start=unlock_done_{order.id}"
+                    idempotence_key = str(uuid4())
+                    try:
+                        result = yookassa.create_payment(
+                            order_id=order.id,
+                            return_url=return_url,
+                            idempotence_key=idempotence_key,
+                        )
+                    except YooKassaClientError as e:
+                        logger.warning("yookassa_create_payment_failed", extra={"order_id": order.id, "error": str(e)})
+                        await callback.message.answer(
+                            "⚠️ Возникла временная ошибка при оплате.\n\n"
+                            "Мы уже исправляем её.\n\n"
+                            "Нажмите «Помощь» —\n"
+                            "поддержка ответит оперативно\n"
+                            "и поможет завершить оплату.",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="🆘 Помощь", callback_data="profile:support")],
+                                [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                            ]),
+                        )
+                        return
+                    conf = result.get("confirmation", {}) or {}
+                    confirmation_url = (conf.get("confirmation_url") or "").strip()
+                    yookassa_payment_id = (result.get("id") or "").strip()
+                    if not confirmation_url or not yookassa_payment_id:
+                        logger.warning(
+                            "yookassa_missing_confirmation_url",
+                            extra={"order_id": order.id, "has_url": bool(confirmation_url), "has_id": bool(yookassa_payment_id)},
+                        )
+                        await callback.message.answer(
+                            "⚠️ Возникла временная ошибка при оплате.\n\n"
+                            "Мы уже исправляем её.\n\n"
+                            "Нажмите «Помощь» —\n"
+                            "поддержка ответит оперативно\n"
+                            "и поможет завершить оплату.",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="🆘 Помощь", callback_data="profile:support")],
+                                [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                            ]),
+                        )
+                        return
+                    unlock_svc.set_payment_created(
+                        order.id,
+                        yookassa_payment_id,
+                        confirmation_url,
+                        idempotence_key,
+                    )
+                    logger.info(
+                        "choose_variant_yookassa_link_sent",
+                        extra={"telegram_id": telegram_id, "order_id": order.id, "take_id": take_id, "variant": variant},
+                    )
+                    await callback.message.answer(
+                        "Оплатите по ссылке (129 ₽) — после оплаты фото придёт в чат. Если уже оплатили — нажмите «Проверить оплату».",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💳 Перейти к оплате", url=confirmation_url)],
+                            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"unlock_check:{order.id}")],
+                            [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                        ]),
+                    )
+        else:
             await state.set_state(BotStates.viewing_take_result)
             await state.update_data(current_take_id=take_id)
-            short_menu_buttons = []
-            if fav_id and balance.get("total", 0) > 0 and not is_collection:
-                short_menu_buttons.append([
-                    InlineKeyboardButton(text="🖼 Забрать 4K для этого", callback_data=f"deliver_hd_one:{fav_id}"),
-                ])
-            if is_collection:
-                short_menu_buttons.append([
-                    InlineKeyboardButton(text="📸 Следующий образ", callback_data="take_more"),
-                    InlineKeyboardButton(text="📋 Избранное", callback_data="open_favorites"),
-                ])
+            hd_buttons = []
+            if fav_id:
+                hd_buttons.append([InlineKeyboardButton(text="💎 Открыть фото в 4K", callback_data=f"deliver_hd_one:{fav_id}")])
             else:
-                short_menu_buttons.append([
-                    InlineKeyboardButton(text="📸 Ещё снимок", callback_data="take_more"),
-                    InlineKeyboardButton(text="📋 В избранное", callback_data="open_favorites"),
-                ])
+                hd_buttons.append([InlineKeyboardButton(text="📋 Избранное", callback_data="open_favorites")])
             await callback.message.answer(
-                f"{trend_label} · Вариант {variant} в избранном.{collection_info}",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=short_menu_buttons),
-            )
-            await callback.message.answer(
-                "Оцените результат:",
-                reply_markup=_feedback_keyboard(take_id, variant),
+                "Отлично. Можно открыть этот вариант в полном качестве (4K) без водяного знака.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=hd_buttons),
             )
 
     except Exception:
@@ -4625,7 +5942,508 @@ async def choose_variant(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await callback.answer("❌ Ошибка. Попробуйте снова.", show_alert=True)
 
 
-async def _show_paywall_after_free_take(message: Message, telegram_id: str, take_id: str, variant: str):
+# --- Preview rescue flow: "Все 3 не подходят" → C1/E, reroll, other photo/trend ---
+def _rescue_screen_c1(take_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = "Что именно не так?"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🙂 Лицо не похоже", callback_data=f"rescue:reason:face:{take_id}"),
+            InlineKeyboardButton(text="🎭 Не подошёл стиль", callback_data=f"rescue:reason:style:{take_id}"),
+        ],
+        [InlineKeyboardButton(text="🔁 Хочу еще варианты", callback_data=f"rescue:reason:more:{take_id}")],
+    ])
+    return text, kb
+
+
+def _rescue_screen_e(take_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = "Не нашли удачный вариант?"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🙂 Лицо не похоже", callback_data=f"rescue:reason:face:{take_id}"),
+            InlineKeyboardButton(text="📷 Попробовать другое фото", callback_data=f"rescue:other_photo:{take_id}"),
+        ],
+        [InlineKeyboardButton(text="🎭 Попробовать другой тренд", callback_data=f"rescue:other_trend:{take_id}")],
+    ])
+    return text, kb
+
+
+def _rescue_screen_f(take_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "Иногда результат зависит от исходного фото. "
+        "Лучше всего работают фото, где лицо видно четко, без сильных теней и перекрытий."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📷 Загрузить другое фото", callback_data=f"rescue:other_photo:{take_id}")],
+        [InlineKeyboardButton(text="💡 Какое фото подойдет", callback_data=f"rescue:photo_tip:{take_id}")],
+    ])
+    return text, kb
+
+
+def _rescue_screen_g(take_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "Лучше всего работают фото, где:\n"
+        "• лицо видно прямо или почти прямо\n"
+        "• нет сильных теней\n"
+        "• глаза и контуры лица не закрыты\n"
+        "• фото четкое"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📷 Загрузить другое фото", callback_data=f"rescue:other_photo:{take_id}")],
+    ])
+    return text, kb
+
+
+def _rescue_screen_i(take_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = "Можно попробовать другой тренд."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎭 Попробовать другой тренд", callback_data="nav:menu")],
+        [InlineKeyboardButton(text="💎 Открыть лучший вариант", callback_data="open_favorites")],
+    ])
+    return text, kb
+
+
+@router.callback_query(F.data.startswith("rescue:reject_set:"))
+async def rescue_reject_set(callback: CallbackQuery, state: FSMContext):
+    """«Все 3 не подходят»: round 1 → C1 (Что именно не так? / Хочу еще варианты), round 2 → E. Флоу перегенерации для всех, включая free_preview."""
+    telegram_id = str(callback.from_user.id)
+    take_id = (callback.data or "").split(":", 2)[-1].strip()
+    if not take_id:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    try:
+        with get_db_session() as db:
+            take_svc = TakeService(db)
+            session_svc = SessionService(db)
+            user_svc = UserService(db)
+            take = take_svc.get_take(take_id)
+            if not take:
+                await callback.answer("Снимок не найден", show_alert=True)
+                return
+            user = user_svc.get_by_telegram_id(telegram_id)
+            if not user or str(take.user_id) != str(user.id):
+                await callback.answer("Нет доступа", show_alert=True)
+                return
+            is_reroll = getattr(take, "is_reroll", False)
+            is_rescue_photo = getattr(take, "is_rescue_photo_replace", False)
+            round_num = 2 if (is_reroll or is_rescue_photo) else 1
+            try:
+                ProductAnalyticsService(db).track(
+                    "rescue_reject_set",
+                    user.id,
+                    take_id=take_id,
+                    session_id=take.session_id,
+                    trend_id=take.trend_id,
+                    properties={"round": round_num},
+                )
+            except Exception:
+                pass
+        if is_reroll or is_rescue_photo:
+            text, kb = _rescue_screen_e(take_id)
+        else:
+            text, kb = _rescue_screen_c1(take_id)
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+    except Exception:
+        logger.exception("rescue_reject_set error", extra={"user_id": telegram_id})
+        await callback.answer("Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("rescue:reason:face:"))
+async def rescue_reason_face(callback: CallbackQuery):
+    """Лицо не похоже → экран F."""
+    telegram_id = str(callback.from_user.id)
+    take_id = (callback.data or "").split(":", 3)[-1].strip()
+    if not take_id:
+        await callback.answer()
+        return
+    try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            take = TakeService(db).get_take(take_id)
+            if user and take:
+                ProductAnalyticsService(db).track(
+                    "rescue_reason_face", user.id,
+                    take_id=take_id, session_id=take.session_id, trend_id=take.trend_id,
+                )
+    except Exception:
+        pass
+    text, kb = _rescue_screen_f(take_id)
+    await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rescue:reason:style:"))
+async def rescue_reason_style(callback: CallbackQuery):
+    """Не зашел образ → экран I."""
+    telegram_id = str(callback.from_user.id)
+    take_id = (callback.data or "").split(":", 3)[-1].strip()
+    if not take_id:
+        await callback.answer()
+        return
+    try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            take = TakeService(db).get_take(take_id)
+            if user and take:
+                ProductAnalyticsService(db).track(
+                    "rescue_reason_style", user.id,
+                    take_id=take_id, session_id=take.session_id, trend_id=take.trend_id,
+                )
+    except Exception:
+        pass
+    text, kb = _rescue_screen_i(take_id)
+    await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rescue:reason:more:"))
+async def rescue_reason_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Хочу еще варианты → один бесплатный reroll (новый Take, is_reroll=True). Для free_preview — paywall."""
+    telegram_id = str(callback.from_user.id)
+    take_id = (callback.data or "").split(":", 3)[-1].strip()
+    if not take_id:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    try:
+        with get_db_session() as db:
+            take_svc = TakeService(db)
+            session_svc = SessionService(db)
+            user_svc = UserService(db)
+            take = take_svc.get_take(take_id)
+            if not take or not take.trend_id or not take.session_id:
+                await callback.answer("Нельзя перегенерировать это фото", show_alert=True)
+                return
+            user = user_svc.get_by_telegram_id(telegram_id)
+            if not user or str(take.user_id) != str(user.id):
+                await callback.answer("Нет доступа", show_alert=True)
+                return
+            session = session_svc.get_session(take.session_id)
+            if session and session.pack_id == "free_preview":
+                await callback.answer()
+                await _show_paywall_after_free_take(callback.message, telegram_id, take_id, "", fav_id=None)
+                return
+            if session_svc.has_reroll_for_trend(take.session_id, take.trend_id):
+                text, kb = _rescue_screen_e(take_id)
+                await callback.message.answer(text, reply_markup=kb)
+                await callback.answer()
+                return
+            session = session_svc.get_session(take.session_id)
+            if not session:
+                await callback.answer("Сессия не найдена", show_alert=True)
+                return
+            input_paths = list(take.input_local_paths or [])
+            if not input_paths:
+                await callback.answer("Нет исходного фото для повтора", show_alert=True)
+                return
+            first_path = input_paths[0] if isinstance(input_paths[0], str) else None
+            if not first_path or not os.path.isfile(first_path):
+                await callback.answer("Исходное фото недоступно. Начните заново с «Создать фото».", show_alert=True)
+                return
+            try:
+                ProductAnalyticsService(db).track(
+                    "rescue_reroll_started", user.id,
+                    take_id=take_id, session_id=take.session_id, trend_id=take.trend_id,
+                )
+            except Exception:
+                pass
+            new_take = take_svc.create_take(
+                user_id=user.id,
+                trend_id=take.trend_id,
+                session_id=take.session_id,
+                image_size=take.image_size,
+                input_file_ids=list(take.input_file_ids or []),
+                input_local_paths=input_paths,
+                is_reroll=True,
+            )
+            new_take_id = new_take.id
+            db.commit()
+        chat_id = str(callback.message.chat.id)
+        status_msg = await callback.message.answer("⏳ Генерируем новый набор из 3 вариантов…")
+        from app.core.celery_app import celery_app
+        celery_app.send_task(
+            "app.workers.tasks.generate_take.generate_take",
+            args=[new_take_id],
+            kwargs={
+                "status_chat_id": chat_id,
+                "status_message_id": status_msg.message_id,
+            },
+        )
+        await callback.answer()
+    except Exception:
+        logger.exception("rescue_reason_more error", extra={"user_id": telegram_id})
+        await callback.answer("Ошибка. Попробуйте позже.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("rescue:photo_tip:"))
+async def rescue_photo_tip(callback: CallbackQuery):
+    """Какое фото подойдет → экран G."""
+    take_id = (callback.data or "").split(":", 3)[-1].strip()
+    if not take_id:
+        await callback.answer()
+        return
+    text, kb = _rescue_screen_g(take_id)
+    await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rescue:other_photo:"))
+async def rescue_other_photo(callback: CallbackQuery, state: FSMContext):
+    """Загрузить другое фото: проверка лимита, переход в rescue_waiting_photo. Для free_preview — paywall."""
+    telegram_id = str(callback.from_user.id)
+    take_id = (callback.data or "").split(":", 3)[-1].strip()
+    if not take_id:
+        await callback.answer()
+        return
+    try:
+        with get_db_session() as db:
+            take_svc = TakeService(db)
+            session_svc = SessionService(db)
+            user_svc = UserService(db)
+            take = take_svc.get_take(take_id)
+            if not take or not take.session_id or not take.trend_id:
+                await callback.answer("Снимок не найден", show_alert=True)
+                return
+            user = user_svc.get_by_telegram_id(telegram_id)
+            if not user or str(take.user_id) != str(user.id):
+                await callback.answer("Нет доступа", show_alert=True)
+                return
+            session = session_svc.get_session(take.session_id)
+            if session and session.pack_id == "free_preview":
+                await callback.answer()
+                await _show_paywall_after_free_take(callback.message, telegram_id, take_id, "", fav_id=None)
+                return
+            if session_svc.has_rescue_photo_for_trend(take.session_id, take.trend_id):
+                text, kb = _rescue_screen_i(take_id)
+                await callback.message.answer(text, reply_markup=kb)
+                await callback.answer()
+                return
+            await state.set_state(BotStates.rescue_waiting_photo)
+            await state.update_data(
+                rescue_take_id=take_id,
+                rescue_trend_id=take.trend_id,
+                rescue_session_id=take.session_id,
+                rescue_user_id=user.id,
+                rescue_image_size=take.image_size,
+            )
+        await callback.message.answer("📷 Отправьте новое фото для этого тренда.")
+        await callback.answer()
+    except Exception:
+        logger.exception("rescue_other_photo error", extra={"user_id": telegram_id})
+        await callback.answer("Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("rescue:other_trend:"))
+async def rescue_other_trend(callback: CallbackQuery, state: FSMContext):
+    """Попробовать другой тренд → экран I. Для free_preview — paywall."""
+    telegram_id = str(callback.from_user.id)
+    take_id = (callback.data or "").split(":", 3)[-1].strip()
+    if not take_id:
+        await callback.answer()
+        return
+    try:
+        with get_db_session() as db:
+            take = TakeService(db).get_take(take_id)
+            if take and take.session_id:
+                session = SessionService(db).get_session(take.session_id)
+                if session and session.pack_id == "free_preview":
+                    user = UserService(db).get_by_telegram_id(telegram_id)
+                    if user and str(take.user_id) == str(user.id):
+                        await callback.answer()
+                        await _show_paywall_after_free_take(callback.message, telegram_id, take_id, "", fav_id=None)
+                        return
+    except Exception:
+        pass
+    text, kb = _rescue_screen_i(take_id)
+    await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+async def _rescue_save_photo_and_start_take(
+    message: Message, bot: Bot, state: FSMContext, local_path: str, file_id: str
+) -> bool:
+    """Сохранить путь в state уже сделано снаружи. Создать Take (rescue photo replace) и поставить generate_take. Возвращает True при успехе."""
+    data = await state.get_data()
+    trend_id = data.get("rescue_trend_id")
+    session_id = data.get("rescue_session_id")
+    user_id = data.get("rescue_user_id")
+    image_size = data.get("rescue_image_size") or "1024x1024"
+    if not trend_id or not session_id or not user_id:
+        await message.answer("Сессия устарела. Начните заново с «Создать фото».", reply_markup=main_menu_keyboard())
+        await state.clear()
+        return False
+    try:
+        with get_db_session() as db:
+            take_svc = TakeService(db)
+            session_svc = SessionService(db)
+            session = session_svc.get_session(session_id)
+            if not session:
+                await message.answer("Сессия не найдена. Начните заново.", reply_markup=main_menu_keyboard())
+                await state.clear()
+                return False
+            new_take = take_svc.create_take(
+                user_id=str(user_id),
+                trend_id=trend_id,
+                session_id=session_id,
+                image_size=image_size,
+                input_file_ids=[file_id],
+                input_local_paths=[local_path],
+                is_rescue_photo_replace=True,
+            )
+            new_take_id = new_take.id
+            db.commit()
+        await state.clear()
+        status_msg = await message.answer("⏳ Генерируем новый набор из 3 вариантов по вашему фото…")
+        from app.core.celery_app import celery_app
+        celery_app.send_task(
+            "app.workers.tasks.generate_take.generate_take",
+            args=[new_take_id],
+            kwargs={
+                "status_chat_id": str(message.chat.id),
+                "status_message_id": status_msg.message_id,
+            },
+        )
+        return True
+    except Exception:
+        logger.exception("rescue_save_photo_and_start_take error")
+        await message.answer("Ошибка при создании снимка. Попробуйте ещё раз.", reply_markup=main_menu_keyboard())
+        await state.clear()
+        return False
+
+
+@router.message(BotStates.rescue_waiting_photo, F.photo)
+async def rescue_waiting_photo_handler(message: Message, state: FSMContext, bot: Bot):
+    """Принять новое фото в rescue flow и запустить новый Take (is_rescue_photo_replace)."""
+    data = await state.get_data()
+    take_id = data.get("rescue_take_id")
+    telegram_id = str(message.from_user.id) if message.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "rescue_photo_uploaded",
+                        user.id,
+                        take_id=take_id,
+                        properties={"button_id": "rescue_photo_uploaded", "take_id": take_id},
+                    )
+        except Exception:
+            logger.exception("rescue_photo_uploaded track failed")
+    photo = message.photo[-1]
+    try:
+        inputs_dir = os.path.join(settings.storage_base_path, "inputs")
+        os.makedirs(inputs_dir, exist_ok=True)
+        local_path = os.path.join(inputs_dir, f"rescue_{photo.file_id}.jpg")
+        file = await bot.get_file(photo.file_id)
+        await bot.download_file(file.file_path, local_path)
+        size_mb = os.path.getsize(local_path) / (1024 * 1024)
+        if size_mb > settings.max_file_size_mb:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+            await message.answer(
+                tr("errors.file_too_large_max", "Файл слишком большой ({size_mb:.1f} МБ). Максимум {max_mb} МБ.", size_mb=size_mb, max_mb=settings.max_file_size_mb)
+            )
+            return
+        ok = await _rescue_save_photo_and_start_take(message, bot, state, local_path, photo.file_id)
+        if not ok:
+            return
+    except Exception:
+        logger.exception("rescue_waiting_photo photo error")
+        await message.answer("Не удалось сохранить фото. Попробуйте ещё раз.")
+        return
+
+
+@router.message(BotStates.rescue_waiting_photo, F.document)
+async def rescue_waiting_photo_document(message: Message, state: FSMContext, bot: Bot):
+    """Принять документ-изображение в rescue flow."""
+    doc = message.document
+    if not doc:
+        await message.answer(t("errors.try_later_short", "Ошибка. Попробуйте позже."))
+        return
+    ext = _document_image_ext(doc.mime_type, doc.file_name)
+    if not ext:
+        await message.answer(t("flow.only_images", "Поддерживаются только изображения: JPG, PNG, WEBP. Отправьте файл с фото."))
+        return
+    data = await state.get_data()
+    take_id = data.get("rescue_take_id")
+    telegram_id = str(message.from_user.id) if message.from_user else None
+    if telegram_id:
+        try:
+            with get_db_session() as db:
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                if user:
+                    ProductAnalyticsService(db).track(
+                        "rescue_photo_uploaded",
+                        user.id,
+                        take_id=take_id,
+                        properties={"button_id": "rescue_photo_uploaded", "take_id": take_id},
+                    )
+        except Exception:
+            logger.exception("rescue_photo_uploaded track failed")
+    try:
+        inputs_dir = os.path.join(settings.storage_base_path, "inputs")
+        os.makedirs(inputs_dir, exist_ok=True)
+        local_path = os.path.join(inputs_dir, f"rescue_{doc.file_id}{ext}")
+        file = await bot.get_file(doc.file_id)
+        await bot.download_file(file.file_path, local_path)
+        size_mb = os.path.getsize(local_path) / (1024 * 1024)
+        if size_mb > settings.max_file_size_mb:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+            await message.answer(
+                tr("errors.file_too_large_max", "Файл слишком большой ({size_mb:.1f} МБ). Максимум {max_mb} МБ.", size_mb=size_mb, max_mb=settings.max_file_size_mb)
+            )
+            return
+        ok = await _rescue_save_photo_and_start_take(message, bot, state, local_path, doc.file_id)
+        if not ok:
+            return
+    except Exception:
+        logger.exception("rescue_waiting_photo document error")
+        await message.answer("Не удалось сохранить файл. Попробуйте ещё раз.")
+        return
+
+
+@router.message(BotStates.rescue_waiting_photo)
+async def rescue_waiting_photo_wrong_input(message: Message):
+    """Не фото в rescue_waiting_photo."""
+    await message.answer("📷 Отправьте фото (изображение). Поддерживаются JPG, PNG, WEBP.")
+
+
+def _pack_activated_message_and_keyboard(
+    db: Session,
+    telegram_id: str,
+    pack_emoji: str,
+    pack_name: str,
+    remaining_display: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и клавиатура после активации пакета: при наличии ожидающего 4K — строка «Можно забрать последнее фото в 4K» и кнопка «Открыть фото в 4К» + «В меню»."""
+    base_text = (
+        f"🎉 Поздравляем! Пакет {pack_emoji} {pack_name} активирован.\n\n"
+        f"Осталось фото: {remaining_display}"
+    )
+    user = db.query(User).filter(User.telegram_id == telegram_id).one_or_none()
+    rows = []
+    if user:
+        fav_svc = FavoriteService(db)
+        last_pending = fav_svc.get_last_pending_hd_favorite(user.id)
+        if last_pending:
+            base_text += "\n\nМожно забрать последнее фото в 4K."
+            rows.append([
+                InlineKeyboardButton(text="💎 Открыть фото в 4K", callback_data=f"deliver_hd_one:{last_pending.id}"),
+            ])
+    rows.append([
+        InlineKeyboardButton(text=t("nav.btn.menu", "📋 В меню"), callback_data="nav:menu"),
+    ])
+    return base_text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_paywall_after_free_take(
+    message: Message, telegram_id: str, take_id: str, variant: str, fav_id: str | None = None
+):
     """Show contextual paywall after free take — all ladder packs."""
     try:
         with get_db_session() as db:
@@ -4639,6 +6457,7 @@ async def _show_paywall_after_free_take(message: Message, telegram_id: str, take
 
             buttons_data = []
             position = 1
+            from app.services.balance_tariffs import SHORT_NAMES as _short_names
             for p in all_packs:
                 if getattr(p, "pack_subtype", "standalone") == "collection" and not getattr(p, "playlist", None):
                     continue
@@ -4646,7 +6465,7 @@ async def _show_paywall_after_free_take(message: Message, telegram_id: str, take
                     continue
                 buttons_data.append({
                     "id": p.id, "emoji": p.emoji,
-                    "name": p.name, "stars_price": p.stars_price,
+                    "name": _short_names.get(p.id, p.name), "stars_price": p.stars_price,
                     "outcome": _pack_outcome_label(p),
                     "hd_amount": getattr(p, "hd_amount", None), "position": position,
                 })
@@ -4665,6 +6484,7 @@ async def _show_paywall_after_free_take(message: Message, telegram_id: str, take
             )
             if user:
                 ProductAnalyticsService(db).track("paywall_viewed", user.id, take_id=take_id)
+                paywall_viewed_total.inc()
 
         rate = getattr(settings, "star_to_rub", 1.3)
         buttons = []
@@ -4676,18 +6496,21 @@ async def _show_paywall_after_free_take(message: Message, telegram_id: str, take
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         await message.answer(
             "👀 Смотри бесплатно, плати только если нравится!\n\n"
-            "🎬 Получи 4K версию без watermark:",
+            "🎬 Получи 4K версию без водяного знака:",
             reply_markup=keyboard,
         )
-        await message.answer(
-            "Оцените результат:",
-            reply_markup=_feedback_keyboard(take_id, variant),
-        )
+        if fav_id:
+            await message.answer(
+                "Отлично. Можно открыть этот вариант в полном качестве (4K) без водяного знака.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Открыть фото в 4K", callback_data=f"deliver_hd_one:{fav_id}")],
+                ]),
+            )
     except Exception:
         logger.exception("_show_paywall_after_free_take error")
         try:
             await message.answer(
-                "Не удалось загрузить тарифы. Выберите фотосессию в меню (🛒 Купить тариф)."
+                "Не удалось открыть магазин. Нажмите «🛒 Купить пакет» ещё раз."
             )
         except Exception:
             pass
@@ -4711,7 +6534,7 @@ async def add_variant_to_favorites(callback: CallbackQuery, state: FSMContext):
 
             take = take_svc.get_take(take_id)
             if not take:
-                await callback.answer("❌ Снимок не найден", show_alert=True)
+                await callback.answer("❌ Фото не найдено", show_alert=True)
                 return
 
             user = user_service.get_or_create_user(
@@ -4735,7 +6558,7 @@ async def add_variant_to_favorites(callback: CallbackQuery, state: FSMContext):
                 session_id=take.session_id,
             )
 
-            trend_label = "Снимок"
+            trend_label = "Фото"
             if getattr(take, "trend_id", None):
                 trend = TrendService(db).get(take.trend_id)
                 if trend:
@@ -4764,6 +6587,7 @@ async def add_variant_to_favorites(callback: CallbackQuery, state: FSMContext):
                 take_id=take_id,
                 properties={"variant_id": variant, "variant_position": variant_position},
             )
+            favorite_selected_total.inc()
             if _trend_id:
                 ProductAnalyticsService(db).track(
                     "trend_favorite_selected",
@@ -4874,6 +6698,14 @@ async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
     telegram_id = str(callback.from_user.id)
     try:
         with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "take_more"},
+                )
+        with get_db_session() as db:
             user_service = UserService(db)
             session_svc = SessionService(db)
             user = user_service.get_or_create_user(
@@ -4892,7 +6724,7 @@ async def take_more(callback: CallbackQuery, state: FSMContext, bot: Bot):
                     telegram_id = str(callback.from_user.id)
                     text, kb_dict = build_balance_tariffs_message(db, telegram_id)
                     if kb_dict is None:
-                        await callback.message.answer("Тарифы временно недоступны.", reply_markup=main_menu_keyboard())
+                        await callback.message.answer("Пакеты временно недоступны.", reply_markup=main_menu_keyboard())
                         await callback.answer()
                         return
                     rows = kb_dict.get("inline_keyboard", [])
@@ -5049,7 +6881,7 @@ def _build_favorites_message(db, user) -> tuple[str | None, list[list[dict]], in
             elapsed_min = (now - f.updated_at).total_seconds() / 60.0
             if elapsed_min > 5:
                 rendering_too_long = True
-        trend_label = "Снимок"
+        trend_label = "Фото"
         take = take_by_id.get(f.take_id) if f.take_id else None
         if take and getattr(take, "trend_id", None):
             trend = trend_by_id.get(take.trend_id)
@@ -5073,7 +6905,7 @@ def _build_favorites_message(db, user) -> tuple[str | None, list[list[dict]], in
             status_icon = "🟢 4K"
         else:
             status_icon = ""
-        trend_label = fav.get("trend_label") or "Снимок"
+        trend_label = fav.get("trend_label") or "Фото"
         lines.append(f"{i}. {trend_label} · Вариант {fav['variant']} {status_icon}")
 
         row = []
@@ -5088,10 +6920,7 @@ def _build_favorites_message(db, user) -> tuple[str | None, list[list[dict]], in
         if row:
             button_rows.append(row)
 
-    if is_collection and session:
-        lines.append(f"\n4K осталось: {hd_rem} | Отмечено для 4K: {selected_count}")
-    else:
-        lines.append(f"\n4K баланс: {balance['total']}")
+    # В пользовательском UI только счётчик фото; 4K не показываем отдельной строкой (терминология NeoBanana)
 
     action_buttons = []
     removable_count = sum(1 for f in favorites_data if f["hd_status"] != "delivered")
@@ -5133,6 +6962,11 @@ async def open_favorites(callback: CallbackQuery, state: FSMContext):
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
+            ProductAnalyticsService(db).track(
+                "button_click",
+                user.id,
+                properties={"button_id": "open_favorites"},
+            )
             text, rows, favorites_count = _build_favorites_message(db, user)
 
             audit = AuditService(db)
@@ -5171,6 +7005,10 @@ async def clear_all_favorites(callback: CallbackQuery, state: FSMContext):
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
+            try:
+                ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "favorites_clear_all"})
+            except Exception:
+                logger.exception("button_click track failed favorites_clear_all")
             fav_svc = FavoriteService(db)
             deleted = fav_svc.clear_all_for_user(user.id)
         if deleted > 0:
@@ -5202,6 +7040,16 @@ async def remove_favorite(callback: CallbackQuery, state: FSMContext):
     fav_id = callback.data.split(":", 1)[1]
     try:
         with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                try:
+                    ProductAnalyticsService(db).track(
+                        "button_click",
+                        user.id,
+                        properties={"button_id": "remove_fav", "favorite_id": fav_id},
+                    )
+                except Exception:
+                    logger.exception("button_click track failed remove_fav")
             fav_svc = FavoriteService(db)
             removed = fav_svc.remove_favorite(fav_id)
         if removed:
@@ -5240,6 +7088,14 @@ async def select_hd_callback(callback: CallbackQuery, state: FSMContext):
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
+            try:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "select_hd", "favorite_id": fav_id},
+                )
+            except Exception:
+                logger.exception("button_click track failed select_hd")
             fav_svc = FavoriteService(db)
             session_svc = SessionService(db)
             fav = fav_svc.get_favorite(fav_id)
@@ -5285,6 +7141,14 @@ async def deselect_hd_callback(callback: CallbackQuery, state: FSMContext):
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
+            try:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "deselect_hd", "favorite_id": fav_id},
+                )
+            except Exception:
+                logger.exception("button_click track failed deselect_hd")
             fav_svc = FavoriteService(db)
             fav = fav_svc.get_favorite(fav_id)
             if not fav or str(fav.user_id) != str(user.id):
@@ -5322,6 +7186,14 @@ async def hd_problem_callback(callback: CallbackQuery, state: FSMContext):
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
+            try:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "hd_problem", "favorite_id": fav_id},
+                )
+            except Exception:
+                logger.exception("button_click track failed hd_problem")
             fav_svc = FavoriteService(db)
             fav = fav_svc.get_favorite(fav_id)
             if not fav:
@@ -5377,7 +7249,7 @@ async def deliver_hd_album_callback(callback: CallbackQuery, state: FSMContext):
             balance = hd_svc.get_balance(user)
             can_deliver = min(len(selected), balance["total"])
             if can_deliver == 0:
-                await callback.answer("❌ Недостаточно 4K на балансе", show_alert=True)
+                await callback.answer("❌ Недостаточно доступа. Купите пакет.", show_alert=True)
                 return
 
             selected_ids = [f.id for f in selected[:can_deliver]]
@@ -5398,6 +7270,267 @@ async def deliver_hd_album_callback(callback: CallbackQuery, state: FSMContext):
         await callback.answer(f"🖼 Запущено {len(selected_ids)} 4K")
     except Exception:
         logger.exception("deliver_hd_album error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("unlock_resend:"))
+async def unlock_resend_callback(callback: CallbackQuery):
+    """Получить фото снова (уже оплаченный unlock order)."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    order_id = (parts[1] or "").strip()
+    if not order_id:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    try:
+        with get_db_session() as db:
+            unlock_svc = UnlockOrderService(db)
+            order = unlock_svc.get_by_id(order_id)
+            if not order or str(order.telegram_user_id) != telegram_id:
+                await callback.answer("Заказ не найден", show_alert=True)
+                return
+            if order.status not in ("paid", "delivered", "delivery_failed"):
+                await callback.answer("Заказ ещё не оплачен", show_alert=True)
+                return
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                try:
+                    ProductAnalyticsService(db).track(
+                        "button_click",
+                        user.id,
+                        properties={"button_id": "unlock_resend", "order_id": order_id},
+                    )
+                except Exception:
+                    logger.exception("button_click track failed unlock_resend")
+            take = TakeService(db).get_take(order.take_id)
+            if not take:
+                await callback.answer("Фото не найдено", show_alert=True)
+                return
+            _, original_path = TakeService(db).get_variant_paths(take, order.variant)
+            if not original_path or not os.path.exists(original_path):
+                await callback.answer("Файл недоступен", show_alert=True)
+                return
+            from app.services.telegram.client import TelegramClient as TgClient
+            tg = TgClient()
+            try:
+                from app.services.unlock_order.service import unlock_photo_display_filename
+                tg.send_document(
+                    int(telegram_id),
+                    original_path,
+                    caption=(
+                        "🎉 Отличный выбор!\n\n"
+                        "Вот ваш снимок\n"
+                        "без водяных знаков\n"
+                        "и в полном качестве.\n\n"
+                        "Сохраните его —\n"
+                        "он идеально подойдёт\n"
+                        "для соцсетей."
+                    ),
+                    filename=unlock_photo_display_filename(order.id, original_path),
+                )
+            finally:
+                tg.close()
+        await callback.answer("Фото отправлено")
+        await callback.message.answer("Фото отправлено в чат.")
+    except Exception:
+        logger.exception("unlock_resend_callback error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("unlock_check:"))
+async def unlock_check_callback(callback: CallbackQuery):
+    """Второй контур: проверить оплату по YooKassa GET /payments/{id} и при успехе поставить доставку."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    order_id = (parts[1] or "").strip()
+    if not order_id:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    try:
+        with get_db_session() as db:
+            unlock_svc = UnlockOrderService(db)
+            order = unlock_svc.get_by_id(order_id)
+            if not order or str(order.telegram_user_id) != telegram_id:
+                await callback.answer("Заказ не найден", show_alert=True)
+                return
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                try:
+                    ProductAnalyticsService(db).track(
+                        "button_click",
+                        user.id,
+                        properties={"button_id": "unlock_check", "order_id": order_id},
+                    )
+                except Exception:
+                    logger.exception("button_click track failed unlock_check")
+            if order.status in ("paid", "delivered"):
+                await callback.answer("Оплата уже подтверждена")
+                await callback.message.answer("Оплата уже подтверждена. Файл отправлен или скоро придёт.")
+                return
+            if order.status != "payment_pending" or not order.yookassa_payment_id:
+                await callback.answer("Нечего проверять", show_alert=True)
+                return
+            yookassa = YooKassaClient()
+            payment = yookassa.get_payment(order.yookassa_payment_id) if yookassa.is_configured() else None
+            if payment and (payment.get("status") or "") == "succeeded":
+                unlock_svc.mark_paid(order_id=order.id)
+                db.commit()
+                from app.core.celery_app import celery_app as _celery
+                _celery.send_task(
+                    "app.workers.tasks.deliver_unlock.deliver_unlock_file",
+                    args=[order.id],
+                )
+                await callback.answer("Оплата подтверждена, файл отправляется")
+                await callback.message.answer("Оплата подтверждена. Файл скоро придёт в чат.")
+            else:
+                await callback.answer("Оплата пока не поступила. Попробуйте позже.")
+                await callback.message.answer("Оплата пока не поступила. Подождите или попробуйте позже.")
+    except Exception:
+        logger.exception("unlock_check_callback error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("pack_check:"))
+async def pack_check_callback(callback: CallbackQuery):
+    """Проверить оплату пакета по ЮKassa и при успехе активировать пакет и показать поздравление."""
+    telegram_id = str(callback.from_user.id)
+    parts = callback.data.split(":", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    order_id = (parts[1] or "").strip()
+    if not order_id:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    try:
+        with get_db_session() as db:
+            from app.services.pack_order.service import PackOrderService
+            pack_order_svc = PackOrderService(db)
+            pack_order = pack_order_svc.get_by_id(order_id)
+            if not pack_order or str(pack_order.telegram_user_id) != telegram_id:
+                await callback.answer("Заказ не найден", show_alert=True)
+                return
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                try:
+                    ProductAnalyticsService(db).track(
+                        "button_click",
+                        user.id,
+                        properties={"button_id": "pack_check", "order_id": order_id},
+                    )
+                except Exception:
+                    logger.exception("button_click track failed pack_check")
+            if pack_order.status == "completed":
+                pack = PaymentService(db).get_pack(pack_order.pack_id)
+                pack_emoji = _escape_markdown(getattr(pack, "emoji", "") or "") if pack else ""
+                pack_name = _escape_markdown(getattr(pack, "name", pack_order.pack_id) or pack_order.pack_id) if pack else _escape_markdown(str(pack_order.pack_id))
+                user = UserService(db).get_by_telegram_id(telegram_id)
+                remaining = 0
+                takes_limit = 0
+                if user:
+                    session = SessionService(db).get_active_session(user.id)
+                    if session:
+                        remaining = (session.takes_limit or 0) - (session.takes_used or 0)
+                        takes_limit = session.takes_limit or 0
+                if user and takes_limit > 0:
+                    count_line = f"Доступно фото: {remaining} из {takes_limit}. "
+                else:
+                    count_line = ""
+                instruction = (
+                    "Один снимок — в этом шаге: выберите лучший из трёх вариантов выше.\n\n"
+                    "Вернитесь выше в чате и выберите лучший снимок — тогда получите его в полном качестве без водяного знака."
+                )
+                fav_svc = FavoriteService(db)
+                last_pending = fav_svc.get_last_pending_hd_favorite(user.id) if user else None
+                if last_pending:
+                    instruction = "Вы уже выбрали снимок — вернитесь к сообщению с кнопкой «Открыть фото в 4K» и нажмите её.\n\n" + instruction
+                text = (
+                    "🎉 *Оплата подтверждена.*\n\n"
+                    f"Пакет {pack_emoji} {pack_name} активирован.\n\n"
+                    f"{count_line}{instruction}"
+                )
+                await callback.answer("Пакет уже активирован")
+                await callback.message.answer(text, parse_mode="Markdown")
+                return
+            if pack_order.status not in ("payment_pending", "paid") or not pack_order.yookassa_payment_id:
+                await callback.answer("Нечего проверять", show_alert=True)
+                return
+            yookassa = YooKassaClient()
+            payment = yookassa.get_payment(pack_order.yookassa_payment_id) if yookassa.is_configured() else None
+            payment_status = (payment.get("status") or "") if payment else ""
+            if payment_status in ("canceled", "failed"):
+                pack_order_svc.mark_canceled(order_id=pack_order.id) if payment_status == "canceled" else pack_order_svc.mark_failed(order_id=pack_order.id)
+                await callback.answer("Платёж не прошёл")
+                await callback.message.answer(
+                    "⚠️ Платёж не был завершён.\n\n"
+                    "Деньги не списаны.\n\n"
+                    "Можно оформить новый заказ и выбрать тариф заново.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="shop:open")],
+                        [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                    ]),
+                )
+                return
+            if payment and payment_status == "succeeded":
+                payment_svc = PaymentService(db)
+                payment_obj, session, trial_err, _ = payment_svc.process_session_purchase_yookassa_link(
+                    telegram_user_id=telegram_id,
+                    pack_id=pack_order.pack_id,
+                    yookassa_payment_id=pack_order.yookassa_payment_id,
+                    amount_kopecks=pack_order.amount_kopecks,
+                )
+                if payment_obj and session:
+                    pack_order_svc.mark_completed(pack_order.id)
+                    pack = payment_svc.get_pack(pack_order.pack_id)
+                    pack_emoji = _escape_markdown(getattr(pack, "emoji", "") or "") if pack else ""
+                    pack_name = _escape_markdown(getattr(pack, "name", pack_order.pack_id) or pack_order.pack_id) if pack else _escape_markdown(str(pack_order.pack_id))
+                    remaining = (session.takes_limit or 0) - (session.takes_used or 0)
+                    takes_limit = session.takes_limit or 0
+                    count_line = f"Доступно фото: {remaining} из {takes_limit}. "
+                    instruction = (
+                        "Один снимок — в этом шаге: выберите лучший из трёх вариантов выше.\n\n"
+                        "Вернитесь выше в чате и выберите лучший снимок — тогда получите его в полном качестве без водяного знака."
+                    )
+                    user = UserService(db).get_by_telegram_id(telegram_id)
+                    fav_svc = FavoriteService(db)
+                    last_pending = fav_svc.get_last_pending_hd_favorite(user.id) if user else None
+                    if last_pending:
+                        instruction = "Вы уже выбрали снимок — вернитесь к сообщению с кнопкой «Открыть фото в 4K» и нажмите её.\n\n" + instruction
+                    text = (
+                        "🎉 *Оплата подтверждена.*\n\n"
+                        f"Пакет {pack_emoji} {pack_name} активирован.\n\n"
+                        f"{count_line}{instruction}"
+                    )
+                    await callback.answer("Оплата подтверждена")
+                    await callback.message.answer(text, parse_mode="Markdown")
+                else:
+                    await callback.answer("Ошибка активации", show_alert=True)
+                    await callback.message.answer(
+                        "При активации пакета произошла ошибка. Обратитесь в поддержку — мы поможем завершить активацию.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                            [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                        ]),
+                    )
+            else:
+                await callback.answer("Платёж ещё обрабатывается")
+                await callback.message.answer(
+                    "Платёж ещё обрабатывается.\n\n"
+                    "Пакет активируется автоматически после подтверждения.\n\n"
+                    "Если прошло больше минуты — нажмите «Помощь».",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"pack_check:{order_id}")],
+                        [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                    ]),
+                )
+    except Exception:
+        logger.exception("pack_check_callback error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
@@ -5430,7 +7563,7 @@ async def deliver_hd_one_callback(callback: CallbackQuery, state: FSMContext):
                 return
             balance = hd_svc.get_balance(user)
             if balance.get("total", 0) < 1:
-                await callback.answer("❌ Недостаточно 4K на балансе", show_alert=True)
+                await callback.answer("❌ Недостаточно доступа. Купите пакет.", show_alert=True)
                 return
 
         from app.core.celery_app import celery_app as _celery
@@ -5475,7 +7608,7 @@ async def deliver_hd_callback(callback: CallbackQuery, state: FSMContext):
             can_deliver = min(len(pending), balance["total"])
 
             if can_deliver == 0:
-                await callback.answer("❌ Недостаточно 4K на балансе", show_alert=True)
+                await callback.answer("❌ Недостаточно доступа. Купите пакет.", show_alert=True)
                 return
 
             pending_ids = [f.id for f in pending[:can_deliver]]
@@ -5512,6 +7645,10 @@ async def session_status(callback: CallbackQuery, state: FSMContext):
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
+            try:
+                ProductAnalyticsService(db).track("button_click", user.id, properties={"button_id": "session_status"})
+            except Exception:
+                logger.exception("button_click track failed session_status")
             session_svc = SessionService(db)
             hd_svc = HDBalanceService(db)
             fav_svc = FavoriteService(db)
@@ -5521,8 +7658,7 @@ async def session_status(callback: CallbackQuery, state: FSMContext):
 
             if not session:
                 await callback.message.answer(
-                    "📸 Нет активной фотосессии.\n"
-                    "Купите пакет, чтобы начать!",
+                    "Нет активного пакета. Купите пакет, чтобы начать!",
                     reply_markup=main_menu_keyboard(),
                 )
                 await callback.answer()
@@ -5540,7 +7676,7 @@ async def session_status(callback: CallbackQuery, state: FSMContext):
 
         buttons = []
         if remaining > 0:
-            buttons.append([InlineKeyboardButton(text="📸 Сделать снимок", callback_data="take_more")])
+            buttons.append([InlineKeyboardButton(text="📸 Ещё фото", callback_data="take_more")])
         buttons.append([InlineKeyboardButton(text="⭐ Открыть избранное", callback_data="open_favorites")])
 
         if is_collection and selected_count > 0:
@@ -5559,14 +7695,13 @@ async def session_status(callback: CallbackQuery, state: FSMContext):
             status_text = (
                 f"📸 Ваша коллекция\n\n"
                 f"Всего превью: {takes_used * 3}/{takes_limit * 3}\n"
-                f"Выбери до {hd_limit} 4K — осталось: {hd_rem}\n"
+                f"Выберите до {hd_limit} 4K — осталось: {hd_rem}\n"
                 f"В избранном: {fav_count} (отмечено для 4K: {selected_count})"
             )
         else:
             status_text = (
-                f"📸 Ваша фотосессия\n\n"
-                f"Осталось снимков: {remaining} из {takes_limit}\n"
-                f"4K баланс: {balance['total']}\n"
+                f"📸 Ваш пакет\n\n"
+                f"Осталось фото: {remaining} из {takes_limit}\n"
                 f"В избранном: {fav_count}"
             )
 
@@ -5582,9 +7717,21 @@ async def session_status(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
+def _payment_method_keyboard(pack_id: str):
+    """Клавиатура выбора способа оплаты: ЮMoney 1-й, по ссылке, Stars, другие, перевод на карту."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить через ЮMoney", callback_data=f"pay_method:yoomoney:{pack_id}")],
+        [InlineKeyboardButton(text="🔗 Оплатить по ссылке (ЮMoney)", callback_data=f"pay_method:yoomoney_link:{pack_id}")],
+        [InlineKeyboardButton(text="⭐ Купить через Stars", callback_data=f"pay_method:stars:{pack_id}")],
+        [InlineKeyboardButton(text="📘 Другие способы оплаты", callback_data="pay_method:other")],
+        [InlineKeyboardButton(text="🏦 Перевод на карту (если не сработало)", callback_data="bank_transfer:start")],
+        [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+    ])
+
+
 @router.callback_query(F.data.startswith("paywall:"))
-async def paywall_buy(callback: CallbackQuery, bot: Bot):
-    """User tapped buy on paywall — send Stars invoice."""
+async def paywall_pack_selected(callback: CallbackQuery, bot: Bot):
+    """User selected pack — show payment method screen (ЮMoney first, then Stars, then bank transfer)."""
     telegram_id = str(callback.from_user.id)
     pack_id = callback.data.split(":", 1)[1]
     if pack_id not in PRODUCT_LADDER_IDS:
@@ -5604,9 +7751,383 @@ async def paywall_buy(callback: CallbackQuery, bot: Bot):
                 telegram_first_name=callback.from_user.first_name,
                 telegram_last_name=callback.from_user.last_name,
             )
+            # Воронка: считаем любой выбор тарифа до проверки trial
+            ProductAnalyticsService(db).track(
+                "pack_selected",
+                user.id,
+                pack_id=pack_id,
+                properties={"pack_id": pack_id},
+            )
 
             if pack.is_trial and user.trial_purchased:
-                await callback.answer("Trial уже был использован", show_alert=True)
+                await callback.answer("Пробный пакет уже был использован", show_alert=True)
+                return
+
+            from app.services.balance_tariffs import DISPLAY_RUB, SHORT_NAMES
+            pack_name = SHORT_NAMES.get(pack_id, pack.name)
+            pack_emoji = pack.emoji
+            pack_takes_limit = getattr(pack, "takes_limit", None)
+            pack_hd_amount = getattr(pack, "hd_amount", None)
+            rub = DISPLAY_RUB.get(pack_id) or round((pack.stars_price or 0) * getattr(settings, "star_to_rub", 1.3))
+
+            # Три пакета (Neo Start / Neo Pro / Neo Unlimited) — сразу ссылка ЮKassa, без экрана выбора способа оплаты
+            if pack_id in ("neo_start", "neo_pro", "neo_unlimited"):
+                from app.services.yookassa.client import YooKassaClient
+                from app.services.pack_order.service import PackOrderService
+                yookassa = YooKassaClient()
+                if not yookassa.is_configured():
+                    await callback.message.answer(
+                        "⚠️ Сейчас оплата временно недоступна.\n\n"
+                        "Мы уже работаем над решением.\n\n"
+                        "Нажмите «Помощь», если нужно оформить пакет вручную.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                            [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                        ]),
+                    )
+                    await callback.answer()
+                    return
+                bot_username = (getattr(settings, "telegram_bot_username", None) or "").strip()
+                if not bot_username:
+                    await callback.message.answer(
+                        "⚠️ Сейчас оплата временно недоступна.\n\n"
+                        "Мы уже работаем над решением.\n\n"
+                        "Нажмите «Помощь», если нужно оформить пакет вручную.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                            [InlineKeyboardButton(text="📋 В меню", callback_data="nav:menu")],
+                        ]),
+                    )
+                    await callback.answer()
+                    return
+                pack_order_svc = PackOrderService(db)
+                existing_pending = pack_order_svc.get_pending_order(telegram_id, pack_id)
+                if existing_pending and existing_pending.confirmation_url:
+                    order = existing_pending
+                    confirmation_url = existing_pending.confirmation_url
+                else:
+                    order, confirmation_url = pack_order_svc.create_order(telegram_id, pack_id, bot_username)
+                if not order or not confirmation_url:
+                    await callback.message.answer(
+                        "⚠️ Возникла временная ошибка при создании платежа.\n\n"
+                        "Ваш заказ не создан. Деньги не списаны.\n\n"
+                        "Попробуйте снова или обратитесь в поддержку.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"paywall:{pack_id}")],
+                            [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                        ]),
+                    )
+                    await callback.answer()
+                    return
+                db.commit()
+                msg_text = (
+                    f"{pack_emoji} *{pack_name}*\n\n"
+                    "Перейдите к оплате — пакет активируется автоматически после подтверждения.\n\n"
+                    "Ваш заказ сохранён."
+                )
+                await callback.message.answer(
+                    msg_text,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text=f"💳 Оплатить {rub} ₽", url=confirmation_url)],
+                        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"pack_check:{order.id}")],
+                        [InlineKeyboardButton(text="🛟 Помощь", callback_data="profile:support")],
+                    ]),
+                )
+                await callback.answer()
+                return
+
+        with get_db_session() as db:
+            audit = AuditService(db)
+            audit.log(
+                actor_type="user",
+                actor_id=telegram_id,
+                action="pay_click",
+                entity_type="pack",
+                entity_id=pack_id,
+                payload={"pack_name": pack_name, "flow": "payment_method_screen"},
+            )
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": f"pack_{pack_id}"},
+                )
+                ProductAnalyticsService(db).track(
+                    "payment_methods_shown",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"entry_point": "paywall"},
+                )
+
+        trust_text = (
+            f"{pack_emoji} *{pack_name}*\n\n"
+            f"Что получите: {pack_takes_limit} фото + {pack_hd_amount} 4K без водяного знака.\n"
+            f"Сумма: *{rub} ₽*\n\n"
+            "После оплаты пакет активируется автоматически. Выберите способ оплаты:"
+        )
+        await callback.message.answer(
+            trust_text,
+            parse_mode="Markdown",
+            reply_markup=_payment_method_keyboard(pack_id),
+        )
+        await callback.answer()
+    except Exception:
+        logger.exception("paywall_pack_selected error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "pay_method:other")
+async def pay_method_other(callback: CallbackQuery):
+    """Подсказка по «Другие способы»."""
+    telegram_id = str(callback.from_user.id)
+    try:
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "pay_other"},
+                )
+    except Exception:
+        logger.exception("button_click track failed pay_other")
+    await callback.answer(
+        "Сейчас доступны: ЮMoney (карта, кошелёк) и Stars выше; или оплата переводом на карту — кнопка ниже.",
+        show_alert=True,
+    )
+
+
+@router.callback_query(
+    F.data.startswith("pay_method:yoomoney:") & ~F.data.startswith("pay_method:yoomoney_link:")
+)
+async def pay_method_yoomoney(callback: CallbackQuery, bot: Bot):
+    """Оплата через ЮMoney — sendInvoice в RUB с provider_token (нативная интеграция)."""
+    telegram_id = str(callback.from_user.id)
+    pack_id = callback.data.split(":")[-1]
+    if pack_id not in PRODUCT_LADDER_IDS:
+        await callback.answer("❌ Пакет недоступен", show_alert=True)
+        return
+    try:
+        with get_db_session() as db:
+            pack = db.query(Pack).filter(Pack.id == pack_id, Pack.enabled == True).one_or_none()
+            if not pack:
+                await callback.answer("❌ Пакет недоступен", show_alert=True)
+                return
+
+            user_service = UserService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+
+            if pack.is_trial and user.trial_purchased:
+                await callback.answer("Пробный пакет уже был использован", show_alert=True)
+                return
+
+            from app.services.balance_tariffs import DISPLAY_RUB, SHORT_NAMES
+            pack_name = SHORT_NAMES.get(pack_id, pack.name)
+            pack_emoji = pack.emoji
+            pack_description = pack.description
+            pack_takes_limit = getattr(pack, "takes_limit", None)
+            pack_hd_amount = getattr(pack, "hd_amount", None)
+            rub = DISPLAY_RUB.get(pack_id) or round((pack.stars_price or 0) * getattr(settings, "star_to_rub", 1.3))
+            amount_kopecks = rub * 100
+
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "pay_yoomoney", "pack_id": pack_id},
+                )
+                ProductAnalyticsService(db).track(
+                    "payment_method_selected",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"method": "yoomoney"},
+                )
+                ProductAnalyticsService(db).track(
+                    "yoomoney_checkout_created",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"amount_kopecks": amount_kopecks, "amount_rub": rub},
+                )
+                ProductAnalyticsService(db).track(
+                    "pay_initiated",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"method": "yoomoney", "amount_kopecks": amount_kopecks, "amount_rub": rub},
+                )
+                pay_initiated_total.labels(pack_id=pack_id).inc()
+
+        provider_token = getattr(settings, "telegram_payment_provider_token", "") or ""
+        if not provider_token:
+            await callback.answer("Оплата ЮMoney временно недоступна. Выберите Stars или перевод на карту.", show_alert=True)
+            return
+
+        payload = f"yoomoney_session:{pack_id}"
+        title = f"{pack_emoji} {pack_name}"
+        description = pack_description or f"{pack_takes_limit} фото + {pack_hd_amount} 4K без водяного знака"
+        prices = [LabeledPrice(label=f"{pack_name} — {rub} ₽", amount=amount_kopecks)]
+
+        await bot.send_invoice(
+            chat_id=callback.message.chat.id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token=provider_token,
+            currency="RUB",
+            prices=prices,
+        )
+        await callback.answer()
+    except TelegramBadRequest as e:
+        if "PAYMENT_PROVIDER_INVALID" in (getattr(e, "message", None) or str(e)):
+            logger.warning("pay_method_yoomoney PAYMENT_PROVIDER_INVALID", extra={"user_id": telegram_id})
+            await callback.answer(
+                "Оплата ЮMoney временно недоступна. Выберите Stars или перевод на карту.",
+                show_alert=True,
+            )
+        else:
+            logger.exception("pay_method_yoomoney TelegramBadRequest", extra={"user_id": telegram_id})
+            await callback.answer("❌ Ошибка оплаты. Попробуйте Stars или перевод на карту.", show_alert=True)
+    except Exception:
+        logger.exception("pay_method_yoomoney error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("pay_method:yoomoney_link:"))
+async def pay_method_yoomoney_link(callback: CallbackQuery, bot: Bot):
+    """Оплата ЮMoney по ссылке — createInvoiceLink, тот же payload и обработка pre_checkout/successful_payment."""
+    telegram_id = str(callback.from_user.id)
+    pack_id = callback.data.split(":")[-1]
+    if pack_id not in PRODUCT_LADDER_IDS:
+        await callback.answer("❌ Пакет недоступен", show_alert=True)
+        return
+    try:
+        with get_db_session() as db:
+            pack = db.query(Pack).filter(Pack.id == pack_id, Pack.enabled == True).one_or_none()
+            if not pack:
+                await callback.answer("❌ Пакет недоступен", show_alert=True)
+                return
+
+            user_service = UserService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+
+            if pack.is_trial and user.trial_purchased:
+                await callback.answer("Пробный пакет уже был использован", show_alert=True)
+                return
+
+            from app.services.balance_tariffs import DISPLAY_RUB, SHORT_NAMES
+            pack_name = SHORT_NAMES.get(pack_id, pack.name)
+            pack_emoji = pack.emoji
+            pack_description = pack.description
+            pack_takes_limit = getattr(pack, "takes_limit", None)
+            pack_hd_amount = getattr(pack, "hd_amount", None)
+            rub = DISPLAY_RUB.get(pack_id) or round((pack.stars_price or 0) * getattr(settings, "star_to_rub", 1.3))
+            amount_kopecks = rub * 100
+
+        with get_db_session() as db:
+            user = UserService(db).get_by_telegram_id(telegram_id)
+            if user:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "pay_yoomoney_link", "pack_id": pack_id},
+                )
+                ProductAnalyticsService(db).track(
+                    "payment_method_selected",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"method": "yoomoney_link"},
+                )
+                ProductAnalyticsService(db).track(
+                    "yoomoney_checkout_created",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"amount_kopecks": amount_kopecks, "amount_rub": rub},
+                )
+                ProductAnalyticsService(db).track(
+                    "pay_initiated",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"method": "yoomoney_link", "amount_kopecks": amount_kopecks, "amount_rub": rub},
+                )
+
+        provider_token = getattr(settings, "telegram_payment_provider_token", "") or ""
+        if not provider_token:
+            await callback.answer("Оплата ЮMoney временно недоступна. Выберите Stars или перевод на карту.", show_alert=True)
+            return
+
+        payload = f"yoomoney_session:{pack_id}"
+        title = f"{pack_emoji} {pack_name}"
+        description = pack_description or f"{pack_takes_limit} фото + {pack_hd_amount} 4K без водяного знака"
+        prices = [LabeledPrice(label=f"{pack_name} — {rub} ₽", amount=amount_kopecks)]
+
+        link = await bot.create_invoice_link(
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token=provider_token,
+            currency="RUB",
+            prices=prices,
+        )
+        await callback.message.answer(
+            "Оплатите по ссылке (откроется окно оплаты ЮMoney):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Оплатить", url=link)],
+            ]),
+        )
+        await callback.answer()
+    except TelegramBadRequest as e:
+        if "PAYMENT_PROVIDER_INVALID" in (getattr(e, "message", None) or str(e)):
+            logger.warning("pay_method_yoomoney_link PAYMENT_PROVIDER_INVALID", extra={"user_id": telegram_id})
+            await callback.answer(
+                "Оплата ЮMoney временно недоступна. Выберите Stars или перевод на карту.",
+                show_alert=True,
+            )
+        else:
+            logger.exception("pay_method_yoomoney_link TelegramBadRequest", extra={"user_id": telegram_id})
+            await callback.answer("❌ Ошибка оплаты. Попробуйте Stars или перевод на карту.", show_alert=True)
+    except Exception:
+        logger.exception("pay_method_yoomoney_link error", extra={"user_id": telegram_id})
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("pay_method:stars:"))
+async def pay_method_stars(callback: CallbackQuery, bot: Bot):
+    """Оплата через Telegram Stars — sendInvoice в XTR."""
+    telegram_id = str(callback.from_user.id)
+    pack_id = callback.data.split(":")[-1]
+    if pack_id not in PRODUCT_LADDER_IDS:
+        await callback.answer("❌ Пакет недоступен", show_alert=True)
+        return
+    try:
+        with get_db_session() as db:
+            pack = db.query(Pack).filter(Pack.id == pack_id, Pack.enabled == True).one_or_none()
+            if not pack:
+                await callback.answer("❌ Пакет недоступен", show_alert=True)
+                return
+
+            user_service = UserService(db)
+            user = user_service.get_or_create_user(
+                telegram_id,
+                telegram_username=callback.from_user.username,
+                telegram_first_name=callback.from_user.first_name,
+                telegram_last_name=callback.from_user.last_name,
+            )
+
+            if pack.is_trial and user.trial_purchased:
+                await callback.answer("Пробный пакет уже был использован", show_alert=True)
                 return
 
             pack_name = pack.name
@@ -5617,17 +8138,19 @@ async def paywall_buy(callback: CallbackQuery, bot: Bot):
             pack_hd_amount = getattr(pack, "hd_amount", None)
 
         with get_db_session() as db:
-            audit = AuditService(db)
-            audit.log(
-                actor_type="user",
-                actor_id=telegram_id,
-                action="pay_click",
-                entity_type="pack",
-                entity_id=pack_id,
-                payload={"pack_name": pack_name, "stars_price": pack_stars_price, "flow": "paywall"},
-            )
             user = UserService(db).get_by_telegram_id(telegram_id)
             if user:
+                ProductAnalyticsService(db).track(
+                    "button_click",
+                    user.id,
+                    properties={"button_id": "pay_stars", "pack_id": pack_id},
+                )
+                ProductAnalyticsService(db).track(
+                    "payment_method_selected",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"method": "stars"},
+                )
                 rate = getattr(settings, "star_to_rub", 1.3)
                 ProductAnalyticsService(db).track(
                     "pay_initiated",
@@ -5635,13 +8158,14 @@ async def paywall_buy(callback: CallbackQuery, bot: Bot):
                     pack_id=pack_id,
                     properties={
                         "price_stars": pack_stars_price,
-                        "price_rub": round(pack_stars_price * rate, 2),
+                        "price_rub": round((pack_stars_price or 0) * rate, 2),
                     },
                 )
+                pay_initiated_total.labels(pack_id=pack_id).inc()
 
         payload = f"session:{pack_id}"
         title = f"{pack_emoji} {pack_name}"
-        description = pack_description or f"{pack_takes_limit} снимков + {pack_hd_amount} 4K без watermark"
+        description = pack_description or f"{pack_takes_limit} фото + {pack_hd_amount} 4K без водяного знака"
         prices = [LabeledPrice(label=title, amount=pack_stars_price)]
 
         await bot.send_invoice(
@@ -5654,7 +8178,7 @@ async def paywall_buy(callback: CallbackQuery, bot: Bot):
         )
         await callback.answer()
     except Exception:
-        logger.exception("paywall_buy error", extra={"user_id": telegram_id})
+        logger.exception("pay_method_stars error", extra={"user_id": telegram_id})
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
@@ -5712,6 +8236,7 @@ async def upgrade_session(callback: CallbackQuery, bot: Bot):
                         "price_rub": round(upgrade_price * rate, 2),
                     },
                 )
+                pay_initiated_total.labels(pack_id=new_pack_id).inc()
 
         payload = f"upgrade:{new_pack_id}:{session_id}"
         title = f"⬆️ Апгрейд до {new_pack_name}"
@@ -5735,21 +8260,23 @@ async def upgrade_session(callback: CallbackQuery, bot: Bot):
 @router.message()
 async def unknown_message(message: Message, state: FSMContext):
     """Handle unknown messages (wrong content type in current state)."""
+    if (getattr(message.chat, "type", None) or "") != "private":
+        return
     current = await state.get_state()
     if current == BotStates.waiting_for_audience:
-        await message.answer(t("audience.prompt", "Для кого создаём образ?"), reply_markup=audience_keyboard())
+        await message.answer(t("audience.prompt", AUDIENCE_PROMPT_DEFAULT), reply_markup=audience_keyboard())
     elif current == BotStates.waiting_for_photo:
         await message.answer(t("nav.upload_photo_or_btn", "Отправьте фото или нажмите «🔥 Создать фото»."), reply_markup=main_menu_keyboard())
     elif current == BotStates.waiting_for_trend:
         await message.answer("Выберите тематику и тренд по кнопкам выше.")
     elif current == BotStates.waiting_for_format:
-        await message.answer("Выберите формат кадра по кнопкам выше.")
+        await message.answer("Выберите соотношение сторон по кнопкам выше.")
     elif current == BotStates.waiting_for_reference_photo:
         await message.answer(t("flow.send_reference", "Отправьте картинку-образец для копирования стиля."))
     elif current == BotStates.waiting_for_self_photo:
         await message.answer(t("flow.send_your_photo", "Отправьте свою фотографию."))
     elif current == BotStates.waiting_for_prompt:
-        await message.answer(t("flow.enter_idea", "Введите текстом описание своей идеи для образа (или выберите тренд по кнопкам)."))
+        await message.answer(t("flow.enter_idea", "Введите текстом описание своей идеи (или выберите тренд по кнопкам)."))
     elif current == BotStates.bank_transfer_waiting_receipt:
         await message.answer("📸 Отправьте скриншот или фото чека перевода.")
     elif current in (
@@ -5780,6 +8307,13 @@ async def on_error(event: ErrorEvent, *args, **kwargs):
 async def main():
     """Start the bot."""
     logger.info("Starting bot...")
+    # Expose /metrics for Prometheus (pay_*, balance_rejected, funnel counters from this process)
+    try:
+        from app.utils.metrics_server import start_metrics_http_server
+        _metrics_port = int(os.environ.get("BOT_METRICS_PORT", "8002"))
+        start_metrics_http_server(port=_metrics_port)
+    except Exception as e:
+        logger.warning("Could not start metrics server: %s", e)
     patch_aiogram_message_methods()
     
     # Initialize bot and dispatcher
@@ -5817,7 +8351,6 @@ async def main():
         logger.warning("Failed to seed default packs on startup")
 
     try:
-        # Start polling (include pre_checkout_query and successful_payment)
         await dp.start_polling(
             bot,
             allowed_updates=[

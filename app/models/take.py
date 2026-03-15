@@ -39,6 +39,7 @@ class Take(Base):
     # Outcome Collections
     step_index = Column(Integer, nullable=True)
     is_reroll = Column(Boolean, nullable=False, default=False)
+    is_rescue_photo_replace = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(
         DateTime(timezone=True),

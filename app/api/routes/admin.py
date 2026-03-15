@@ -5,25 +5,40 @@ Paths match admin-frontend/src/services/api.ts. Order: /users/analytics and /use
 """
 import logging
 import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, distinct, func, literal_column, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.session import get_db
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Normalize to timezone-aware UTC for safe max() with mixed naive/aware datetimes."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+FREE_PREVIEW_PACK_NAME = "Бесплатный (без 4К)"
+
+
 from app.models.audit_log import AuditLog
-from app.models.product_event import ProductEvent
 from app.models.bank_transfer_receipt_log import BankTransferReceiptLog
 from app.models.job import Job
 from app.models.pack import Pack
 from app.models.take import Take
 from app.models.payment import Payment
+from app.models.session import Session as SessionModel
 from app.constants import AUDIENCE_CHOICES, normalize_target_audiences
 from app.models.theme import Theme
 from app.models.trend import Trend
@@ -35,7 +50,7 @@ from app.services.bank_transfer.settings_service import BankTransferSettingsServ
 from app.services.cleanup.service import CleanupService
 from app.services.copy_style.settings_service import CopyStyleSettingsService
 from app.services.jobs.service import JobService
-from app.services.payments.service import PaymentService
+from app.services.payments.service import PaymentService, PRODUCT_LADDER_IDS
 from app.services.security.settings_service import SecuritySettingsService
 from app.services.telegram_messages.service import TelegramMessageTemplateService
 from app.services.transfer_policy.service import get_all as transfer_get_all, get_effective as transfer_get_effective, update_both as transfer_update_both
@@ -45,6 +60,9 @@ from app.services.generation_prompt.settings_service import GenerationPromptSett
 from app.core.config import settings as app_settings
 from app.api.routes.playground import trend_to_playground_config
 from app.workers.tasks.broadcast import broadcast_message
+from app.workers.tasks.send_user_message import send_telegram_to_user
+from app.services.idempotency import get_admin_grant_response, set_admin_grant_response
+from app.utils.metrics import admin_grant_pack_total, admin_reset_limits_total
 from app.models.referral_bonus import ReferralBonus
 from app.referral.service import ReferralService
 from app.models.traffic_source import TrafficSource
@@ -58,6 +76,28 @@ from app.services.telegram.client import TelegramClient
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(get_current_user)])
 
 
+def _admin_audit(
+    db: Session,
+    current_user: dict,
+    action: str,
+    entity_type: str,
+    entity_id: str | None,
+    payload: dict | None = None,
+) -> None:
+    """Log admin action to audit_logs. Swallows errors to avoid breaking the main flow."""
+    try:
+        AuditService(db).log(
+            actor_type="admin",
+            actor_id=current_user.get("username") or "unknown",
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            payload=payload or {},
+        )
+    except Exception:
+        logger.exception("admin audit log failed")
+
+
 # ---------- Security ----------
 @router.get("/security/settings")
 def security_get_settings(db: Session = Depends(get_db)):
@@ -66,9 +106,15 @@ def security_get_settings(db: Session = Depends(get_db)):
 
 
 @router.put("/security/settings")
-def security_update_settings(payload: dict, db: Session = Depends(get_db)):
+def security_update_settings(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = SecuritySettingsService(db)
-    return svc.update(payload)
+    result = svc.update(payload)
+    _admin_audit(db, current_user, "update", "security_settings", None, {"section": "security"})
+    return result
 
 
 @router.get("/security/overview")
@@ -141,7 +187,12 @@ def security_users(
 
 
 @router.post("/security/users/{user_id}/ban")
-def security_ban_user(user_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
+def security_ban_user(
+    user_id: str,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
@@ -150,11 +201,16 @@ def security_ban_user(user_id: str, payload: dict | None = None, db: Session = D
     user.banned_at = datetime.now(timezone.utc)
     db.add(user)
     db.commit()
+    _admin_audit(db, current_user, "user_banned", "user", user_id, {"reason": (payload or {}).get("reason")})
     return {"ok": True}
 
 
 @router.post("/security/users/{user_id}/unban")
-def security_unban_user(user_id: str, db: Session = Depends(get_db)):
+def security_unban_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
@@ -164,11 +220,17 @@ def security_unban_user(user_id: str, db: Session = Depends(get_db)):
     user.banned_by = None
     db.add(user)
     db.commit()
+    _admin_audit(db, current_user, "user_unbanned", "user", user_id, {})
     return {"ok": True}
 
 
 @router.post("/security/users/{user_id}/suspend")
-def security_suspend_user(user_id: str, payload: dict, db: Session = Depends(get_db)):
+def security_suspend_user(
+    user_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
@@ -178,11 +240,16 @@ def security_suspend_user(user_id: str, payload: dict, db: Session = Depends(get
     user.suspend_reason = payload.get("reason")
     db.add(user)
     db.commit()
+    _admin_audit(db, current_user, "user_suspended", "user", user_id, {"hours": hours, "reason": payload.get("reason")})
     return {"ok": True}
 
 
 @router.post("/security/users/{user_id}/resume")
-def security_resume_user(user_id: str, db: Session = Depends(get_db)):
+def security_resume_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
@@ -191,11 +258,17 @@ def security_resume_user(user_id: str, db: Session = Depends(get_db)):
     user.suspend_reason = None
     db.add(user)
     db.commit()
+    _admin_audit(db, current_user, "user_resumed", "user", user_id, {})
     return {"ok": True}
 
 
 @router.post("/security/users/{user_id}/rate-limit")
-def security_set_rate_limit(user_id: str, payload: dict, db: Session = Depends(get_db)):
+def security_set_rate_limit(
+    user_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
@@ -203,24 +276,36 @@ def security_set_rate_limit(user_id: str, payload: dict, db: Session = Depends(g
     user.rate_limit_per_hour = int(limit) if limit is not None and limit != "" else None
     db.add(user)
     db.commit()
+    _admin_audit(db, current_user, "rate_limit_set", "user", user_id, {"limit": user.rate_limit_per_hour})
     return {"ok": True}
 
 
 @router.post("/security/users/{user_id}/moderator")
-def security_set_moderator(user_id: str, payload: dict, db: Session = Depends(get_db)):
+def security_set_moderator(
+    user_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
     user.is_moderator = bool(payload.get("is_moderator", False))
     db.add(user)
     db.commit()
+    _admin_audit(db, current_user, "moderator", "user", user_id, {"is_moderator": user.is_moderator})
     return {"ok": True}
 
 
 @router.post("/security/reset-limits")
-def security_reset_limits(db: Session = Depends(get_db)):
+def security_reset_limits(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     from app.services.users.service import UserService
     count = UserService(db).reset_all_limits()
+    db.commit()
+    _admin_audit(db, current_user, "reset_limits", "user", None, {"users_updated": count})
     return {"users_updated": count}
 
 
@@ -231,8 +316,14 @@ def transfer_policy_get(db: Session = Depends(get_db)):
 
 
 @router.put("/settings/transfer-policy")
-def transfer_policy_put(payload: dict, db: Session = Depends(get_db)):
-    return transfer_update_both(db, payload)
+def transfer_policy_put(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = transfer_update_both(db, payload)
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "transfer_policy"})
+    return result
 
 
 # ---------- Master prompt (Generation Prompt Settings: INPUT, TASK, IDENTITY, SAFETY + defaults) ----------
@@ -245,7 +336,7 @@ def master_prompt_get(db: Session = Depends(get_db)):
     result["use_nano_banana_pro"] = app_dict.get("use_nano_banana_pro", False)
     result["watermark_text"] = app_dict.get("watermark_text")
     result["watermark_text_effective"] = (
-        app_dict.get("watermark_text") or getattr(app_settings, "watermark_text", "NanoBanan Preview")
+        app_dict.get("watermark_text") or getattr(app_settings, "watermark_text", "@ai_nanobananastudio_bot")
     )
     result["watermark_opacity"] = app_dict.get("watermark_opacity", 60)
     result["watermark_tile_spacing"] = app_dict.get("watermark_tile_spacing", 200)
@@ -253,17 +344,67 @@ def master_prompt_get(db: Session = Depends(get_db)):
     return result
 
 
+@router.get("/settings/preview-policy")
+def preview_policy_get(db: Session = Depends(get_db)):
+    """Единый раздел настроек превью и вотермарка (для страницы «Политика превью»)."""
+    app_svc = AppSettingsService(db)
+    app_dict = app_svc.as_dict()
+    return {
+        "preview_format": app_dict.get("preview_format", "webp"),
+        "preview_quality": app_dict.get("preview_quality", 85),
+        "take_preview_max_dim": app_dict.get("take_preview_max_dim", 800),
+        "job_preview_max_dim": app_dict.get("job_preview_max_dim", 800),
+        "watermark_text": app_dict.get("watermark_text"),
+        "watermark_text_effective": (
+            app_dict.get("watermark_text") or getattr(app_settings, "watermark_text", "@ai_nanobananastudio_bot")
+        ),
+        "watermark_opacity": app_dict.get("watermark_opacity", 60),
+        "watermark_tile_spacing": app_dict.get("watermark_tile_spacing", 200),
+        "watermark_use_contrast": app_dict.get("watermark_use_contrast", True),
+        "updated_at": app_dict.get("updated_at"),
+    }
+
+
+@router.put("/settings/preview-policy")
+def preview_policy_put(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    app_svc = AppSettingsService(db)
+    allowed = {
+        "preview_format", "preview_quality", "take_preview_max_dim", "job_preview_max_dim",
+        "watermark_text", "watermark_opacity", "watermark_tile_spacing", "watermark_use_contrast",
+    }
+    data = {k: v for k, v in payload.items() if k in allowed}
+    if data:
+        try:
+            app_svc.update(data)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "preview_policy"})
+    return preview_policy_get(db)
+
+
 @router.put("/settings/master-prompt")
-def master_prompt_put(payload: dict, db: Session = Depends(get_db)):
+def master_prompt_put(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = GenerationPromptSettingsService(db)
     app_svc = AppSettingsService(db)
-    app_keys = {"use_nano_banana_pro", "watermark_text", "watermark_opacity", "watermark_tile_spacing", "take_preview_max_dim"}
+    app_keys = {"use_nano_banana_pro", "watermark_text", "watermark_opacity", "watermark_tile_spacing", "take_preview_max_dim", "preview_format", "preview_quality", "job_preview_max_dim", "watermark_use_contrast"}
     app_payload = {k: v for k, v in payload.items() if k in app_keys}
     if app_payload:
-        app_svc.update(app_payload)
+        try:
+            app_svc.update(app_payload)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     data = {k: v for k, v in payload.items() if k not in app_keys}
     if data:
         svc.update(data)
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "master_prompt"})
     return master_prompt_get(db)
 
 
@@ -285,9 +426,15 @@ def settings_app_get(db: Session = Depends(get_db)):
 
 
 @router.put("/settings/app")
-def settings_app_put(payload: dict, db: Session = Depends(get_db)):
+def settings_app_put(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = AppSettingsService(db)
-    return svc.update(payload)
+    result = svc.update(payload)
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "app"})
+    return result
 
 
 # ---------- Users (order: analytics and list before /users/{id}) ----------
@@ -436,6 +583,9 @@ def users_analytics(db: Session = Depends(get_db), time_window: str | None = Que
     }
 
 
+_ALLOWED_SORT = {"created_at", "token_balance", "telegram_id", "payments_count", "jobs_count"}
+
+
 @router.get("/users")
 def users_list(
     db: Session = Depends(get_db),
@@ -444,9 +594,48 @@ def users_list(
     search: str | None = None,
     telegram_id: str | None = None,
     subscription_active: bool | None = None,
+    trial_purchased: bool | None = None,
+    pack_id: str | None = None,
+    payments_count_min: int | None = Query(None, ge=0),
+    sort_by: str = Query("created_at", description="created_at|token_balance|telegram_id|payments_count|jobs_count"),
+    sort_order: str = Query("desc", description="asc|desc"),
 ):
+    sort_by = sort_by.strip().lower() if sort_by else "created_at"
+    sort_order = sort_order.strip().lower() if sort_order else "desc"
+    if sort_by not in _ALLOWED_SORT:
+        sort_by = "created_at"
+    if sort_order not in ("asc", "desc"):
+        sort_order = "desc"
+    need_pay_join = sort_by == "payments_count" or payments_count_min is not None
+    need_job_join = sort_by == "jobs_count"
+
     q = db.query(User)
-    search_val = search or telegram_id
+    if need_pay_join:
+        pay_subq = (
+            db.query(Payment.user_id, func.count(Payment.id).label("pay_count"))
+            .filter(Payment.status == "completed")
+            .group_by(Payment.user_id)
+            .subquery()
+        )
+        q = q.outerjoin(pay_subq, User.id == pay_subq.c.user_id)
+    if need_job_join:
+        job_subq = (
+            db.query(Job.user_id, func.count(Job.job_id).label("job_count"))
+            .group_by(Job.user_id)
+            .subquery()
+        )
+        q = q.outerjoin(job_subq, User.id == job_subq.c.user_id)
+    if pack_id:
+        pack_id = pack_id.strip()
+        active_with_pack = (
+            db.query(SessionModel.user_id)
+            .filter(SessionModel.status == "active", SessionModel.pack_id == pack_id)
+            .distinct()
+            .subquery()
+        )
+        q = q.join(active_with_pack, User.id == active_with_pack.c.user_id)
+
+    search_val = (search or telegram_id or "").strip()
     if search_val:
         s = f"%{search_val}%"
         q = q.filter(
@@ -457,8 +646,30 @@ def users_list(
         )
     if subscription_active is not None:
         q = q.filter(User.subscription_active.is_(subscription_active))
+    if trial_purchased is not None:
+        q = q.filter(User.trial_purchased.is_(trial_purchased))
+    if payments_count_min is not None and need_pay_join:
+        q = q.filter(pay_subq.c.pay_count >= payments_count_min)
+
     total = q.count()
-    q = q.order_by(User.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    order_col = None
+    if sort_by == "created_at":
+        order_col = User.created_at
+    elif sort_by == "token_balance":
+        order_col = User.token_balance
+    elif sort_by == "telegram_id":
+        order_col = User.telegram_id
+    elif sort_by == "payments_count" and need_pay_join:
+        order_col = pay_subq.c.pay_count
+    elif sort_by == "jobs_count" and need_job_join:
+        order_col = job_subq.c.job_count
+    if order_col is None:
+        order_col = User.created_at
+    if sort_order == "asc":
+        q = q.order_by(order_col.asc().nullslast())
+    else:
+        q = q.order_by(order_col.desc().nullslast())
+    q = q.offset((page - 1) * page_size).limit(page_size)
     users = q.all()
     user_ids = [u.id for u in users]
     # Job stats per user: jobs_count, succeeded, failed, last_active (max updated_at)
@@ -482,9 +693,76 @@ def users_list(
                 "failed": int(row.failed or 0),
                 "last_active": row.last_active.isoformat() if row.last_active else None,
             }
+    # Take last activity per user (max created_at) for last_active
+    take_last_by_user = {}
+    if user_ids:
+        take_agg = (
+            db.query(Take.user_id, func.max(Take.created_at).label("last_take_at"))
+            .filter(Take.user_id.in_(user_ids))
+            .group_by(Take.user_id)
+        )
+        for row in take_agg:
+            if row.last_take_at:
+                take_last_by_user[row.user_id] = row.last_take_at
+    # Active session per user (latest by created_at) and payments count
+    active_by_user = {}
+    payments_count_by_user = {}
+    if user_ids:
+        active_sessions = (
+            db.query(SessionModel)
+            .filter(SessionModel.user_id.in_(user_ids), SessionModel.status == "active")
+            .order_by(SessionModel.created_at.desc())
+            .all()
+        )
+        for s in active_sessions:
+            if s.user_id not in active_by_user:
+                active_by_user[s.user_id] = s
+        pack_ids = list({s.pack_id for s in active_by_user.values()})
+        pack_map = {}
+        if pack_ids:
+            for p in db.query(Pack).filter(Pack.id.in_(pack_ids)).all():
+                pack_map[p.id] = p
+        pay_agg = (
+            db.query(Payment.user_id, func.count(Payment.id).label("cnt"))
+            .filter(Payment.user_id.in_(user_ids), Payment.status == "completed")
+            .group_by(Payment.user_id)
+        )
+        for row in pay_agg:
+            payments_count_by_user[row.user_id] = row.cnt or 0
+    sec = SecuritySettingsService(db).get_or_create()
+    free_limit = getattr(sec, "free_generations_per_user", 3)
+    copy_limit = getattr(sec, "copy_generations_per_user", 1)
     items = []
     for u in users:
         stats = job_stats.get(u.id, {"jobs_count": 0, "succeeded": 0, "failed": 0, "last_active": None})
+        job_last_iso = stats.get("last_active")
+        take_dt = take_last_by_user.get(u.id)
+        if job_last_iso and take_dt:
+            try:
+                job_dt = datetime.fromisoformat(job_last_iso.replace("Z", "+00:00"))
+                last_active_iso = max(_as_utc(job_dt), _as_utc(take_dt)).isoformat()
+            except (ValueError, TypeError):
+                last_active_iso = job_last_iso
+        elif take_dt:
+            last_active_iso = take_dt.isoformat()
+        else:
+            last_active_iso = job_last_iso
+        sess = active_by_user.get(u.id)
+        active_session = None
+        if sess:
+            pack = pack_map.get(sess.pack_id)
+            takes_remaining = max(0, (sess.takes_limit or 0) - (sess.takes_used or 0))
+            hd_remaining = max(0, (sess.hd_limit or 0) - (sess.hd_used or 0))
+            active_session = {
+                "pack_id": sess.pack_id,
+                "pack_name": FREE_PREVIEW_PACK_NAME if sess.pack_id == "free_preview" else (pack.name if pack else sess.pack_id),
+                "takes_limit": sess.takes_limit,
+                "takes_used": sess.takes_used,
+                "takes_remaining": takes_remaining,
+                "hd_limit": sess.hd_limit,
+                "hd_used": sess.hd_used,
+                "hd_remaining": hd_remaining,
+            }
         items.append({
             "id": u.id,
             "telegram_id": u.telegram_id,
@@ -494,14 +772,291 @@ def users_list(
             "token_balance": u.token_balance,
             "subscription_active": u.subscription_active,
             "free_generations_used": u.free_generations_used,
+            "free_generations_limit": free_limit,
             "copy_generations_used": u.copy_generations_used,
+            "copy_generations_limit": copy_limit,
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "jobs_count": stats["jobs_count"],
             "succeeded": stats["succeeded"],
             "failed": stats["failed"],
-            "last_active": stats["last_active"],
+            "last_active": last_active_iso,
+            "trial_purchased": bool(getattr(u, "trial_purchased", False)),
+            "free_takes_used": getattr(u, "free_takes_used", 0) or 0,
+            "payments_count": payments_count_by_user.get(u.id, 0),
+            "active_session": active_session,
         })
     return {"items": items, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
+
+
+def _resolve_user_by_id_or_telegram(db: Session, user_id: str) -> User | None:
+    """Resolve user by primary key (UUID) or by telegram_id."""
+    u = db.query(User).filter(User.id == user_id).first()
+    if u:
+        return u
+    return db.query(User).filter(User.telegram_id == user_id).first()
+
+
+@router.get("/users/{user_id}")
+def user_detail(user_id: str, db: Session = Depends(get_db)):
+    user = _resolve_user_by_id_or_telegram(db, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    payment_svc = PaymentService(db)
+    payments = payment_svc.get_user_payments(user.id, limit=30)
+    active_session = (
+        db.query(SessionModel)
+        .filter(SessionModel.user_id == user.id, SessionModel.status == "active")
+        .order_by(SessionModel.created_at.desc())
+        .first()
+    )
+    sessions = (
+        db.query(SessionModel)
+        .filter(SessionModel.user_id == user.id)
+        .order_by(SessionModel.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    pack_ids = list({s.pack_id for s in sessions}) + ([active_session.pack_id] if active_session else [])
+    pack_map = {}
+    if pack_ids:
+        for p in db.query(Pack).filter(Pack.id.in_(pack_ids)).all():
+            pack_map[p.id] = p
+    sec = SecuritySettingsService(db).get_or_create()
+    free_limit = getattr(sec, "free_generations_per_user", 3)
+    copy_limit = getattr(sec, "copy_generations_per_user", 1)
+
+    def _session_row(s: SessionModel):
+        pack = pack_map.get(s.pack_id)
+        pack_name = FREE_PREVIEW_PACK_NAME if s.pack_id == "free_preview" else (pack.name if pack else s.pack_id)
+        return {
+            "id": s.id,
+            "pack_id": s.pack_id,
+            "pack_name": pack_name,
+            "status": s.status,
+            "takes_limit": s.takes_limit,
+            "takes_used": s.takes_used,
+            "hd_limit": s.hd_limit,
+            "hd_used": s.hd_used,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        }
+
+    active_session_out = None
+    if active_session:
+        active_session_out = _session_row(active_session)
+        active_session_out["takes_remaining"] = max(0, (active_session.takes_limit or 0) - (active_session.takes_used or 0))
+        active_session_out["hd_remaining"] = max(0, (active_session.hd_limit or 0) - (active_session.hd_used or 0))
+
+    job_last = db.query(func.max(Job.updated_at)).filter(Job.user_id == user.id).scalar()
+    take_last = db.query(func.max(Take.created_at)).filter(Take.user_id == user.id).scalar()
+    if job_last and take_last:
+        last_active_iso = max(_as_utc(job_last), _as_utc(take_last)).isoformat()
+    elif take_last:
+        last_active_iso = take_last.isoformat()
+    else:
+        last_active_iso = job_last.isoformat() if job_last else None
+
+    return {
+        "id": user.id,
+        "telegram_id": user.telegram_id,
+        "telegram_username": user.telegram_username,
+        "telegram_first_name": user.telegram_first_name,
+        "telegram_last_name": user.telegram_last_name,
+        "token_balance": user.token_balance,
+        "subscription_active": user.subscription_active,
+        "free_generations_used": user.free_generations_used,
+        "free_generations_limit": free_limit,
+        "copy_generations_used": user.copy_generations_used,
+        "copy_generations_limit": copy_limit,
+        "trial_purchased": bool(getattr(user, "trial_purchased", False)),
+        "free_takes_used": getattr(user, "free_takes_used", 0) or 0,
+        "hd_paid_balance": getattr(user, "hd_paid_balance", 0) or 0,
+        "hd_promo_balance": getattr(user, "hd_promo_balance", 0) or 0,
+        "admin_notes": user.admin_notes,
+        "is_banned": user.is_banned,
+        "is_suspended": user.is_suspended,
+        "suspended_until": user.suspended_until.isoformat() if user.suspended_until else None,
+        "rate_limit_per_hour": user.rate_limit_per_hour,
+        "is_moderator": user.is_moderator,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+        "last_active": last_active_iso,
+        "active_session": active_session_out,
+        "sessions": [_session_row(s) for s in sessions],
+        "payments": [
+            {
+                "id": p.id,
+                "pack_id": p.pack_id,
+                "status": p.status,
+                "stars_amount": p.stars_amount,
+                "amount_kopecks": p.amount_kopecks,
+                "tokens_granted": p.tokens_granted,
+                "session_id": p.session_id,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+            }
+            for p in payments
+        ],
+    }
+
+
+class GrantPackBody(BaseModel):
+    pack_id: str
+    activation_message: str | None = None
+
+
+@router.post("/users/{user_id}/grant-pack")
+def user_grant_pack(
+    request: Request,
+    user_id: str,
+    body: GrantPackBody,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    from uuid import uuid4
+
+    idempotency_key = (request.headers.get("Idempotency-Key") or "").strip() or None
+    if idempotency_key:
+        cached = get_admin_grant_response(idempotency_key)
+        if cached is not None:
+            admin_grant_pack_total.labels(status="idempotent_replay").inc()
+            logger.info(
+                "admin_grant_pack_idempotent_replay",
+                extra={"request_id": getattr(request.state, "request_id", None), "user_id": user_id, "pack_id": body.pack_id},
+            )
+            return cached
+
+    user = _resolve_user_by_id_or_telegram(db, user_id)
+    if not user:
+        admin_grant_pack_total.labels(status="failure").inc()
+        raise HTTPException(404, "User not found")
+    payment_svc = PaymentService(db)
+    pack = payment_svc.get_pack(body.pack_id)
+    if not pack:
+        admin_grant_pack_total.labels(status="failure").inc()
+        raise HTTPException(400, "Pack not found")
+    if not pack.enabled:
+        admin_grant_pack_total.labels(status="failure").inc()
+        raise HTTPException(400, "Pack is disabled")
+
+    reference = idempotency_key if idempotency_key else str(uuid4())
+    session_id = None
+    payment_id = None
+    try:
+        if pack.id in PRODUCT_LADDER_IDS:
+            try:
+                payment, session, trial_error = payment_svc.grant_session_pack_admin(
+                    user.telegram_id, body.pack_id, reference
+                )
+            except ValueError as e:
+                admin_grant_pack_total.labels(status="failure").inc()
+                raise HTTPException(400, str(e))
+            if trial_error == "trial_already_used":
+                admin_grant_pack_total.labels(status="failure").inc()
+                raise HTTPException(400, "Пробный тариф уже использован")
+            if not payment:
+                admin_grant_pack_total.labels(status="failure").inc()
+                raise HTTPException(400, "Failed to grant session pack")
+            session_id = session.id if session else None
+            payment_id = payment.id
+        else:
+            payment = payment_svc.credit_tokens(
+                telegram_user_id=user.telegram_id,
+                telegram_payment_charge_id=f"admin_manual:{reference}",
+                provider_payment_charge_id=None,
+                pack_id=body.pack_id,
+                stars_amount=0,
+                tokens_granted=pack.tokens or 0,
+                payload=f"admin_manual:{reference}",
+            )
+            if not payment:
+                admin_grant_pack_total.labels(status="failure").inc()
+                raise HTTPException(400, "Failed to grant tokens")
+            payment_id = payment.id
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        admin_grant_pack_total.labels(status="failure").inc()
+        logger.exception(
+            "admin_grant_pack_error",
+            extra={"request_id": getattr(request.state, "request_id", None), "user_id": user_id, "pack_id": body.pack_id, "error": str(e)},
+        )
+        raise
+
+    if body.activation_message and body.activation_message.strip():
+        try:
+            send_telegram_to_user.delay(user.telegram_id, body.activation_message.strip())
+        except Exception as e:
+            logger.warning(
+                "admin_grant_pack_telegram_enqueue_failed",
+                extra={
+                    "request_id": getattr(request.state, "request_id", None),
+                    "user_id": user.id,
+                    "telegram_id": user.telegram_id,
+                    "error": str(e),
+                },
+            )
+            # Не возвращаем 5xx: выдача уже выполнена, уведомление — best-effort
+
+    response = {
+        "ok": True,
+        "message": "Пакет выдан",
+        "session_id": session_id,
+        "payment_id": payment_id,
+    }
+    _admin_audit(
+        db,
+        current_user,
+        "grant_pack",
+        "user",
+        user.id,
+        {"pack_id": body.pack_id, "payment_id": payment_id, "session_id": session_id},
+    )
+    admin_grant_pack_total.labels(status="success").inc()
+    logger.info(
+        "admin_grant_pack_success",
+        extra={
+            "request_id": getattr(request.state, "request_id", None),
+            "user_id": user.id,
+            "pack_id": body.pack_id,
+            "payment_id": payment_id,
+        },
+    )
+    if idempotency_key:
+        set_admin_grant_response(idempotency_key, response)
+    return response
+
+
+@router.post("/users/{user_id}/reset-limits")
+def user_reset_limits(
+    request: Request,
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    from app.services.users.service import UserService
+
+    user = _resolve_user_by_id_or_telegram(db, user_id)
+    if not user:
+        admin_reset_limits_total.labels(status="failure").inc()
+        raise HTTPException(404, "User not found")
+    updated = UserService(db).reset_user_limits(user)
+    if not updated:
+        db.commit()
+        _admin_audit(db, current_user, "reset_limits", "user", user_id, {"updated": False})
+        admin_reset_limits_total.labels(status="no_change").inc()
+        logger.info(
+            "admin_reset_limits_no_change",
+            extra={"request_id": getattr(request.state, "request_id", None), "user_id": user_id},
+        )
+        return {"ok": True, "updated": False}
+    db.commit()
+    _admin_audit(db, current_user, "reset_limits", "user", user_id, {"updated": True})
+    admin_reset_limits_total.labels(status="success").inc()
+    logger.info(
+        "admin_reset_limits_success",
+        extra={"request_id": getattr(request.state, "request_id", None), "user_id": user.id},
+    )
+    return {"ok": True, "updated": True}
 
 
 # ---------- Telegram messages ----------
@@ -517,17 +1072,26 @@ class TelegramBulkItem(BaseModel):
 
 
 @router.post("/telegram-messages/bulk")
-def telegram_messages_bulk(payload: dict, db: Session = Depends(get_db)):
+def telegram_messages_bulk(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     items = payload.get("items", [])
     svc = TelegramMessageTemplateService(db)
     result = svc.bulk_upsert(items, updated_by="admin")
+    _admin_audit(db, current_user, "bulk_action", "telegram_messages", None, {"updated": result["updated"]})
     return {"updated": result["updated"]}
 
 
 @router.post("/telegram-messages/reset")
-def telegram_messages_reset(db: Session = Depends(get_db)):
+def telegram_messages_reset(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = TelegramMessageTemplateService(db)
     result = svc.reset_defaults(updated_by="admin")
+    _admin_audit(db, current_user, "update", "telegram_messages", None, {"reset": result.get("reset", 0)})
     return {"reset": result.get("reset", 0)}
 
 
@@ -540,8 +1104,18 @@ def _telemetry_since(db: Session, since: datetime) -> tuple[int, dict[str, int]]
     return total, by_status
 
 
+def _utc_date_job():
+    """Expression: date(Job.created_at) in UTC for grouping (supports .label())."""
+    return literal_column("(jobs.created_at AT TIME ZONE 'UTC')::date")
+
+
+def _utc_date_take():
+    """Expression: date(Take.created_at) in UTC for grouping (supports .label())."""
+    return literal_column("(takes.created_at AT TIME ZONE 'UTC')::date")
+
+
 @router.get("/telemetry")
-def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query(24, ge=1)):
+def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query(24, ge=1, le=720)):
     since = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     users_total = db.query(func.count(User.id)).scalar() or 0
     users_subscribed = db.query(func.count(User.id)).filter(User.subscription_active.is_(True)).scalar() or 0
@@ -550,8 +1124,18 @@ def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query
     takes_window = (
         db.query(func.count(Take.id)).filter(Take.created_at >= since).scalar() or 0
     )
-    succeeded = (db.query(func.count(Job.job_id)).filter(Job.status == "SUCCEEDED").scalar() or 0)
-    queue_length = (db.query(func.count(Job.job_id)).filter(Job.status.in_(["CREATED", "RUNNING"])).scalar() or 0)
+    succeeded = (
+        db.query(func.count(Job.job_id))
+        .filter(Job.status == "SUCCEEDED", Job.created_at >= since)
+        .scalar()
+        or 0
+    )
+    queue_length = (
+        db.query(func.count(Job.job_id))
+        .filter(Job.status.in_(["CREATED", "RUNNING"]), Job.created_at >= since)
+        .scalar()
+        or 0
+    )
     # Статистика Take по трендам за окно (снимки — основной флоу «Создать фото»)
     take_stats_q = (
         db.query(
@@ -572,6 +1156,51 @@ def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query
         }
         for r in take_stats_q
     }
+    # Глобальные счётчики Take за окно (включая снимки без trend_id)
+    takes_succeeded = (
+        db.query(func.count(Take.id))
+        .filter(
+            Take.created_at >= since,
+            Take.status.in_(["ready", "partial_fail"]),
+        )
+        .scalar()
+        or 0
+    )
+    takes_failed = (
+        db.query(func.count(Take.id))
+        .filter(Take.created_at >= since, Take.status == "failed")
+        .scalar()
+        or 0
+    )
+    # Среднее время генерации 3 снимков (одно значение на Take — по первому событию take_previews_ready)
+    take_avg_generation_sec = None
+    take_avg_q = (
+        db.query(AuditLog.entity_id, AuditLog.created_at, Take.created_at)
+        .join(Take, AuditLog.entity_id == Take.id)
+        .filter(
+            AuditLog.action == "take_previews_ready",
+            AuditLog.entity_type == "take",
+            AuditLog.created_at >= since,
+        )
+        .order_by(AuditLog.entity_id, AuditLog.created_at)
+        .all()
+    )
+    if take_avg_q:
+        utc = timezone.utc
+        # Один срок на take (первое событие по entity_id), отрицательные длительности не учитываем
+        seen_take_ids = set()
+        diffs = []
+        for entity_id, al_created, take_created in take_avg_q:
+            if entity_id in seen_take_ids:
+                continue
+            seen_take_ids.add(entity_id)
+            a = al_created.replace(tzinfo=utc) if al_created.tzinfo is None else al_created
+            t = take_created.replace(tzinfo=utc) if take_created.tzinfo is None else take_created
+            sec = (a - t).total_seconds()
+            if sec >= 0:
+                diffs.append(sec)
+        if diffs:
+            take_avg_generation_sec = round(sum(diffs) / len(diffs), 1)
     # Топ трендов за окно: по Job (задачи) и по Take (снимки)
     trend_stats = (
         db.query(
@@ -661,7 +1290,7 @@ def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query
     # Ошибки по коду за окно
     failed_by_code_q = (
         db.query(func.coalesce(Job.error_code, "unknown").label("code"), func.count(Job.job_id).label("cnt"))
-        .filter(Job.status == "FAILED", Job.created_at >= since)
+        .filter(Job.status.in_(["FAILED", "ERROR"]), Job.created_at >= since)
         .group_by(func.coalesce(Job.error_code, "unknown"))
     )
     jobs_failed_by_error = {row[0]: row[1] for row in failed_by_code_q}
@@ -673,6 +1302,9 @@ def telemetry_dashboard(db: Session = Depends(get_db), window_hours: int = Query
         "jobs_total": jobs_total,
         "jobs_window": jobs_window,
         "takes_window": takes_window,
+        "takes_succeeded": takes_succeeded,
+        "takes_failed": takes_failed,
+        "take_avg_generation_sec": take_avg_generation_sec,
         "queue_length": queue_length,
         "succeeded": succeeded,
         "jobs_by_status": jobs_by_status,
@@ -720,7 +1352,7 @@ def telemetry_errors(db: Session = Depends(get_db), window_days: int = Query(30,
     since = now - timedelta(days=window_days)
     job_errors = (
         db.query(func.coalesce(Job.error_code, "unknown").label("code"), func.count(Job.job_id).label("cnt"))
-        .filter(Job.status == "FAILED", Job.created_at >= since)
+        .filter(Job.status.in_(["FAILED", "ERROR"]), Job.created_at >= since)
         .group_by(func.coalesce(Job.error_code, "unknown"))
         .all()
     )
@@ -738,17 +1370,19 @@ def telemetry_errors(db: Session = Depends(get_db), window_days: int = Query(30,
     for code, cnt in take_errors:
         combined.setdefault(code, {"job": 0, "take": 0})["take"] = cnt
 
-    # Распределение ошибок по датам за окно (для графика)
+    # Распределение ошибок по датам за окно (UTC)
+    day_j = _utc_date_job()
+    day_t = _utc_date_take()
     jobs_by_day = (
-        db.query(func.date(Job.created_at).label("date"), func.count(Job.job_id).label("cnt"))
-        .filter(Job.status == "FAILED", Job.created_at >= since)
-        .group_by(func.date(Job.created_at))
+        db.query(day_j.label("date"), func.count(Job.job_id).label("cnt"))
+        .filter(Job.status.in_(["FAILED", "ERROR"]), Job.created_at >= since)
+        .group_by(day_j)
         .all()
     )
     takes_by_day = (
-        db.query(func.date(Take.created_at).label("date"), func.count(Take.id).label("cnt"))
+        db.query(day_t.label("date"), func.count(Take.id).label("cnt"))
         .filter(Take.status == "failed", Take.created_at >= since)
-        .group_by(func.date(Take.created_at))
+        .group_by(day_t)
         .all()
     )
     jobs_failed_by_date = {str(r.date): r.cnt for r in jobs_by_day}
@@ -776,16 +1410,16 @@ def telemetry_errors(db: Session = Depends(get_db), window_days: int = Query(30,
 
 
 @router.get("/telemetry/history")
-def telemetry_history(db: Session = Depends(get_db), window_days: int = Query(7, ge=1)):
+def telemetry_history(db: Session = Depends(get_db), window_days: int = Query(7, ge=1, le=90)):
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=window_days)
-    day_j = func.date(Job.created_at)
+    day_j = _utc_date_job()
     q_jobs = (
         db.query(
             day_j.label("date"),
             func.count(Job.job_id).label("jobs_total"),
             func.sum(case((Job.status == "SUCCEEDED", 1), else_=0)).label("jobs_succeeded"),
-            func.sum(case((Job.status == "FAILED", 1), else_=0)).label("jobs_failed"),
+            func.sum(case((Job.status.in_(["FAILED", "ERROR"]), 1), else_=0)).label("jobs_failed"),
             func.count(func.distinct(Job.user_id)).label("job_users"),
         )
         .filter(Job.created_at >= since)
@@ -802,13 +1436,13 @@ def telemetry_history(db: Session = Depends(get_db), window_days: int = Query(7,
         for r in jobs_rows
     }
     job_user_pairs = (
-        db.query(func.date(Job.created_at).label("date"), Job.user_id)
+        db.query(_utc_date_job().label("date"), Job.user_id)
         .filter(Job.created_at >= since, Job.user_id.isnot(None))
         .distinct()
         .all()
     )
     take_user_pairs = (
-        db.query(func.date(Take.created_at).label("date"), Take.user_id)
+        db.query(_utc_date_take().label("date"), Take.user_id)
         .filter(Take.created_at >= since, Take.user_id.isnot(None))
         .distinct()
         .all()
@@ -820,13 +1454,50 @@ def telemetry_history(db: Session = Depends(get_db), window_days: int = Query(7,
     for d, uid in take_user_pairs:
         if uid:
             users_by_date.setdefault(str(d), set()).add(uid)
+    day_t = _utc_date_take()
     takes_by_date = (
-        db.query(func.date(Take.created_at).label("date"), func.count(Take.id).label("cnt"))
+        db.query(day_t.label("date"), func.count(Take.id).label("cnt"))
         .filter(Take.created_at >= since)
-        .group_by(func.date(Take.created_at))
+        .group_by(day_t)
         .all()
     )
     takes_by_date_map = {str(r.date): r.cnt for r in takes_by_date}
+    # Среднее время генерации 3 снимков по дням (Take created -> take_previews_ready)
+    take_avg_rows = (
+        db.query(Take.id, Take.created_at, AuditLog.created_at)
+        .select_from(Take)
+        .join(
+            AuditLog,
+            and_(
+                AuditLog.entity_id == Take.id,
+                AuditLog.entity_type == "take",
+                AuditLog.action == "take_previews_ready",
+            ),
+        )
+        .filter(Take.created_at >= since, AuditLog.created_at >= since)
+        .order_by(Take.id, AuditLog.created_at)
+        .all()
+    )
+    utc = timezone.utc
+    take_diffs_by_date: dict[str, list[float]] = {}
+    seen_per_date: dict[str, set[str]] = {}
+    for take_id, take_created, audit_created in take_avg_rows:
+        t = take_created.replace(tzinfo=utc) if take_created and take_created.tzinfo is None else take_created
+        a = audit_created.replace(tzinfo=utc) if audit_created and audit_created.tzinfo is None else audit_created
+        if t is None or a is None:
+            continue
+        date_key = str(t.date())
+        if date_key not in seen_per_date:
+            seen_per_date[date_key] = set()
+        if take_id in seen_per_date[date_key]:
+            continue
+        seen_per_date[date_key].add(take_id)
+        sec = (a - t).total_seconds()
+        if sec >= 0:
+            take_diffs_by_date.setdefault(date_key, []).append(sec)
+    take_avg_by_date = {
+        k: round(sum(v) / len(v), 1) for k, v in take_diffs_by_date.items() if v
+    }
     history = []
     for i in range(window_days):
         d = (now - timedelta(days=window_days - 1 - i)).date()
@@ -840,6 +1511,7 @@ def telemetry_history(db: Session = Depends(get_db), window_days: int = Query(7,
             "jobs_failed": row["jobs_failed"],
             "active_users": active_users,
             "takes_total": takes_by_date_map.get(key, 0),
+            "take_avg_generation_sec": take_avg_by_date.get(key),
         })
     return {"window_days": window_days, "history": history}
 
@@ -858,7 +1530,7 @@ def _active_user_ids_in_period(db: Session, since: datetime) -> set[str]:
 
 
 @router.get("/telemetry/product-metrics")
-def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = Query(7, ge=1)):
+def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = Query(7, ge=1, le=90)):
     now = datetime.now(timezone.utc)
     since_1d = now - timedelta(days=1)
     since_7d = now - timedelta(days=7)
@@ -939,17 +1611,33 @@ def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = 
     }
 
 
-# ---------- Product analytics (product_events) ----------
+# ---------- Product analytics (from audit_logs — single event log) ----------
 FUNNEL_EVENT_NAMES = [
     "bot_started",
     "photo_uploaded",
     "take_preview_ready",
     "favorite_selected",
     "paywall_viewed",
+    "pack_selected",
     "pay_initiated",
     "pay_success",
     "hd_delivered",
 ]
+
+
+def _audit_user_id_expr():
+    """Expression: user identifier for funnel/metrics (user_id or entity_id when entity_type=user)."""
+    return func.coalesce(
+        AuditLog.user_id,
+        case((AuditLog.entity_type == "user", AuditLog.entity_id), else_=None),
+    )
+
+
+def _utc_date_audit_log():
+    """Expression: date(audit_logs.created_at) in UTC for grouping.
+    Assumes created_at is stored as UTC (default in app is datetime.now(timezone.utc)).
+    """
+    return literal_column("(audit_logs.created_at AT TIME ZONE 'UTC')::date")
 
 
 @router.get("/telemetry/product-funnel")
@@ -957,12 +1645,13 @@ def telemetry_product_funnel(
     db: Session = Depends(get_db),
     window_days: int = Query(7, ge=1, le=90),
 ):
-    """Funnel counts from product_events (for product analytics dashboard)."""
+    """Funnel: уникальные пользователи по шагам (хотя бы одно событие за период). Source: audit_logs."""
     since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    user_expr = _audit_user_id_expr()
     rows = (
-        db.query(ProductEvent.event_name, func.count(ProductEvent.id))
-        .filter(ProductEvent.timestamp >= since, ProductEvent.event_name.in_(FUNNEL_EVENT_NAMES))
-        .group_by(ProductEvent.event_name)
+        db.query(AuditLog.action, func.count(func.distinct(user_expr)).label("users"))
+        .filter(AuditLog.created_at >= since, AuditLog.action.in_(FUNNEL_EVENT_NAMES))
+        .group_by(AuditLog.action)
         .all()
     )
     funnel_counts = {name: 0 for name in FUNNEL_EVENT_NAMES}
@@ -971,73 +1660,373 @@ def telemetry_product_funnel(
     return {"window_days": window_days, "funnel_counts": funnel_counts}
 
 
+@router.get("/telemetry/product-funnel-history")
+def telemetry_product_funnel_history(
+    db: Session = Depends(get_db),
+    window_days: int = Query(30, ge=1, le=90),
+):
+    """Funnel event counts per day (from audit_logs) for historical chart."""
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=window_days)
+    day_al = _utc_date_audit_log()
+    user_expr = _audit_user_id_expr()
+    rows = (
+        db.query(
+            day_al.label("date"),
+            AuditLog.action,
+            func.count(func.distinct(user_expr)).label("cnt"),
+        )
+        .filter(
+            AuditLog.created_at >= since,
+            AuditLog.action.in_(FUNNEL_EVENT_NAMES),
+        )
+        .group_by(day_al, AuditLog.action)
+        .all()
+    )
+    by_date: dict[str, dict[str, int]] = {}
+    for date_val, action_name, cnt in rows:
+        key = str(date_val)
+        if key not in by_date:
+            by_date[key] = {name: 0 for name in FUNNEL_EVENT_NAMES}
+        by_date[key][action_name] = cnt
+    history = []
+    for i in range(window_days + 1):
+        d = (now - timedelta(days=window_days - i)).date()
+        key = str(d)
+        history.append({
+            "date": key,
+            **{name: by_date.get(key, {}).get(name, 0) for name in FUNNEL_EVENT_NAMES},
+        })
+    return {"window_days": window_days, "history": history}
+
+
+# Max rows for path aggregation to avoid OOM/timeout on huge audit_logs (e.g. 90d × high traffic).
+_PATH_QUERY_ROW_LIMIT = 500_000
+
+
+def _path_transitions_and_sequences(
+    db: Session,
+    since: datetime,
+    window_days: int,
+    path_limit: int = 20,
+) -> tuple[list[dict], list[dict], list[dict], bool]:
+    """Load funnel events from audit_logs, group by session/user, return transitions, drop_off, path sequences, truncated."""
+    user_expr = _audit_user_id_expr()
+    q = (
+        db.query(
+            AuditLog.session_id,
+            user_expr.label("uid"),
+            AuditLog.created_at,
+            AuditLog.action,
+        )
+        .filter(
+            AuditLog.created_at >= since,
+            AuditLog.action.in_(FUNNEL_EVENT_NAMES),
+        )
+        .order_by(AuditLog.session_id.nulls_last(), user_expr, AuditLog.created_at, AuditLog.action)
+    )
+    rows = q.limit(_PATH_QUERY_ROW_LIMIT + 1).all()
+    truncated = len(rows) > _PATH_QUERY_ROW_LIMIT
+    if truncated:
+        rows = rows[:_PATH_QUERY_ROW_LIMIT]
+    # Group by session (or user when no session_id). Skip rows with no session_id and no user (invalid for path).
+    sessions: dict[str, list[tuple[datetime, str]]] = {}
+    for r in rows:
+        if r.session_id:
+            key = r.session_id
+        elif r.uid:
+            key = f"u:{r.uid}"
+        else:
+            continue
+        ts = _as_utc(r.created_at) or r.created_at
+        if key not in sessions:
+            sessions[key] = []
+        sessions[key].append((ts, r.action))
+    # Sort each session by (created_at, action) for deterministic order when timestamps tie.
+    for key in sessions:
+        sessions[key].sort(key=lambda x: (x[0], x[1]))
+
+    transitions_agg: dict[tuple[str, str], list[float]] = {}
+    drop_off_agg: dict[str, int] = {}
+    path_counts: dict[str, list[tuple[float | None, float]]] = {}
+
+    for _key, events in sessions.items():
+        if not events:
+            continue
+        # Transitions and drop-off
+        for i in range(len(events) - 1):
+            from_act, to_act = events[i][1], events[i + 1][1]
+            delta_min = (events[i + 1][0] - events[i][0]).total_seconds() / 60.0
+            if delta_min < 0:
+                continue
+            k = (from_act, to_act)
+            transitions_agg.setdefault(k, []).append(delta_min)
+        last_action = events[-1][1]
+        if last_action not in ("pay_success", "hd_delivered"):
+            drop_off_agg[last_action] = drop_off_agg.get(last_action, 0) + 1
+
+        # Path sequence: time to pay_success (if any), time to last step
+        path_steps = [e[1] for e in events]
+        path_str = "|".join(path_steps)
+        first_ts = events[0][0]
+        time_to_pay: float | None = None
+        for j, (ts, act) in enumerate(events):
+            if act == "pay_success":
+                time_to_pay = (ts - first_ts).total_seconds() / 60.0
+                break
+        time_to_last = (events[-1][0] - first_ts).total_seconds() / 60.0
+        if path_str not in path_counts:
+            path_counts[path_str] = []
+        path_counts[path_str].append((time_to_pay, time_to_last))
+
+    def _median(values: list[float]) -> float | None:
+        if not values:
+            return None
+        s = sorted(values)
+        n = len(s)
+        return (s[(n - 1) // 2] + s[n // 2]) / 2.0 if n % 2 == 0 else s[n // 2]
+
+    transitions = [
+        {
+            "from": from_act,
+            "to": to_act,
+            "sessions": len(deltas),
+            "median_minutes": round(_median(deltas), 1) if _median(deltas) is not None else None,
+            "avg_minutes": round(sum(deltas) / len(deltas), 1) if deltas else None,
+        }
+        for (from_act, to_act), deltas in transitions_agg.items()
+    ]
+    drop_off = [
+        {"from": act, "to": None, "sessions": cnt}
+        for act, cnt in sorted(drop_off_agg.items(), key=lambda x: -x[1])
+    ]
+    paths_list: list[dict] = []
+    for path_str, pairs in path_counts.items():
+        steps = path_str.split("|")
+        to_pay = [p[0] for p in pairs if p[0] is not None]
+        to_last = [p[1] for p in pairs]
+        reached_pay = len(to_pay)
+        paths_list.append({
+            "steps": steps,
+            "sessions": len(pairs),
+            "median_minutes_to_pay": round(_median(to_pay), 1) if to_pay and _median(to_pay) is not None else None,
+            "median_minutes_to_last": round(_median(to_last), 1) if to_last and _median(to_last) is not None else None,
+            "pct_reached_pay": round(100.0 * reached_pay / len(pairs), 1) if pairs else 0,
+        })
+    paths_list.sort(key=lambda x: -x["sessions"])
+    path_sequences = paths_list[:path_limit]
+    return transitions, drop_off, path_sequences, truncated
+
+
+@router.get("/telemetry/path-transitions")
+def telemetry_path_transitions(
+    db: Session = Depends(get_db),
+    window_days: int = Query(7, ge=1, le=90),
+):
+    """Transitions between funnel steps with session counts and median/avg time in minutes. Source: audit_logs."""
+    try:
+        since = datetime.now(timezone.utc) - timedelta(days=window_days)
+        transitions, drop_off, _, truncated = _path_transitions_and_sequences(db, since, window_days)
+        return {"window_days": window_days, "transitions": transitions, "drop_off": drop_off, "truncated": truncated}
+    except Exception as e:
+        logger.exception("telemetry path-transitions failed: window_days=%s", window_days)
+        raise HTTPException(status_code=503, detail="Path aggregation failed; try a smaller window.") from e
+
+
+@router.get("/telemetry/path-sequences")
+def telemetry_path_sequences(
+    db: Session = Depends(get_db),
+    window_days: int = Query(7, ge=1, le=90),
+    limit: int = Query(20, ge=1, le=50),
+):
+    """Top path sequences with session count, median time to pay/last, pct reached pay. Source: audit_logs."""
+    try:
+        since = datetime.now(timezone.utc) - timedelta(days=window_days)
+        _, _, path_sequences, truncated = _path_transitions_and_sequences(
+            db, since, window_days, path_limit=limit
+        )
+        return {"window_days": window_days, "paths": path_sequences, "truncated": truncated}
+    except Exception as e:
+        logger.exception("telemetry path-sequences failed: window_days=%s", window_days)
+        raise HTTPException(status_code=503, detail="Path aggregation failed; try a smaller window.") from e
+
+
+@router.get("/telemetry/path")
+def telemetry_path(
+    db: Session = Depends(get_db),
+    window_days: int = Query(7, ge=1, le=90),
+    limit: int = Query(20, ge=1, le=50),
+):
+    """Single call returning both path-transitions and path-sequences to avoid double heavy aggregation."""
+    try:
+        since = datetime.now(timezone.utc) - timedelta(days=window_days)
+        transitions, drop_off, path_sequences, truncated = _path_transitions_and_sequences(
+            db, since, window_days, path_limit=limit
+        )
+        return {
+            "window_days": window_days,
+            "transitions": transitions,
+            "drop_off": drop_off,
+            "paths": path_sequences,
+            "truncated": truncated,
+        }
+    except Exception as e:
+        logger.exception("telemetry path failed: window_days=%s", window_days)
+        raise HTTPException(status_code=503, detail="Path aggregation failed; try a smaller window.") from e
+
+
+@router.get("/telemetry/button-clicks")
+def telemetry_button_clicks(
+    db: Session = Depends(get_db),
+    window_days: int = Query(7, ge=1, le=90),
+):
+    """Count of button_click events per button_id (from audit_logs.payload) in window."""
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    button_col = func.coalesce(AuditLog.payload["button_id"].astext, "")
+    rows = (
+        db.query(button_col.label("button_id"), func.count(AuditLog.id).label("count"))
+        .filter(
+            AuditLog.action == "button_click",
+            AuditLog.created_at >= since,
+        )
+        .group_by(button_col)
+        .all()
+    )
+    by_button_id = {r.button_id: r.count for r in rows if r.button_id}
+    return {"window_days": window_days, "by_button_id": by_button_id}
+
+
+def _safe_price_from_payload(props: dict | None) -> int:
+    try:
+        return int(float((props or {}).get("price", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 @router.get("/telemetry/product-metrics-v2")
 def telemetry_product_metrics_v2(
     db: Session = Depends(get_db),
     window_days: int = Query(7, ge=1, le=90),
 ):
-    """Calculated product metrics from product_events: preview_to_pay, hit_rate, AOV, etc."""
+    """Calculated product metrics from audit_logs: preview_to_pay, hit_rate, AOV, etc."""
     since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    user_expr = _audit_user_id_expr()
     # Counts
-    take_preview = db.query(func.count(ProductEvent.id)).filter(
-        ProductEvent.event_name == "take_preview_ready", ProductEvent.timestamp >= since
-    ).scalar() or 0
-    pay_success_count = db.query(func.count(ProductEvent.id)).filter(
-        ProductEvent.event_name == "pay_success", ProductEvent.timestamp >= since
-    ).scalar() or 0
-    # Preview -> Pay conversion
+    take_preview = (
+        db.query(func.count(AuditLog.id))
+        .filter(AuditLog.action == "take_preview_ready", AuditLog.created_at >= since)
+        .scalar()
+        or 0
+    )
+    pay_success_count = (
+        db.query(func.count(AuditLog.id))
+        .filter(AuditLog.action == "pay_success", AuditLog.created_at >= since)
+        .scalar()
+        or 0
+    )
     preview_to_pay = round((pay_success_count / take_preview * 100), 1) if take_preview else 0.0
-    # Sessions with favorite vs with preview (Hit Rate)
-    sessions_with_preview = db.query(func.count(func.distinct(ProductEvent.session_id))).filter(
-        ProductEvent.event_name == "take_preview_ready",
-        ProductEvent.timestamp >= since,
-        ProductEvent.session_id.isnot(None),
-    ).scalar() or 0
-    sessions_with_favorite = db.query(func.count(func.distinct(ProductEvent.session_id))).filter(
-        ProductEvent.event_name == "favorite_selected",
-        ProductEvent.timestamp >= since,
-        ProductEvent.session_id.isnot(None),
-    ).scalar() or 0
+    sessions_with_preview = (
+        db.query(func.count(func.distinct(AuditLog.session_id)))
+        .filter(
+            AuditLog.action == "take_preview_ready",
+            AuditLog.created_at >= since,
+            AuditLog.session_id.isnot(None),
+        )
+        .scalar()
+        or 0
+    )
+    sessions_with_favorite = (
+        db.query(func.count(func.distinct(AuditLog.session_id)))
+        .filter(
+            AuditLog.action == "favorite_selected",
+            AuditLog.created_at >= since,
+            AuditLog.session_id.isnot(None),
+        )
+        .scalar()
+        or 0
+    )
     hit_rate = round((sessions_with_favorite / sessions_with_preview * 100), 1) if sessions_with_preview else 0.0
-    # Revenue from pay_success (properties.price in stars)
     pay_events = (
-        db.query(ProductEvent.properties)
-        .filter(ProductEvent.event_name == "pay_success", ProductEvent.timestamp >= since)
+        db.query(AuditLog.payload)
+        .filter(AuditLog.action == "pay_success", AuditLog.created_at >= since)
         .all()
     )
-    def _safe_price(props: dict | None) -> int:
-        try:
-            return int(float((props or {}).get("price", 0) or 0))
-        except (TypeError, ValueError):
-            return 0
-    total_stars = sum(_safe_price(p[0]) for p in pay_events)
+    total_stars = sum(_safe_price_from_payload(p[0]) for p in pay_events)
     aov_stars = round(total_stars / pay_success_count, 1) if pay_success_count else 0.0
-    # Likeness: generation_likeness_feedback with likeness=yes
     likeness_events = (
-        db.query(ProductEvent.properties)
+        db.query(AuditLog.payload)
         .filter(
-            ProductEvent.event_name == "generation_likeness_feedback",
-            ProductEvent.timestamp >= since,
+            AuditLog.action == "generation_likeness_feedback",
+            AuditLog.created_at >= since,
         )
         .all()
     )
     total_likeness = len(likeness_events)
     likeness_yes = sum(1 for p in likeness_events if (p[0] or {}).get("likeness") == "yes")
     likeness_score = round((likeness_yes / total_likeness * 100), 1) if total_likeness else 0.0
-    # Repeat purchase: users with 2+ pay_success
     pay_per_user = (
-        db.query(ProductEvent.user_id, func.count(ProductEvent.id))
-        .filter(ProductEvent.event_name == "pay_success", ProductEvent.timestamp >= since)
-        .group_by(ProductEvent.user_id)
+        db.query(user_expr, func.count(AuditLog.id))
+        .filter(AuditLog.action == "pay_success", AuditLog.created_at >= since)
+        .group_by(user_expr)
         .all()
     )
     paying_users = len(pay_per_user)
     users_2plus = sum(1 for _u, c in pay_per_user if c >= 2)
     repeat_purchase_rate = round((users_2plus / paying_users * 100), 1) if paying_users else 0.0
-    # Unique users (bot_started) and paying users
-    users_started = db.query(func.count(func.distinct(ProductEvent.user_id))).filter(
-        ProductEvent.event_name == "bot_started", ProductEvent.timestamp >= since
-    ).scalar() or 0
+    users_started = (
+        db.query(func.count(func.distinct(user_expr)))
+        .filter(AuditLog.action == "bot_started", AuditLog.created_at >= since)
+        .scalar()
+        or 0
+    )
+    avg_time_start_to_result_sec = None
+    avg_steps_start_to_result = None
+    start_result_rows = (
+        db.query(user_expr.label("uid"), AuditLog.action, AuditLog.created_at)
+        .filter(
+            AuditLog.action.in_(["bot_started", "favorite_selected"]),
+            AuditLog.created_at >= since,
+        )
+        .all()
+    )
+    by_user: dict[str, dict[str, Any]] = {}
+    for row in start_result_rows:
+        uid, action_name, ts = row.uid, row.action, row.created_at
+        if uid not in by_user:
+            by_user[uid] = {"start_ts": None, "result_ts": None}
+        if action_name == "bot_started" and (by_user[uid]["start_ts"] is None or ts < by_user[uid]["start_ts"]):
+            by_user[uid]["start_ts"] = ts
+        if action_name == "favorite_selected" and (by_user[uid]["result_ts"] is None or ts < by_user[uid]["result_ts"]):
+            by_user[uid]["result_ts"] = ts
+    valid_users = [
+        (uid, data["start_ts"], data["result_ts"])
+        for uid, data in by_user.items()
+        if uid is not None
+        and data["start_ts"] is not None
+        and data["result_ts"] is not None
+        and data["result_ts"] >= data["start_ts"]
+    ]
+    _max_users_start_to_result = 2000
+    if len(valid_users) > _max_users_start_to_result:
+        valid_users = sorted(valid_users, key=lambda u: u[2], reverse=True)[:_max_users_start_to_result]
+    if valid_users:
+        # Normalize to str so IN clause and dict keys match regardless of DB type (UUID vs text)
+        user_ids = [str(u[0]) for u in valid_users]
+        all_events_in_window = (
+            db.query(user_expr.label("uid"), AuditLog.created_at)
+            .filter(user_expr.in_(user_ids), AuditLog.created_at >= since)
+            .all()
+        )
+        events_by_user: dict[str, list[datetime]] = {uid: [] for uid in user_ids}
+        for row in all_events_in_window:
+            events_by_user.setdefault(str(row.uid), []).append(row.created_at)
+        durations = []
+        steps_list = []
+        for uid, start_ts, result_ts in valid_users:
+            durations.append((result_ts - start_ts).total_seconds())
+            steps_list.append(sum(1 for t in events_by_user.get(str(uid), []) if start_ts <= t <= result_ts))
+        avg_time_start_to_result_sec = round(sum(durations) / len(durations), 1)
+        avg_steps_start_to_result = round(sum(steps_list) / len(steps_list), 1)
     return {
         "window_days": window_days,
         "preview_to_pay_pct": preview_to_pay,
@@ -1053,6 +2042,8 @@ def telemetry_product_metrics_v2(
         "repeat_purchase_rate_pct": repeat_purchase_rate,
         "paying_users": paying_users,
         "users_started": users_started,
+        "avg_time_start_to_result_sec": avg_time_start_to_result_sec,
+        "avg_steps_start_to_result": avg_steps_start_to_result,
     }
 
 
@@ -1061,27 +2052,23 @@ def telemetry_revenue(
     db: Session = Depends(get_db),
     window_days: int = Query(30, ge=1, le=90),
 ):
-    """Revenue by pack and by source from product_events pay_success."""
+    """Revenue by pack and by source from audit_logs pay_success (payload.pack_id, payload.source, payload.price)."""
     since = datetime.now(timezone.utc) - timedelta(days=window_days)
     events = (
-        db.query(ProductEvent.pack_id, ProductEvent.source, ProductEvent.properties)
-        .filter(ProductEvent.event_name == "pay_success", ProductEvent.timestamp >= since)
+        db.query(AuditLog.payload)
+        .filter(AuditLog.action == "pay_success", AuditLog.created_at >= since)
         .all()
     )
     by_pack: dict[str, int] = {}
     by_source: dict[str, int] = {}
     total_stars = 0
-    def _safe_price(p: dict | None) -> int:
-        try:
-            return int(float((p or {}).get("price", 0) or 0))
-        except (TypeError, ValueError):
-            return 0
-    for pack_id, source, props in events:
-        price = _safe_price(props)
+    for (props,) in events:
+        p = props or {}
+        price = _safe_price_from_payload(props)
         total_stars += price
-        pack_key = pack_id or "unknown"
+        pack_key = p.get("pack_id") or "unknown"
         by_pack[pack_key] = by_pack.get(pack_key, 0) + price
-        src_key = source or "organic"
+        src_key = p.get("source") or "organic"
         by_source[src_key] = by_source.get(src_key, 0) + price
     rate = getattr(app_settings, "star_to_rub", 1.3)
     return {
@@ -1105,9 +2092,77 @@ def bank_transfer_settings_get(db: Session = Depends(get_db)):
 
 
 @router.put("/bank-transfer/settings")
-def bank_transfer_settings_put(payload: dict, db: Session = Depends(get_db)):
+def bank_transfer_settings_put(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = BankTransferSettingsService(db)
-    return svc.update(payload)
+    result = svc.update(payload)
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "bank_transfer"})
+    return result
+
+
+@router.get("/bank-transfer/pay-initiated")
+def bank_transfer_pay_initiated(
+    db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    date_from: date | None = Query(None, description="Start date (UTC, inclusive)"),
+    date_to: date | None = Query(None, description="End date (UTC, inclusive)"),
+    price_rub: float | None = Query(None, description="Filter by expected amount in RUB, e.g. 129 or 199"),
+    telegram_user_id: str | None = Query(None, description="Filter by Telegram user ID"),
+):
+    """List pay_initiated events for bank_transfer (from audit_logs). Used to find who initiated a transfer by date/sum."""
+    if date_from is not None and date_to is not None and date_to < date_from:
+        raise HTTPException(400, "date_to must be >= date_from")
+    if telegram_user_id is not None:
+        telegram_user_id = telegram_user_id.strip() or None
+
+    q = (
+        db.query(AuditLog, User.telegram_id, User.telegram_username)
+        .outerjoin(User, AuditLog.user_id == User.id)
+        .filter(
+            AuditLog.action == "pay_initiated",
+            AuditLog.payload["method"].astext == "bank_transfer",
+        )
+    )
+    if date_from is not None:
+        ts_from = datetime.combine(date_from, datetime.min.time()).replace(tzinfo=timezone.utc)
+        q = q.filter(AuditLog.created_at >= ts_from)
+    if date_to is not None:
+        ts_to = datetime.combine(date_to, datetime.max.time()).replace(tzinfo=timezone.utc)
+        q = q.filter(AuditLog.created_at <= ts_to)
+    if price_rub is not None:
+        # payload.price_rub may be stored as JSON number or string; COALESCE both for filter
+        price_rub_expr = literal_column(
+            "(COALESCE((audit_logs.payload->>'price_rub'), (audit_logs.payload->'price_rub')::text))::numeric(12,2)"
+        )
+        q = q.filter(price_rub_expr == price_rub)
+    if telegram_user_id:
+        q = q.filter(User.telegram_id == telegram_user_id)
+    total = q.count()
+    q = q.order_by(AuditLog.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    rows = q.all()
+    items = []
+    for al, tg_id, tg_username in rows:
+        props = al.payload or {}
+        price_rub_val = props.get("price_rub")
+        if price_rub_val is not None and not isinstance(price_rub_val, (int, float)):
+            try:
+                price_rub_val = float(price_rub_val)
+            except (TypeError, ValueError):
+                price_rub_val = None
+        items.append({
+            "id": al.id,
+            "user_id": al.user_id,
+            "telegram_id": tg_id,
+            "telegram_username": tg_username,
+            "timestamp": al.created_at.isoformat() if al.created_at else None,
+            "pack_id": props.get("pack_id"),
+            "price_rub": price_rub_val,
+        })
+    return {"items": items, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
 
 
 @router.get("/bank-transfer/receipt-logs")
@@ -1117,12 +2172,28 @@ def bank_transfer_receipt_logs(
     page_size: int = Query(50, ge=1, le=200),
     match_success: bool | None = None,
     telegram_user_id: str | None = None,
+    expected_rub: float | None = Query(None, description="Filter by expected amount in RUB, e.g. 129 or 199"),
+    date_from: date | None = Query(None, description="Start date (UTC, inclusive)"),
+    date_to: date | None = Query(None, description="End date (UTC, inclusive)"),
 ):
+    if date_from is not None and date_to is not None and date_to < date_from:
+        raise HTTPException(400, "date_to must be >= date_from")
+    if telegram_user_id is not None:
+        telegram_user_id = telegram_user_id.strip() or None
+
     q = db.query(BankTransferReceiptLog)
     if match_success is not None:
         q = q.filter(BankTransferReceiptLog.match_success == match_success)
     if telegram_user_id:
         q = q.filter(BankTransferReceiptLog.telegram_user_id == telegram_user_id)
+    if expected_rub is not None:
+        q = q.filter(BankTransferReceiptLog.expected_rub == expected_rub)
+    if date_from is not None:
+        ts_from = datetime.combine(date_from, datetime.min.time()).replace(tzinfo=timezone.utc)
+        q = q.filter(BankTransferReceiptLog.created_at >= ts_from)
+    if date_to is not None:
+        ts_to = datetime.combine(date_to, datetime.max.time()).replace(tzinfo=timezone.utc)
+        q = q.filter(BankTransferReceiptLog.created_at <= ts_to)
     total = q.count()
     q = q.order_by(BankTransferReceiptLog.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
     rows = q.all()
@@ -1140,8 +2211,30 @@ def bank_transfer_receipt_logs(
             "pack_id": r.pack_id,
             "payment_id": r.payment_id,
             "error_message": r.error_message,
+            "card_match_success": r.card_match_success,
+            "extracted_card_first4": r.extracted_card_first4,
+            "extracted_card_last4": r.extracted_card_last4,
+            "extracted_receipt_dt": r.extracted_receipt_dt.isoformat() if r.extracted_receipt_dt else None,
+            "extracted_comment": r.extracted_comment,
+            "comment_match_success": r.comment_match_success,
         })
     return {"items": items, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
+
+
+def _receipt_file_path_safe(row_file_path: str) -> str:
+    """Resolve receipt file path and ensure it is under storage_base_path (prevent path traversal)."""
+    base = getattr(app_settings, "storage_base_path", "") or ""
+    if not base:
+        raise HTTPException(404, "Storage not configured")
+    if os.path.isabs(row_file_path):
+        path = row_file_path
+    else:
+        path = os.path.join(base, row_file_path)
+    real_path = os.path.realpath(path)
+    real_base = os.path.realpath(base)
+    if not real_path.startswith(real_base + os.sep) and real_path != real_base:
+        raise HTTPException(404, "File not found")
+    return real_path
 
 
 @router.get("/bank-transfer/receipt-logs/{log_id}/file")
@@ -1149,26 +2242,76 @@ def bank_transfer_receipt_log_file(log_id: str, db: Session = Depends(get_db)):
     row = db.query(BankTransferReceiptLog).filter(BankTransferReceiptLog.id == log_id).first()
     if not row or not row.file_path:
         raise HTTPException(404, "Log or file not found")
-    import os
-    if not os.path.isfile(row.file_path):
+    base = getattr(app_settings, "storage_base_path", "") or ""
+    if not base:
+        raise HTTPException(404, "Storage not configured")
+    real_base = os.path.realpath(base)
+    path = None
+    try:
+        candidate = _receipt_file_path_safe(row.file_path)
+        if os.path.isfile(candidate):
+            path = candidate
+    except HTTPException:
+        pass
+    if not path and not os.path.isabs(row.file_path):
+        fallback = os.path.join(base, "receipts", os.path.basename(row.file_path))
+        real_fallback = os.path.realpath(fallback)
+        if real_fallback.startswith(real_base + os.sep) and os.path.isfile(fallback):
+            path = fallback
+    if not path or not os.path.isfile(path):
         raise HTTPException(404, "File not found")
-    return FileResponse(row.file_path, filename=os.path.basename(row.file_path))
+    return FileResponse(path, filename=os.path.basename(path))
 
 
 # ---------- Payments ----------
+def _payment_method_from_row(p: Payment) -> str:
+    """Определить способ оплаты по записи Payment (stars / yoomoney / bank_transfer / yookassa_link / yookassa_unlock)."""
+    if p.payload and p.payload.startswith("bank_transfer:"):
+        return "bank_transfer"
+    if p.telegram_payment_charge_id and p.telegram_payment_charge_id.startswith("yoomoney:"):
+        return "yoomoney"
+    if p.telegram_payment_charge_id and p.telegram_payment_charge_id.startswith("yookassa_unlock:"):
+        return "yookassa_unlock"
+    if p.telegram_payment_charge_id and p.telegram_payment_charge_id.startswith("yookassa_link:"):
+        return "yookassa_link"
+    return "stars"
+
+
 @router.get("/payments")
 def payments_list(
     db: Session = Depends(get_db),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     payment_method: str | None = None,
+    date_from: date | None = Query(None, description="Start date (UTC, inclusive)"),
+    date_to: date | None = Query(None, description="End date (UTC, inclusive)"),
 ):
+    if date_from is not None and date_to is not None and date_to < date_from:
+        raise HTTPException(400, "date_to must be >= date_from")
     q = db.query(Payment)
     if payment_method:
         if payment_method == "stars":
-            q = q.filter(Payment.telegram_payment_charge_id.isnot(None))
+            q = q.filter(
+                Payment.telegram_payment_charge_id.isnot(None),
+                ~Payment.telegram_payment_charge_id.like("yoomoney:%"),
+                ~Payment.telegram_payment_charge_id.like("yookassa_link:%"),
+                ~Payment.telegram_payment_charge_id.like("yookassa_unlock:%"),
+                ~Payment.payload.like("bank_transfer:%"),
+            )
+        elif payment_method == "yoomoney":
+            q = q.filter(Payment.telegram_payment_charge_id.like("yoomoney:%"))
         elif payment_method == "bank_transfer":
             q = q.filter(Payment.payload.like("bank_transfer:%"))
+        elif payment_method == "yookassa_link":
+            q = q.filter(Payment.telegram_payment_charge_id.like("yookassa_link:%"))
+        elif payment_method == "yookassa_unlock":
+            q = q.filter(Payment.telegram_payment_charge_id.like("yookassa_unlock:%"))
+    if date_from is not None:
+        ts_from = datetime.combine(date_from, datetime.min.time()).replace(tzinfo=timezone.utc)
+        q = q.filter(Payment.created_at >= ts_from)
+    if date_to is not None:
+        ts_to = datetime.combine(date_to, datetime.max.time()).replace(tzinfo=timezone.utc)
+        q = q.filter(Payment.created_at <= ts_to)
     total = q.count()
     q = q.order_by(Payment.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
     payments = q.all()
@@ -1184,9 +2327,11 @@ def payments_list(
             "username": u.telegram_username if u else None,
             "pack_id": p.pack_id,
             "stars_amount": p.stars_amount,
+            "amount_kopecks": p.amount_kopecks,
             "tokens_granted": p.tokens_granted,
             "status": p.status,
             "created_at": p.created_at.isoformat() if p.created_at else None,
+            "payment_method": _payment_method_from_row(p),
         })
     return {"items": items, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
 
@@ -1202,8 +2347,24 @@ def payments_stats(db: Session = Depends(get_db), days: int = Query(30, ge=1)):
     base = db.query(Payment).filter(Payment.status == "completed", Payment.created_at >= since)
     total_payments = base.count()
     total_stars = db.query(func.coalesce(func.sum(Payment.stars_amount), 0)).filter(
-        Payment.status == "completed", Payment.created_at >= since
+        Payment.status == "completed",
+        Payment.created_at >= since,
+        ~Payment.telegram_payment_charge_id.like("yoomoney:%"),
+        ~Payment.telegram_payment_charge_id.like("yookassa_link:%"),
+        ~Payment.telegram_payment_charge_id.like("yookassa_unlock:%"),
+        ~Payment.payload.like("bank_transfer:%"),
     ).scalar() or 0
+    total_rub_yoomoney = db.query(func.coalesce(func.sum(Payment.amount_kopecks), 0)).filter(
+        Payment.status == "completed",
+        Payment.created_at >= since,
+        Payment.telegram_payment_charge_id.like("yoomoney:%"),
+    ).scalar() or 0
+    total_rub_yoomoney_rub = int(total_rub_yoomoney) / 100.0
+    total_rub_all_kopecks = db.query(func.coalesce(func.sum(Payment.amount_kopecks), 0)).filter(
+        Payment.status == "completed",
+        Payment.created_at >= since,
+    ).scalar() or 0
+    total_rub_all_rub = int(total_rub_all_kopecks) / 100.0
     refunded = db.query(func.count(Payment.id)).filter(
         Payment.status == "refunded", Payment.created_at >= since
     ).scalar() or 0
@@ -1211,33 +2372,146 @@ def payments_stats(db: Session = Depends(get_db), days: int = Query(30, ge=1)):
         Payment.status == "completed", Payment.created_at >= since
     ).scalar() or 0
     revenue_usd = float(total_stars) * STAR_USD_RATE
-    revenue_rub = float(total_stars) * STAR_RUB_RATE
+    revenue_rub_stars = float(total_stars) * STAR_RUB_RATE
+    revenue_rub_total = revenue_rub_stars + total_rub_all_rub
     by_pack_rows = (
-        db.query(Payment.pack_id, func.count(Payment.id).label("cnt"), func.coalesce(func.sum(Payment.stars_amount), 0).label("stars"))
+        db.query(Payment.pack_id, func.count(Payment.id).label("cnt"), func.coalesce(func.sum(Payment.stars_amount), 0).label("stars"), func.coalesce(func.sum(Payment.amount_kopecks), 0).label("rub_kopecks"))
         .filter(Payment.status == "completed", Payment.created_at >= since)
         .group_by(Payment.pack_id)
     )
-    by_pack = [{"pack_id": r.pack_id, "count": r.cnt, "stars": int(r.stars)} for r in by_pack_rows]
+    by_pack = [
+        {"pack_id": r.pack_id, "count": r.cnt, "stars": int(r.stars), "rub": int(r.rub_kopecks or 0) / 100.0}
+        for r in by_pack_rows
+    ]
     return {
         "days": days,
         "total_stars": int(total_stars),
+        "total_rub_yoomoney": round(total_rub_yoomoney_rub, 2),
         "total_payments": total_payments,
         "refunds": refunded,
         "unique_buyers": unique_buyers,
         "revenue_usd_approx": round(revenue_usd, 2),
-        "revenue_rub_approx": round(revenue_rub, 0),
+        "revenue_rub_approx": round(revenue_rub_total, 0),
+        "revenue_rub_stars": round(revenue_rub_stars, 0),
         "star_to_rub": STAR_RUB_RATE,
         "by_pack": by_pack,
         "conversion_rate_pct": 0,
     }
 
 
+@router.get("/payments/history")
+def payments_history(
+    db: Session = Depends(get_db),
+    date_from: date | None = Query(None, description="Start date (UTC, inclusive)"),
+    date_to: date | None = Query(None, description="End date (UTC, inclusive)"),
+    granularity: str = Query("day", description="day | week"),
+    pack_id: str | None = Query(None, description="Filter by pack_id"),
+):
+    """Исторические ряды по дням/неделям: выручка, транзакции, покупатели. Для графиков на странице Платежи."""
+    if date_from is not None and date_to is not None and date_to < date_from:
+        raise HTTPException(400, "date_to must be >= date_from")
+    q = db.query(Payment).filter(Payment.status == "completed")
+    if pack_id:
+        q = q.filter(Payment.pack_id == pack_id)
+    if date_from is not None:
+        ts_from = datetime.combine(date_from, datetime.min.time()).replace(tzinfo=timezone.utc)
+        q = q.filter(Payment.created_at >= ts_from)
+    if date_to is not None:
+        ts_to = datetime.combine(date_to, datetime.max.time()).replace(tzinfo=timezone.utc)
+        q = q.filter(Payment.created_at <= ts_to)
+    if granularity == "week":
+        date_expr = func.date_trunc("week", Payment.created_at)
+    else:
+        date_expr = func.date(Payment.created_at)
+    revenue_rub_expr = (
+        func.coalesce(func.sum(Payment.amount_kopecks), 0) / 100.0
+        + func.coalesce(func.sum(Payment.stars_amount), 0) * STAR_RUB_RATE
+    )
+    rows = (
+        q.with_entities(
+            date_expr.label("dt"),
+            revenue_rub_expr.label("revenue_rub"),
+            func.coalesce(func.sum(Payment.stars_amount), 0).label("revenue_stars"),
+            func.count(Payment.id).label("transactions_count"),
+            func.count(distinct(Payment.user_id)).label("unique_buyers"),
+        )
+        .group_by(date_expr)
+        .order_by(date_expr)
+        .all()
+    )
+    pack_revenue_expr = (
+        func.coalesce(func.sum(Payment.amount_kopecks), 0) / 100.0
+        + func.coalesce(func.sum(Payment.stars_amount), 0) * STAR_RUB_RATE
+    )
+    pack_rows = (
+        q.with_entities(
+            date_expr.label("dt"),
+            Payment.pack_id.label("pack_id"),
+            func.count(Payment.id).label("cnt"),
+            pack_revenue_expr.label("revenue_rub"),
+        )
+        .group_by(date_expr, Payment.pack_id)
+        .all()
+    )
+    date_to_pack: dict[str, list[dict[str, Any]]] = {}
+    for pr in pack_rows:
+        dt = pr.dt
+        if hasattr(dt, "date"):
+            dt = dt.date()
+        if hasattr(dt, "isoformat"):
+            date_str = dt.isoformat()
+        else:
+            date_str = str(dt)[:10]
+        if date_str not in date_to_pack:
+            date_to_pack[date_str] = []
+        date_to_pack[date_str].append({
+            "pack_id": pr.pack_id,
+            "count": pr.cnt,
+            "revenue_rub": round(float(pr.revenue_rub or 0), 2),
+        })
+    out = []
+    for r in rows:
+        dt = r.dt
+        if hasattr(dt, "date"):
+            dt = dt.date()
+        if hasattr(dt, "isoformat"):
+            date_str = dt.isoformat()
+        else:
+            date_str = str(dt)[:10]
+        out.append({
+            "date": date_str,
+            "revenue_rub": round(float(r.revenue_rub or 0), 2),
+            "revenue_stars": int(r.revenue_stars or 0),
+            "transactions_count": r.transactions_count or 0,
+            "unique_buyers": r.unique_buyers or 0,
+            "by_pack": date_to_pack.get(date_str, []),
+        })
+    return {"series": out}
+
+
 @router.post("/payments/{payment_id}/refund")
-def payments_refund(payment_id: str, db: Session = Depends(get_db)):
+def payments_refund(
+    payment_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    payment = db.query(Payment).filter(Payment.id == payment_id).one_or_none()
+    if not payment:
+        raise HTTPException(404, "Платёж не найден")
+    if payment.payload and payment.payload.startswith("bank_transfer:"):
+        raise HTTPException(400, "Возврат возможен только для платежей Stars. Для перевода на карту — вручную.")
+    if payment.telegram_payment_charge_id and payment.telegram_payment_charge_id.startswith("yoomoney:"):
+        raise HTTPException(400, "Возврат возможен только для платежей Stars. Для ЮMoney — через ЮKassa.")
+    if payment.telegram_payment_charge_id and payment.telegram_payment_charge_id.startswith("yookassa_link:"):
+        raise HTTPException(400, "Возврат возможен только для платежей Stars. Для ЮKassa (пакеты) — через ЮKassa.")
+    if payment.telegram_payment_charge_id and payment.telegram_payment_charge_id.startswith("yookassa_unlock:"):
+        raise HTTPException(400, "Возврат возможен только для платежей Stars. Для ЮKassa (unlock) — через ЮKassa.")
     svc = PaymentService(db)
     ok, msg, _ = svc.process_refund(payment_id)
     if not ok:
         raise HTTPException(400, msg)
+    db.commit()
+    _admin_audit(db, current_user, "refund", "payment", payment_id, {"user_id": payment.user_id})
     return {"ok": True}
 
 
@@ -1271,7 +2545,12 @@ def packs_list(db: Session = Depends(get_db)):
 
 
 @router.put("/packs/{pack_id}")
-def packs_update(pack_id: str, payload: dict, db: Session = Depends(get_db)):
+def packs_update(
+    pack_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     pack = db.query(Pack).filter(Pack.id == pack_id).first()
     if not pack:
         raise HTTPException(404, "Pack not found")
@@ -1295,6 +2574,7 @@ def packs_update(pack_id: str, payload: dict, db: Session = Depends(get_db)):
     db.add(pack)
     db.commit()
     db.refresh(pack)
+    _admin_audit(db, current_user, "update", "pack", pack_id, {})
     return {
         "id": pack.id, "name": pack.name, "emoji": pack.emoji,
         "tokens": pack.tokens, "stars_price": pack.stars_price,
@@ -1309,7 +2589,11 @@ def packs_update(pack_id: str, payload: dict, db: Session = Depends(get_db)):
 
 
 @router.post("/packs")
-def packs_create(payload: dict, db: Session = Depends(get_db)):
+def packs_create(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     subtype = payload.get("pack_subtype", "standalone")
     playlist = payload.get("playlist")
     is_enabled = bool(payload.get("enabled", True))
@@ -1341,6 +2625,7 @@ def packs_create(payload: dict, db: Session = Depends(get_db)):
     db.add(pack)
     db.commit()
     db.refresh(pack)
+    _admin_audit(db, current_user, "create", "pack", pack.id, {"name": pack.name})
     return {
         "id": pack.id, "name": pack.name, "emoji": pack.emoji,
         "tokens": pack.tokens, "stars_price": pack.stars_price,
@@ -1349,12 +2634,18 @@ def packs_create(payload: dict, db: Session = Depends(get_db)):
 
 
 @router.delete("/packs/{pack_id}")
-def packs_delete(pack_id: str, db: Session = Depends(get_db)):
+def packs_delete(
+    pack_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     pack = db.query(Pack).filter(Pack.id == pack_id).first()
     if not pack:
         raise HTTPException(404, "Pack not found")
+    pack_name = pack.name
     db.delete(pack)
     db.commit()
+    _admin_audit(db, current_user, "delete", "pack", pack_id, {"name": pack_name})
     return {"ok": True}
 
 
@@ -1472,9 +2763,9 @@ def sessions_list(
 THEME_EDIT_FIELDS = {"name", "emoji", "order_index", "enabled", "target_audiences"}
 
 
-def _theme_to_item(theme: Theme) -> dict:
+def _theme_to_item(theme: Theme, bot_username: str | None = None) -> dict:
     audiences = getattr(theme, "target_audiences", None)
-    return {
+    out = {
         "id": theme.id,
         "name": theme.name,
         "emoji": theme.emoji or "",
@@ -1482,13 +2773,27 @@ def _theme_to_item(theme: Theme) -> dict:
         "enabled": theme.enabled,
         "target_audiences": normalize_target_audiences(audiences),
     }
+    if bot_username:
+        out["deeplink"] = f"https://t.me/{bot_username}?start=theme_{theme.id}"
+    else:
+        out["deeplink"] = None
+    return out
+
+
+def _get_bot_username_for_deeplink(db: Session) -> str:
+    """Username бота без @ для диплинков (сначала из PosterSettings, иначе из env)."""
+    ps = db.query(PosterSettings).filter(PosterSettings.id == 1).one_or_none()
+    db_bot = (getattr(ps, "poster_bot_username", None) or "").strip() if ps else ""
+    env_bot = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
+    return (db_bot or env_bot).lstrip("@")
 
 
 @router.get("/themes")
 def admin_themes_list(db: Session = Depends(get_db)):
     svc = ThemeService(db)
     themes = svc.list_all()
-    return [_theme_to_item(t) for t in themes]
+    bot_username = _get_bot_username_for_deeplink(db)
+    return [_theme_to_item(t, bot_username) for t in themes]
 
 
 @router.get("/themes/{theme_id}")
@@ -1497,7 +2802,8 @@ def admin_themes_get(theme_id: str, db: Session = Depends(get_db)):
     theme = svc.get(theme_id)
     if not theme:
         raise HTTPException(404, "Theme not found")
-    return _theme_to_item(theme)
+    bot_username = _get_bot_username_for_deeplink(db)
+    return _theme_to_item(theme, bot_username)
 
 
 def _normalize_theme_target_audiences(value) -> list:
@@ -1508,7 +2814,11 @@ def _normalize_theme_target_audiences(value) -> list:
 
 
 @router.post("/themes")
-def admin_themes_post(payload: dict = Body(...), db: Session = Depends(get_db)):
+def admin_themes_post(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = ThemeService(db)
     data = {k: v for k, v in payload.items() if k in THEME_EDIT_FIELDS}
     data.setdefault("emoji", "")
@@ -1522,11 +2832,18 @@ def admin_themes_post(payload: dict = Body(...), db: Session = Depends(get_db)):
     if themes:
         data.setdefault("order_index", max(t.order_index for t in themes) + 1)
     theme = svc.create(data)
-    return _theme_to_item(theme)
+    _admin_audit(db, current_user, "create", "theme", theme.id, {"name": theme.name})
+    bot_username = _get_bot_username_for_deeplink(db)
+    return _theme_to_item(theme, bot_username)
 
 
 @router.put("/themes/{theme_id}")
-def admin_themes_put(theme_id: str, payload: dict = Body(...), db: Session = Depends(get_db)):
+def admin_themes_put(
+    theme_id: str,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = ThemeService(db)
     theme = svc.get(theme_id)
     if not theme:
@@ -1534,14 +2851,21 @@ def admin_themes_put(theme_id: str, payload: dict = Body(...), db: Session = Dep
     data = {k: v for k, v in payload.items() if k in THEME_EDIT_FIELDS}
     if "target_audiences" in data:
         data["target_audiences"] = _normalize_theme_target_audiences(data["target_audiences"])
+    bot_username = _get_bot_username_for_deeplink(db)
     if not data:
-        return _theme_to_item(theme)
+        return _theme_to_item(theme, bot_username)
     svc.update(theme, data)
-    return _theme_to_item(theme)
+    _admin_audit(db, current_user, "update", "theme", theme_id, {})
+    return _theme_to_item(theme, bot_username)
 
 
 @router.patch("/themes/{theme_id}/order")
-def admin_themes_patch_order(theme_id: str, payload: dict = Body(...), db: Session = Depends(get_db)):
+def admin_themes_patch_order(
+    theme_id: str,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     direction = payload.get("direction")
     if direction not in ("up", "down"):
         raise HTTPException(400, "direction must be 'up' or 'down'")
@@ -1549,16 +2873,24 @@ def admin_themes_patch_order(theme_id: str, payload: dict = Body(...), db: Sessi
     theme = svc.patch_order(theme_id, direction)
     if not theme:
         raise HTTPException(404, "Theme not found")
-    return _theme_to_item(theme)
+    _admin_audit(db, current_user, "update", "theme", theme_id, {"order": direction})
+    bot_username = _get_bot_username_for_deeplink(db)
+    return _theme_to_item(theme, bot_username)
 
 
 @router.delete("/themes/{theme_id}")
-def admin_themes_delete(theme_id: str, db: Session = Depends(get_db)):
+def admin_themes_delete(
+    theme_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = ThemeService(db)
     theme = svc.get(theme_id)
     if not theme:
         raise HTTPException(404, "Theme not found")
+    theme_name = theme.name
     svc.delete(theme)
+    _admin_audit(db, current_user, "delete", "theme", theme_id, {"name": theme_name})
     return {"ok": True}
 
 
@@ -1642,44 +2974,61 @@ def admin_trends_list(db: Session = Depends(get_db)):
 @router.get("/trends/analytics")
 def admin_trends_analytics(
     db: Session = Depends(get_db),
-    window_days: int = Query(30, ge=1, le=365),
+    window_days: int = Query(30, ge=0, le=365),
 ):
-    """Аналитика по всем трендам: сколько успешно сгенерировано, сколько с ошибкой/не доставлено."""
-    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    """Аналитика по всем трендам: сколько успешно сгенерировано, сколько с ошибкой/не доставлено. window_days=0 — всё время."""
+    since = (datetime.now(timezone.utc) - timedelta(days=window_days)) if window_days else None
     svc = TrendService(db)
     all_trends = svc.list_all()
     trend_ids = [t.id for t in all_trends]
-    # Job по trend_id за окно
-    job_stats = (
+    if not trend_ids:
+        return {"window_days": window_days if window_days else None, "items": []}
+    job_q = (
         db.query(
             Job.trend_id,
             func.count(Job.job_id).label("total"),
             func.sum(case((Job.status == "SUCCEEDED", 1), else_=0)).label("succeeded"),
             func.sum(case((Job.status.in_(["FAILED", "ERROR"]), 1), else_=0)).label("failed"),
         )
-        .filter(Job.trend_id.in_(trend_ids), Job.created_at >= since)
-        .group_by(Job.trend_id)
-        .all()
+        .filter(Job.trend_id.in_(trend_ids))
     )
+    if since is not None:
+        job_q = job_q.filter(Job.created_at >= since)
+    job_stats = job_q.group_by(Job.trend_id).all()
     job_by_trend = {
         r.trend_id: {"total": r.total or 0, "succeeded": r.succeeded or 0, "failed": r.failed or 0}
         for r in job_stats
     }
-    # Take по trend_id за окно
-    take_stats = (
+    take_q = (
         db.query(
             Take.trend_id,
             func.count(Take.id).label("total"),
             func.sum(case((Take.status.in_(["ready", "partial_fail"]), 1), else_=0)).label("succeeded"),
             func.sum(case((Take.status == "failed", 1), else_=0)).label("failed"),
         )
-        .filter(Take.trend_id.in_(trend_ids), Take.created_at >= since)
-        .group_by(Take.trend_id)
-        .all()
+        .filter(Take.trend_id.in_(trend_ids))
     )
+    if since is not None:
+        take_q = take_q.filter(Take.created_at >= since)
+    take_stats = take_q.group_by(Take.trend_id).all()
     take_by_trend = {
         r.trend_id: {"total": r.total or 0, "succeeded": r.succeeded or 0, "failed": r.failed or 0}
         for r in take_stats
+    }
+    chosen_actions = ("choose_best_variant", "favorites_auto_add")
+    chosen_q = (
+        db.query(
+            func.coalesce(AuditLog.payload["trend_id"].astext, "").label("trend_id"),
+            func.count(AuditLog.id).label("cnt"),
+        )
+        .filter(AuditLog.action.in_(chosen_actions))
+        .group_by(func.coalesce(AuditLog.payload["trend_id"].astext, ""))
+    )
+    if since is not None:
+        chosen_q = chosen_q.filter(AuditLog.created_at >= since)
+    chosen_by_trend = {
+        r.trend_id: r.cnt for r in chosen_q.all()
+        if r.trend_id and str(r.trend_id).strip()
     }
     items = []
     for t in all_trends:
@@ -1696,8 +3045,9 @@ def admin_trends_analytics(
             "takes_total": tk["total"],
             "takes_succeeded": tk["succeeded"],
             "takes_failed": tk["failed"],
+            "chosen_total": chosen_by_trend.get(t.id, 0),
         })
-    return {"window_days": window_days, "items": items}
+    return {"window_days": window_days if window_days else None, "items": items}
 
 
 @router.get("/trends/{trend_id}")
@@ -1719,7 +3069,12 @@ def _normalize_trend_payload(data: dict) -> dict:
 
 
 @router.put("/trends/{trend_id}")
-def admin_trends_put(trend_id: str, payload: dict = Body(...), db: Session = Depends(get_db)):
+def admin_trends_put(
+    trend_id: str,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = TrendService(db)
     trend = svc.get(trend_id)
     if not trend:
@@ -1729,11 +3084,16 @@ def admin_trends_put(trend_id: str, payload: dict = Body(...), db: Session = Dep
     if not data:
         return _trend_to_detail(trend)
     svc.update(trend, data)
+    _admin_audit(db, current_user, "update", "trend", trend_id, {})
     return _trend_to_detail(trend)
 
 
 @router.post("/trends")
-def admin_trends_post(payload: dict = Body(...), db: Session = Depends(get_db)):
+def admin_trends_post(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = TrendService(db)
     data = {k: v for k, v in payload.items() if k in TREND_EDIT_FIELDS}
     data = _normalize_trend_payload(data)
@@ -1745,6 +3105,7 @@ def admin_trends_post(payload: dict = Body(...), db: Session = Depends(get_db)):
         max_order = max((t.order_index for t in trends_in_theme), default=-1)
         data.setdefault("order_index", max_order + 1)
     trend = svc.create(data)
+    _admin_audit(db, current_user, "create", "trend", trend.id, {"name": trend.name or trend.id})
     return _trend_to_detail(trend)
 
 
@@ -1802,18 +3163,28 @@ def _save_trend_file(trend_id: str, file: UploadFile, suffix: str) -> str:
 
 
 @router.post("/trends/{trend_id}/example")
-def admin_trends_post_example(trend_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+def admin_trends_post_example(
+    trend_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = TrendService(db)
     trend = svc.get(trend_id)
     if not trend:
         raise HTTPException(404, "Trend not found")
     path = _save_trend_file(trend_id, file, "_example")
     svc.update(trend, {"example_image_path": path})
+    _admin_audit(db, current_user, "update", "trend", trend_id, {"example_uploaded": True})
     return _trend_to_detail(trend)
 
 
 @router.delete("/trends/{trend_id}/example")
-def admin_trends_delete_example(trend_id: str, db: Session = Depends(get_db)):
+def admin_trends_delete_example(
+    trend_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = TrendService(db)
     trend = svc.get(trend_id)
     if not trend:
@@ -1825,6 +3196,7 @@ def admin_trends_delete_example(trend_id: str, db: Session = Depends(get_db)):
         except OSError:
             pass
     svc.update(trend, {"example_image_path": None})
+    _admin_audit(db, current_user, "delete", "trend_example", trend_id, {})
     return _trend_to_detail(trend)
 
 
@@ -1872,7 +3244,12 @@ def admin_trends_prompt_preview(trend_id: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/trends/{trend_id}/order")
-def admin_trends_patch_order(trend_id: str, payload: dict = Body(...), db: Session = Depends(get_db)):
+def admin_trends_patch_order(
+    trend_id: str,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     direction = payload.get("direction")
     if direction not in ("up", "down"):
         raise HTTPException(400, "direction must be 'up' or 'down'")
@@ -1900,6 +3277,7 @@ def admin_trends_patch_order(trend_id: str, payload: dict = Body(...), db: Sessi
     other = trends[swap_idx]
     svc.update(trend, {"order_index": other.order_index})
     svc.update(other, {"order_index": trend.order_index})
+    _admin_audit(db, current_user, "update", "trend", trend_id, {"order": direction})
     db.refresh(trend)
     return _trend_to_detail(trend)
 
@@ -2050,6 +3428,7 @@ def trend_posts_preview(
 def trend_posts_publish(
     payload: dict = Body(...),
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """Отправить пост в канал: фото + подпись + кнопка «Попробовать»."""
     trend_id = payload.get("trend_id") or payload.get("trendId")
@@ -2161,6 +3540,7 @@ def trend_posts_publish(
         db.add(post)
         db.commit()
         db.refresh(post)
+    _admin_audit(db, current_user, "create", "trend_post", post.id, {"trend_id": trend_id})
     return {
         "id": post.id,
         "trend_id": post.trend_id,
@@ -2171,7 +3551,11 @@ def trend_posts_publish(
 
 
 @router.delete("/trend-posts/{post_id}")
-def trend_posts_delete(post_id: str, db: Session = Depends(get_db)):
+def trend_posts_delete(
+    post_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     """Удалить пост из канала и пометить запись как deleted."""
     post = db.query(TrendPost).filter(TrendPost.id == post_id).one_or_none()
     if not post:
@@ -2191,6 +3575,7 @@ def trend_posts_delete(post_id: str, db: Session = Depends(get_db)):
     db.add(post)
     db.commit()
     db.refresh(post)
+    _admin_audit(db, current_user, "delete", "trend_post", post_id, {"trend_id": post.trend_id})
     return {"id": post.id, "status": post.status}
 
 
@@ -2219,6 +3604,7 @@ def trend_posts_settings_get(db: Session = Depends(get_db)):
 def trend_posts_settings_put(
     payload: dict = Body(...),
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """Обновить канал, username бота, шаблон подписи и/или текст инлайн-кнопки."""
     template = (payload.get("poster_default_template") or "").strip()
@@ -2250,6 +3636,7 @@ def trend_posts_settings_put(
         db.add(ps)
     db.commit()
     db.refresh(ps)
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "trend_posts"})
     env_channel = (getattr(app_settings, "poster_channel_id", None) or "").strip()
     db_channel = (ps.poster_channel_id or "").strip()
     env_bot = (getattr(app_settings, "telegram_bot_username", None) or "").strip()
@@ -2264,6 +3651,48 @@ def trend_posts_settings_put(
 
 
 # ---------- Audit ----------
+_AUDIT_FILTERS_CACHE: dict[int, tuple[dict[str, Any], float]] = {}
+_AUDIT_FILTERS_CACHE_TTL_SEC = 300
+_AUDIT_FILTERS_SAMPLE_LIMIT = 500_000
+
+
+def _parse_audit_date(value: str) -> datetime:
+    """Parse ISO date string; raise ValueError if invalid. Used to return 400 instead of ignoring."""
+    if not value or not value.strip():
+        raise ValueError("empty date")
+    s = value.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+@router.get("/audit/filters")
+def audit_filters(
+    db: Session = Depends(get_db),
+    window_days: int = Query(90, ge=1, le=365),
+):
+    """Distinct action and entity_type from audit_logs for the last window_days. Cached 5 min, sample limited to 500k rows."""
+    now = time.time()
+    if window_days in _AUDIT_FILTERS_CACHE:
+        cached, expiry = _AUDIT_FILTERS_CACHE[window_days]
+        if now <= expiry:
+            return cached
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    limited = (
+        db.query(AuditLog.action, AuditLog.entity_type)
+        .filter(AuditLog.created_at >= since)
+        .order_by(AuditLog.created_at.desc())
+        .limit(_AUDIT_FILTERS_SAMPLE_LIMIT)
+        .all()
+    )
+    actions = sorted({r[0] for r in limited if r[0]})
+    entity_types = sorted({r[1] for r in limited if r[1]})
+    result = {"actions": actions, "entity_types": entity_types, "window_days": window_days}
+    _AUDIT_FILTERS_CACHE[window_days] = (result, now + _AUDIT_FILTERS_CACHE_TTL_SEC)
+    return result
+
+
 @router.get("/audit")
 def audit_list(
     db: Session = Depends(get_db),
@@ -2274,6 +3703,8 @@ def audit_list(
     date_from: str | None = None,
     date_to: str | None = None,
     search: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
 ):
@@ -2286,18 +3717,22 @@ def audit_list(
         q = q.filter(AuditLog.actor_type == actor_type)
     if entity_type:
         q = q.filter(AuditLog.entity_type == entity_type)
+    if user_id and user_id.strip():
+        q = q.filter(AuditLog.user_id == user_id.strip())
+    if session_id and session_id.strip():
+        q = q.filter(AuditLog.session_id == session_id.strip())
     if date_from:
         try:
-            since = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+            since = _parse_audit_date(date_from)
             q = q.filter(AuditLog.created_at >= since)
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, detail=f"invalid date_from: {e!s}") from e
     if date_to:
         try:
-            until = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+            until = _parse_audit_date(date_to)
             q = q.filter(AuditLog.created_at <= until)
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, detail=f"invalid date_to: {e!s}") from e
     if search and search.strip():
         term = f"%{search.strip()}%"
         q = q.filter(
@@ -2339,6 +3774,8 @@ def audit_list(
             "action": r.action,
             "entity_type": r.entity_type,
             "entity_id": r.entity_id,
+            "user_id": r.user_id,
+            "session_id": r.session_id,
             "payload": r.payload or {},
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
@@ -2364,6 +3801,8 @@ def audit_analytics(
     actor_type: str | None = None,
     entity_type: str | None = None,
     audience: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
 ):
     """Aggregations for audit log: events by day, by action, top actors (users)."""
     q = db.query(AuditLog)
@@ -2375,20 +3814,24 @@ def audit_analytics(
         q = q.filter(AuditLog.entity_type == entity_type)
     if audience and audience.strip() in ("women", "men", "couples"):
         q = q.filter(AuditLog.payload["audience"].astext == audience.strip())
+    if user_id and user_id.strip():
+        q = q.filter(AuditLog.user_id == user_id.strip())
+    if session_id and session_id.strip():
+        q = q.filter(AuditLog.session_id == session_id.strip())
     since: datetime | None = None
     until: datetime | None = None
     if date_from:
         try:
-            since = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+            since = _parse_audit_date(date_from)
             q = q.filter(AuditLog.created_at >= since)
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, detail=f"invalid date_from: {e!s}") from e
     if date_to:
         try:
-            until = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+            until = _parse_audit_date(date_to)
             q = q.filter(AuditLog.created_at <= until)
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, detail=f"invalid date_to: {e!s}") from e
 
     base_q = q
 
@@ -2491,12 +3934,17 @@ def broadcast_preview(db: Session = Depends(get_db), include_blocked: bool = Que
 
 
 @router.post("/broadcast/send")
-def broadcast_send(payload: dict, db: Session = Depends(get_db)):
+def broadcast_send(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     message = (payload.get("message") or "").strip()
     include_blocked = bool(payload.get("include_blocked", False))
     if not message:
         raise HTTPException(400, "message is required")
     result = broadcast_message.delay(message, include_blocked=include_blocked)
+    _admin_audit(db, current_user, "broadcast", "broadcast", result.id, {"include_blocked": include_blocked})
     return {"task_id": result.id, "message": "Broadcast task queued"}
 
 
@@ -2522,6 +3970,44 @@ def jobs_stats(
     }
 
 
+def _job_to_item(j: Job, users: dict, trends: dict) -> dict:
+    u = users.get(j.user_id)
+    t = trends.get(j.trend_id)
+    user_display_name = None
+    if u:
+        if u.telegram_username:
+            user_display_name = f"@{u.telegram_username}"
+        else:
+            name = f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip()
+            user_display_name = name or u.telegram_id
+    return {
+        "job_id": j.job_id,
+        "task_type": "job",
+        "user_id": j.user_id,
+        "telegram_id": u.telegram_id if u else None,
+        "user_display_name": user_display_name,
+        "trend_id": j.trend_id,
+        "trend_name": t.name if t else None,
+        "trend_emoji": t.emoji if t else None,
+        "status": j.status,
+        "is_preview": getattr(j, "is_preview", False),
+        "reserved_tokens": j.reserved_tokens,
+        "error_code": j.error_code,
+        "created_at": j.created_at.isoformat() if j.created_at else None,
+    }
+
+
+def _take_status_display(take_status: str) -> str:
+    """Привести статус Take к отображаемому (близко к Job)."""
+    if take_status in ("ready", "partial_fail"):
+        return "SUCCEEDED"
+    if take_status == "failed":
+        return "FAILED"
+    if take_status == "generating":
+        return "RUNNING"
+    return take_status.upper() if take_status else "CREATED"
+
+
 @router.get("/jobs")
 def jobs_list(
     db: Session = Depends(get_db),
@@ -2531,53 +4017,119 @@ def jobs_list(
     telegram_id: str | None = None,
     trend_id: str | None = None,
     hours: int | None = Query(None, ge=1, le=720),
+    include_takes: bool = Query(True, description="Включить снимки (Take) в журнал"),
 ):
-    q = db.query(Job)
-    if status:
-        q = q.filter(Job.status == status)
+    user_id_filter = None
     if telegram_id:
         u = db.query(User).filter(User.telegram_id == telegram_id).first()
-        if u:
-            q = q.filter(Job.user_id == u.id)
-        else:
-            q = q.filter(Job.user_id == "")
-    if trend_id:
-        q = q.filter(Job.trend_id == trend_id)
+        user_id_filter = u.id if u else ""
+
+    since = None
     if hours is not None:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
-        q = q.filter(Job.created_at >= since)
-    total = q.count()
-    q = q.order_by(Job.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
-    jobs = q.all()
-    user_ids = [j.user_id for j in jobs]
-    trend_ids = list({j.trend_id for j in jobs})
+
+    if not include_takes:
+        q = db.query(Job)
+        if status:
+            q = q.filter(Job.status == status)
+        if user_id_filter is not None:
+            q = q.filter(Job.user_id == user_id_filter)
+        if trend_id:
+            q = q.filter(Job.trend_id == trend_id)
+        if since is not None:
+            q = q.filter(Job.created_at >= since)
+        total = q.count()
+        q = q.order_by(Job.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+        jobs = q.all()
+        user_ids = [j.user_id for j in jobs]
+        trend_ids = list({j.trend_id for j in jobs})
+        users = {u.id: u for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+        trends = {t.id: t for t in db.query(Trend).filter(Trend.id.in_(trend_ids)).all()} if trend_ids else {}
+        items = [_job_to_item(j, users, trends) for j in jobs]
+        return {"items": items, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
+
+    # Объединённый список Job + Take: собираем id и created_at, сортируем, пагинируем, потом догружаем сущности
+    cap = 5000
+    q_j = db.query(Job.job_id, Job.created_at).order_by(Job.created_at.desc())
+    if status:
+        q_j = q_j.filter(Job.status == status)
+    if user_id_filter is not None:
+        q_j = q_j.filter(Job.user_id == user_id_filter)
+    if trend_id:
+        q_j = q_j.filter(Job.trend_id == trend_id)
+    if since is not None:
+        q_j = q_j.filter(Job.created_at >= since)
+    job_rows = q_j.limit(cap).all()
+
+    take_status_filter = None
+    if status:
+        if status == "SUCCEEDED":
+            take_status_filter = ["ready", "partial_fail"]
+        elif status in ("FAILED", "ERROR"):
+            take_status_filter = ["failed"]
+        elif status in ("CREATED", "RUNNING"):
+            take_status_filter = ["generating"]
+        else:
+            take_status_filter = [status.lower()] if status else None
+    q_t = db.query(Take.id, Take.created_at).order_by(Take.created_at.desc())
+    if take_status_filter is not None:
+        q_t = q_t.filter(Take.status.in_(take_status_filter))
+    if user_id_filter is not None:
+        q_t = q_t.filter(Take.user_id == user_id_filter)
+    if trend_id:
+        q_t = q_t.filter(Take.trend_id == trend_id)
+    if since is not None:
+        q_t = q_t.filter(Take.created_at >= since)
+    take_rows = q_t.limit(cap).all()
+
+    merged = [(r.created_at, "job", r.job_id) for r in job_rows]
+    merged += [(r.created_at, "take", str(r.id)) for r in take_rows]
+    merged.sort(key=lambda x: x[0], reverse=True)
+    total = len(merged)
+    # total ограничен 2*cap (10000): при большем числе задач пагинация показывает первые 10k
+    start = (page - 1) * page_size
+    page_slice = merged[start : start + page_size]
+
+    job_ids = [tid for _, t, tid in page_slice if t == "job"]
+    take_ids = [tid for _, t, tid in page_slice if t == "take"]
+    jobs = {j.job_id: j for j in db.query(Job).filter(Job.job_id.in_(job_ids)).all()} if job_ids else {}
+    takes = {t.id: t for t in db.query(Take).filter(Take.id.in_(take_ids)).all()} if take_ids else {}
+
+    user_ids = [jobs[jid].user_id for jid in job_ids if jid in jobs]
+    user_ids += [takes[tid].user_id for tid in take_ids if tid in takes]
+    trend_ids = list({jobs[jid].trend_id for jid in job_ids if jid in jobs} | {takes[tid].trend_id for tid in take_ids if tid in takes} - {None})
     users = {u.id: u for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
     trends = {t.id: t for t in db.query(Trend).filter(Trend.id.in_(trend_ids)).all()} if trend_ids else {}
+
     items = []
-    for j in jobs:
-        u = users.get(j.user_id)
-        t = trends.get(j.trend_id)
-        user_display_name = None
-        if u:
-            if u.telegram_username:
-                user_display_name = f"@{u.telegram_username}"
-            else:
-                name = f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip()
-                user_display_name = name or u.telegram_id
-        items.append({
-            "job_id": j.job_id,
-            "user_id": j.user_id,
-            "telegram_id": u.telegram_id if u else None,
-            "user_display_name": user_display_name,
-            "trend_id": j.trend_id,
-            "trend_name": t.name if t else None,
-            "trend_emoji": t.emoji if t else None,
-            "status": j.status,
-            "is_preview": getattr(j, "is_preview", False),
-            "reserved_tokens": j.reserved_tokens,
-            "error_code": j.error_code,
-            "created_at": j.created_at.isoformat() if j.created_at else None,
-        })
+    for created_at, task_type, task_id in page_slice:
+        if task_type == "job":
+            j = jobs.get(task_id)
+            if j:
+                items.append(_job_to_item(j, users, trends))
+        else:
+            t = takes.get(task_id)
+            if t:
+                u = users.get(t.user_id)
+                tr = trends.get(t.trend_id)
+                user_display_name = None
+                if u:
+                    user_display_name = f"@{u.telegram_username}" if u.telegram_username else (f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip() or u.telegram_id)
+                items.append({
+                    "job_id": task_id,
+                    "task_type": "take",
+                    "user_id": t.user_id,
+                    "telegram_id": u.telegram_id if u else None,
+                    "user_display_name": user_display_name,
+                    "trend_id": t.trend_id,
+                    "trend_name": tr.name if tr else None,
+                    "trend_emoji": tr.emoji if tr else None,
+                    "status": _take_status_display(t.status),
+                    "is_preview": False,
+                    "reserved_tokens": 0,
+                    "error_code": t.error_code,
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                })
     return {"items": items, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
 
 
@@ -2765,9 +4317,15 @@ def copy_style_get(db: Session = Depends(get_db)):
 
 
 @router.put("/settings/copy-style")
-def copy_style_put(payload: dict, db: Session = Depends(get_db)):
+def copy_style_put(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     svc = CopyStyleSettingsService(db)
-    return svc.update(payload)
+    result = svc.update(payload)
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "copy_style"})
+    return result
 
 
 # ---------- Cleanup ----------
@@ -2778,9 +4336,22 @@ def cleanup_preview(db: Session = Depends(get_db), older_than_hours: int = Query
 
 
 @router.post("/cleanup/run")
-def cleanup_run(db: Session = Depends(get_db), older_than_hours: int = Query(24, ge=1)):
+def cleanup_run(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    older_than_hours: int = Query(24, ge=1),
+):
     svc = CleanupService(db)
-    return svc.cleanup_temp_files(older_than_hours)
+    result = svc.cleanup_temp_files(older_than_hours)
+    _admin_audit(
+        db,
+        current_user,
+        "cleanup",
+        "temp_files",
+        None,
+        {"cleaned_jobs": result.get("cleaned_jobs", 0), "older_than_hours": older_than_hours},
+    )
+    return result
 
 
 # ---------- Referrals ----------
@@ -2884,13 +4455,18 @@ def referrals_bonuses_list(
 
 
 @router.post("/referrals/bonuses/{bonus_id}/freeze")
-def referrals_bonus_freeze(bonus_id: str, db: Session = Depends(get_db)):
+def referrals_bonus_freeze(
+    bonus_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     """Freeze a bonus for manual review."""
     ref_svc = ReferralService(db)
     ok = ref_svc.freeze_bonus(bonus_id)
     if not ok:
         raise HTTPException(400, "Cannot freeze this bonus (already spent/revoked or not found)")
     db.commit()
+    _admin_audit(db, current_user, "update", "referral_bonus", bonus_id, {"action": "freeze"})
     return {"ok": True}
 
 
@@ -2941,7 +4517,11 @@ class TrafficSourceUpdate(BaseModel):
 
 
 @router.post("/traffic-sources")
-def traffic_sources_create(body: TrafficSourceCreate, db: Session = Depends(get_db)):
+def traffic_sources_create(
+    body: TrafficSourceCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     """Create a traffic source. Slug: [a-zA-Z0-9_-], max 50 chars for start param headroom."""
     slug = (body.slug or "").strip()
     if not slug or len(slug) > 50:
@@ -2960,6 +4540,7 @@ def traffic_sources_create(body: TrafficSourceCreate, db: Session = Depends(get_
     db.add(source)
     db.commit()
     db.refresh(source)
+    _admin_audit(db, current_user, "create", "traffic_source", source.id, {"slug": source.slug})
     return {
         "id": source.id,
         "slug": source.slug,
@@ -2972,7 +4553,12 @@ def traffic_sources_create(body: TrafficSourceCreate, db: Session = Depends(get_
 
 
 @router.patch("/traffic-sources/{source_id}")
-def traffic_sources_update(source_id: str, body: TrafficSourceUpdate, db: Session = Depends(get_db)):
+def traffic_sources_update(
+    source_id: str,
+    body: TrafficSourceUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     """Update traffic source."""
     source = db.query(TrafficSource).filter(TrafficSource.id == source_id).first()
     if not source:
@@ -2985,6 +4571,7 @@ def traffic_sources_update(source_id: str, body: TrafficSourceUpdate, db: Sessio
         source.is_active = body.is_active
     db.commit()
     db.refresh(source)
+    _admin_audit(db, current_user, "update", "traffic_source", source_id, {})
     return {
         "id": source.id,
         "slug": source.slug,
@@ -2997,13 +4584,18 @@ def traffic_sources_update(source_id: str, body: TrafficSourceUpdate, db: Sessio
 
 
 @router.delete("/traffic-sources/{source_id}")
-def traffic_sources_delete(source_id: str, db: Session = Depends(get_db)):
+def traffic_sources_delete(
+    source_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     """Soft-delete: set is_active=False."""
     source = db.query(TrafficSource).filter(TrafficSource.id == source_id).first()
     if not source:
         raise HTTPException(404, "Traffic source not found")
     source.is_active = False
     db.commit()
+    _admin_audit(db, current_user, "update", "traffic_source", source_id, {"is_active": False})
     return {"ok": True}
 
 
@@ -3320,7 +4912,11 @@ def ad_campaigns_list(db: Session = Depends(get_db)):
 
 
 @router.post("/ad-campaigns")
-def ad_campaigns_create(body: AdCampaignCreate, db: Session = Depends(get_db)):
+def ad_campaigns_create(
+    body: AdCampaignCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     """Create ad campaign."""
     source = db.query(TrafficSource).filter(TrafficSource.id == body.source_id).first()
     if not source:
@@ -3343,6 +4939,7 @@ def ad_campaigns_create(body: AdCampaignCreate, db: Session = Depends(get_db)):
     db.add(campaign)
     db.commit()
     db.refresh(campaign)
+    _admin_audit(db, current_user, "create", "ad_campaign", campaign.id, {"name": campaign.name})
     return {
         "id": campaign.id,
         "source_id": campaign.source_id,
@@ -3357,7 +4954,12 @@ def ad_campaigns_create(body: AdCampaignCreate, db: Session = Depends(get_db)):
 
 
 @router.patch("/ad-campaigns/{campaign_id}")
-def ad_campaigns_update(campaign_id: str, body: AdCampaignUpdate, db: Session = Depends(get_db)):
+def ad_campaigns_update(
+    campaign_id: str,
+    body: AdCampaignUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     """Update ad campaign."""
     campaign = db.query(AdCampaign).filter(AdCampaign.id == campaign_id).first()
     if not campaign:
@@ -3382,6 +4984,7 @@ def ad_campaigns_update(campaign_id: str, body: AdCampaignUpdate, db: Session = 
         campaign.notes = body.notes.strip() if body.notes else None
     db.commit()
     db.refresh(campaign)
+    _admin_audit(db, current_user, "update", "ad_campaign", campaign_id, {})
     return {
         "id": campaign.id,
         "source_id": campaign.source_id,
@@ -3579,7 +5182,13 @@ def photo_merge_settings_get(db: Session = Depends(get_db)):
 
 
 @router.put("/photo-merge/settings")
-def photo_merge_settings_put(payload: dict, db: Session = Depends(get_db)):
+def photo_merge_settings_put(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     """Обновить настройки сервиса склейки."""
     svc = PhotoMergeSettingsService(db)
-    return svc.update(payload)
+    result = svc.update(payload)
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "photo_merge"})
+    return result

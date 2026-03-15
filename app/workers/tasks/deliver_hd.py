@@ -22,6 +22,11 @@ from app.services.favorites.service import FavoriteService
 from app.services.hd_balance.service import HDBalanceService
 from app.services.sessions.service import SessionService
 from app.services.telegram.client import TelegramClient
+from app.utils.metrics import (
+    favorites_hd_delivery_total,
+    hd_delivery_failed_total,
+    balance_rejected_total,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,46 +70,31 @@ def _try_upsell_after_hd(db, fav, chat_id: str, telegram: TelegramClient) -> Non
                 keyboard = {"inline_keyboard": buttons}
                 telegram.send_message(
                     chat_id,
-                    "Попробовал? Перейди на Neo Start или Neo Pro.\n99⭐ уже учтены.",
+                    "Попробовали? Перейдите на Neo Start или Neo Pro.\n99⭐ уже учтены.",
                     reply_markup=keyboard,
                 )
             return
 
-        paid_pack_ids = ("neo_start", "neo_pro", "neo_unlimited")
-        is_paid = pack and getattr(pack, "id", None) in paid_pack_ids
+        # Платным считаем любой пакет, кроме free_preview (в т.ч. trial, neo_*, legacy).
+        # Иначе пользователь с оплаченным Trial или старым пакетом видит "Закончились 4K" как бесплатный.
+        is_free_preview = (session.pack_id or "").strip().lower() == "free_preview"
+        is_paid = not is_free_preview
 
         if is_paid:
-            # Платный тариф: счётчик + только «Купить ещё 4K» и «Меню с тарифами»
+            # Платный пакет: счётчик + «Купить ещё 4K» и «В меню»
             session_svc = SessionService(db)
             remaining_takes = session.takes_limit - session.takes_used
-            hd_rem = session_svc.hd_remaining(session)
             text = (
-                f"Осталось снимков: {remaining_takes} из {session.takes_limit}\n"
-                f"4K без watermark: {hd_rem}\n\n"
-                "Купить ещё 4K — выберите пакет в меню тарифов."
+                f"Осталось фото: {remaining_takes} из {session.takes_limit}\n\n"
+                "Купить ещё 4K — выберите пакет в меню."
             )
             buttons = [
                 [{"text": "🛒 Купить ещё 4K", "callback_data": "shop:open"}],
                 [{"text": "📋 В меню", "callback_data": "nav:menu"}],
             ]
         else:
-            # Бесплатный (free_preview или иное): закончились именно 4K без watermark, не «образы»
-            text = (
-                "Закончились 4K без watermark.\n\n"
-                "Хотите попробовать ещё образы?\n\n"
-                "⭐ Neo Pro — 40 фото · 699 ₽\n"
-                "самый популярный пакет\n\n"
-                "🚀 Start — 10 фото · 199 ₽\n"
-                "для быстрого старта\n\n"
-                "👑 Unlimited — 120 фото · 1990 ₽\n"
-                "максимум образов"
-            )
-            buttons = [
-                [{"text": "⭐ Ещё 40 фото · 699 ₽", "callback_data": "paywall:neo_pro"}],
-                [{"text": "🚀 Ещё 10 фото · 199 ₽", "callback_data": "paywall:neo_start"}],
-                [{"text": "👑 120 фото · 1990 ₽", "callback_data": "paywall:neo_unlimited"}],
-                [{"text": "📋 В меню", "callback_data": "nav:menu"}],
-            ]
+            # Бесплатный (free_preview): баннер апсейла с тарифами убран — не путаем пользователя
+            return
         keyboard = {"inline_keyboard": buttons}
         telegram.send_message(chat_id, text, reply_markup=keyboard)
     except Exception:
@@ -152,6 +142,7 @@ def deliver_hd(
 
         if fav.hd_status == "delivered":
             logger.info("deliver_hd_already_delivered", extra={"favorite_id": favorite_id})
+            favorites_hd_delivery_total.labels(outcome="delivered").inc()
             if status_chat_id and fav.hd_path and os.path.isfile(fav.hd_path):
                 try:
                     telegram.send_document(
@@ -172,6 +163,8 @@ def deliver_hd(
 
         if not fav.original_path or not os.path.isfile(fav.original_path):
             logger.error("deliver_hd_original_missing", extra={"favorite_id": favorite_id})
+            favorites_hd_delivery_total.labels(outcome="failed").inc()
+            hd_delivery_failed_total.inc()
             fav_svc.reset_hd_status(favorite_id)
             comp_svc = CompensationService(db)
             comp_svc.auto_compensate_on_fail(favorite_id)
@@ -182,6 +175,8 @@ def deliver_hd(
 
         user = db.query(User).filter(User.id == fav.user_id).one_or_none()
         if not user:
+            favorites_hd_delivery_total.labels(outcome="failed").inc()
+            hd_delivery_failed_total.inc()
             fav_svc.reset_hd_status(favorite_id)
             db.commit()
             if status_chat_id:
@@ -196,6 +191,8 @@ def deliver_hd(
             _upscale_image(fav.original_path, hd_path)
         except Exception as e:
             logger.exception("deliver_hd_upscale_failed", extra={"favorite_id": favorite_id})
+            favorites_hd_delivery_total.labels(outcome="failed").inc()
+            hd_delivery_failed_total.inc()
             fav_svc.reset_hd_status(favorite_id)
             comp_svc = CompensationService(db)
             comp_svc.auto_compensate_on_fail(favorite_id)
@@ -206,6 +203,9 @@ def deliver_hd(
 
         if not hd_svc.spend(user, 1):
             logger.warning("deliver_hd_insufficient_balance", extra={"favorite_id": favorite_id, "user_id": user.id})
+            balance_rejected_total.inc()
+            favorites_hd_delivery_total.labels(outcome="failed").inc()
+            hd_delivery_failed_total.inc()
             fav_svc.reset_hd_status(favorite_id)
             try:
                 os.unlink(hd_path)
@@ -213,7 +213,7 @@ def deliver_hd(
                 pass
             db.commit()
             if status_chat_id:
-                telegram.send_message(status_chat_id, "❌ Недостаточно 4K на балансе.")
+                telegram.send_message(status_chat_id, "❌ Недостаточно доступа. Купите пакет.")
             return {"ok": False, "error": "insufficient_hd_balance"}
 
         fav_svc.mark_hd_delivered(favorite_id, hd_path)
@@ -259,15 +259,22 @@ def deliver_hd(
                     caption="🖼 4K версия готова!",
                     filename="Изображение_4K.png",
                 )
+                favorites_hd_delivery_total.labels(outcome="delivered").inc()
             except Exception as e:
                 logger.exception("deliver_hd_send_failed", extra={"favorite_id": favorite_id})
+                favorites_hd_delivery_total.labels(outcome="failed").inc()
+                hd_delivery_failed_total.inc()
                 telegram.send_message(status_chat_id, f"✅ 4K готова, но не удалось отправить: {e}")
 
             _try_upsell_after_hd(db, fav, status_chat_id, telegram)
 
+        if status_chat_id is None:
+            favorites_hd_delivery_total.labels(outcome="delivered").inc()
         return {"ok": True, "favorite_id": favorite_id, "hd_path": hd_path}
     except Exception:
         logger.exception("deliver_hd_fatal", extra={"favorite_id": favorite_id})
+        favorites_hd_delivery_total.labels(outcome="failed").inc()
+        hd_delivery_failed_total.inc()
         try:
             fav_svc.reset_hd_status(favorite_id)
             db.commit()

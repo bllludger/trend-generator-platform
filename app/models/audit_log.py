@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import Column, DateTime, String
+from sqlalchemy import Column, DateTime, ForeignKey, String
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.db.base import Base
@@ -18,3 +18,6 @@ class AuditLog(Base):
     entity_id = Column(String, nullable=True)
     payload = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    # For telemetry/metrics built from audit: avoid join on actor_id when filtering by user/session
+    user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    session_id = Column(String, nullable=True, index=True)

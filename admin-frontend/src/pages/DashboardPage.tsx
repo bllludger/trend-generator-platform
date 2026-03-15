@@ -13,7 +13,6 @@ import {
   ArrowRight,
   Activity,
   BarChart3,
-  Sparkles,
 } from 'lucide-react'
 import {
   AreaChart,
@@ -41,8 +40,8 @@ const STAT_CARDS = [
     key: 'users_subscribed' as const,
     icon: UserCheck,
     href: '/users',
-    gradient: 'from-emerald-500 to-green-600',
-    bgLight: 'bg-emerald-500/10',
+    gradient: 'from-success to-green-600',
+    bgLight: 'bg-success/10',
   },
   {
     name: 'Всего задач',
@@ -57,8 +56,8 @@ const STAT_CARDS = [
     key: 'jobs_window' as const,
     icon: Clock,
     href: '/jobs',
-    gradient: 'from-amber-500 to-orange-600',
-    bgLight: 'bg-amber-500/10',
+    gradient: 'from-warning to-orange-600',
+    bgLight: 'bg-warning/10',
   },
   {
     name: 'В очереди',
@@ -88,8 +87,8 @@ const STATUS_LABELS: Record<string, string> = {
 const STATUS_COLORS: Record<string, string> = {
   CREATED: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
   RUNNING: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
-  SUCCEEDED: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300',
-  FAILED: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
+  SUCCEEDED: 'bg-success/10 text-success',
+  FAILED: 'bg-destructive/10 text-destructive',
 }
 
 type TrendAnalyticsItem = {
@@ -110,6 +109,7 @@ type DashboardData = {
   users_subscribed?: number
   jobs_total?: number
   jobs_window?: number
+  takes_window?: number
   queue_length?: number
   succeeded?: number
   jobs_by_status?: Record<string, number>
@@ -117,53 +117,74 @@ type DashboardData = {
   variants_chosen_by_trend?: Record<string, number>
 }
 
-const DASHBOARD_HISTORY_DAYS = 14
+const DASHBOARD_HISTORY_DAYS = 30
 const DASHBOARD_STATS_HOURS = 24
 
 export function DashboardPage() {
-  const { data, isLoading, dataUpdatedAt } = useQuery<DashboardData>({
+  const { data, isLoading, isError: mainError, dataUpdatedAt, refetch: refetchMain } = useQuery<DashboardData>({
     queryKey: ['telemetry', DASHBOARD_STATS_HOURS],
     queryFn: () => telemetryService.getDashboard(DASHBOARD_STATS_HOURS) as Promise<DashboardData>,
     refetchInterval: 30000,
   })
 
-  const { data: data14d } = useQuery<DashboardData>({
+  const { data: dataWindow, isError: windowError, isLoading: windowLoading, refetch: refetchWindow } = useQuery<DashboardData>({
     queryKey: ['telemetry', DASHBOARD_HISTORY_DAYS * 24],
     queryFn: () => telemetryService.getDashboard(DASHBOARD_HISTORY_DAYS * 24) as Promise<DashboardData>,
     refetchInterval: 60000,
   })
 
-  const { data: historyData } = useQuery({
+  const { data: historyData, isError: historyError, isLoading: historyLoading, refetch: refetchHistory } = useQuery({
     queryKey: ['telemetry-history', DASHBOARD_HISTORY_DAYS],
-    queryFn: () => telemetryService.getHistory(DASHBOARD_HISTORY_DAYS) as Promise<{ history?: Array<{ date: string; jobs_total?: number; jobs_succeeded?: number; jobs_failed?: number }> }>,
+    queryFn: () =>
+      telemetryService.getHistory(DASHBOARD_HISTORY_DAYS) as Promise<{
+        history?: Array<{
+          date: string
+          jobs_total?: number
+          jobs_succeeded?: number
+          jobs_failed?: number
+          takes_total?: number
+        }>
+      }>,
     refetchInterval: 60000,
   })
 
-  const jobsByStatus = data14d?.jobs_by_status ?? data?.jobs_by_status ?? {}
-  const succeededCount = jobsByStatus.SUCCEEDED ?? 0
+  const jobsByStatus24h = data?.jobs_by_status ?? {}
+  const jobsByStatus30d = dataWindow?.jobs_by_status ?? {}
+  const succeededCount24h = jobsByStatus24h.SUCCEEDED ?? 0
+  const jobsWindow = (data?.jobs_window as number | undefined) ?? 0
+  const takesWindow = (data?.takes_window as number | undefined) ?? 0
   const statsWithValues = STAT_CARDS.map((card) => ({
     ...card,
     value:
       card.key === 'succeeded'
-        ? succeededCount
-        : (data?.[card.key] as number | undefined) ?? 0,
+        ? succeededCount24h
+        : card.key === 'jobs_window'
+          ? jobsWindow + takesWindow
+          : (data?.[card.key] as number | undefined) ?? 0,
   }))
-  const trendList = (data14d?.trend_analytics_window ?? data?.trend_analytics_window ?? [])
-    .filter(
-      (t) =>
-        (t.jobs_window ?? 0) > 0 ||
-        (t.takes_window ?? 0) > 0 ||
-        (t.chosen_window ?? 0) > 0
-    )
-    .slice(0, 10)
+  const hasDashboardError = mainError || windowError || historyError
   const chartData =
-    historyData?.history?.map((d: { date: string; jobs_total?: number; jobs_succeeded?: number; jobs_failed?: number }) => ({
-      date: d.date,
-      dateShort: format(parseISO(d.date), 'd MMM', { locale: ru }),
-      jobs: d.jobs_total,
-      succeeded: d.jobs_succeeded,
-      failed: d.jobs_failed,
-    })) ?? []
+    historyData?.history?.map(
+      (d: {
+        date: string
+        jobs_total?: number
+        jobs_succeeded?: number
+        jobs_failed?: number
+        takes_total?: number
+      }) => {
+        const jobs = d.jobs_total ?? 0
+        const takes = d.takes_total ?? 0
+        return {
+          date: d.date,
+          dateShort: format(parseISO(d.date), 'd MMM', { locale: ru }),
+          jobs: jobs + takes,
+          jobsOnly: jobs,
+          takesOnly: takes,
+          succeeded: d.jobs_succeeded,
+          failed: d.jobs_failed,
+        }
+      }
+    ) ?? []
 
   if (isLoading) {
     return (
@@ -178,6 +199,18 @@ export function DashboardPage() {
 
   return (
     <div className="space-y-8">
+      {hasDashboardError && (
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          <span>Ошибка загрузки данных. Обновите страницу.</span>
+          <button
+            type="button"
+            onClick={() => { refetchMain(); refetchWindow(); refetchHistory() }}
+            className="shrink-0 rounded-md border border-red-300 bg-white px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-700 dark:bg-red-900/50 dark:text-red-200 dark:hover:bg-red-900/70"
+          >
+            Обновить
+          </button>
+        </div>
+      )}
       {/* Hero */}
       <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
         <div>
@@ -185,7 +218,7 @@ export function DashboardPage() {
             Панель управления
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Статистика: 24 ч — сводка, 14 д — график и тренды
+            Статистика: 24 ч — сводка, 30 д — график и тренды
             {dataUpdatedAt && (
               <span className="ml-2 text-muted-foreground/80">
                 · обновлено {format(new Date(dataUpdatedAt), 'HH:mm', { locale: ru })}
@@ -194,7 +227,7 @@ export function DashboardPage() {
           </p>
         </div>
         <div className="mt-2 flex items-center gap-2 sm:mt-0">
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-success/10 px-3 py-1 text-xs font-medium text-success">
             <Activity className="h-3.5 w-3.5" />
             Live
           </span>
@@ -239,11 +272,15 @@ export function DashboardPage() {
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-2 text-base">
               <BarChart3 className="h-4 w-4 text-muted-foreground" />
-              Задачи за 14 дней
+              Задачи за 30 дней
             </CardTitle>
           </CardHeader>
           <CardContent className="pt-0">
-            {chartData.length > 0 ? (
+            {historyLoading && !historyData ? (
+              <div className="flex h-[200px] items-center justify-center rounded-lg border border-dashed border-muted-foreground/20 text-sm text-muted-foreground">
+                Загрузка…
+              </div>
+            ) : chartData.length > 0 ? (
               <div className="h-[200px] w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={chartData} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
@@ -266,10 +303,15 @@ export function DashboardPage() {
                         active && payload?.[0] ? (
                           <div className="rounded-lg border bg-card px-3 py-2 text-sm shadow-sm">
                             <p className="font-medium">{payload[0].payload.date}</p>
-                            <p>Задач: {payload[0].value}</p>
-                            <p className="text-emerald-600">Успешно: {payload[0].payload.succeeded}</p>
-                            {Number(payload[0].payload.failed) > 0 && (
-                              <p className="text-red-600">Ошибок: {payload[0].payload.failed}</p>
+                            <p>Всего: {payload[0].value}</p>
+                            {(Number(payload[0].payload.jobsOnly) > 0 || Number(payload[0].payload.takesOnly) > 0) && (
+                              <p className="text-muted-foreground text-xs">
+                                задач: {payload[0].payload.jobsOnly} · снимков: {payload[0].payload.takesOnly}
+                              </p>
+                            )}
+                            <p className="text-success">Успешно: {payload[0].payload.succeeded ?? 0}</p>
+                            {Number(payload[0].payload.failed ?? 0) > 0 && (
+                              <p className="text-destructive">Ошибок: {payload[0].payload.failed ?? 0}</p>
                             )}
                           </div>
                         ) : null
@@ -285,6 +327,10 @@ export function DashboardPage() {
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
+            ) : historyError ? (
+              <div className="flex h-[200px] items-center justify-center rounded-lg border border-dashed border-red-200 bg-red-50/50 text-sm text-red-700 dark:border-red-800 dark:bg-red-950/20 dark:text-red-300">
+                Ошибка загрузки графика
+              </div>
             ) : (
               <div className="flex h-[200px] items-center justify-center rounded-lg border border-dashed border-muted-foreground/20 text-sm text-muted-foreground">
                 Нет данных за период
@@ -293,107 +339,54 @@ export function DashboardPage() {
           </CardContent>
         </Card>
 
-        {/* Status badges */}
+        {/* Status badges — только данные за 30 д */}
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-base">Статусы задач (14 д)</CardTitle>
+            <CardTitle className="text-base">Статусы задач (30 д)</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="flex flex-wrap gap-2">
-              {Object.entries(jobsByStatus).map(([status, count]) => (
-                <div
-                  key={status}
-                  className={`rounded-lg px-3 py-2 ${STATUS_COLORS[status] ?? 'bg-muted text-muted-foreground'}`}
-                >
-                  <span className="text-xs font-medium">
-                    {STATUS_LABELS[status] ?? status}
-                  </span>
-                  <span className="ml-2 text-lg font-bold tabular-nums">
-                    {formatNumber(Number(count))}
-                  </span>
-                </div>
-              ))}
-              {Object.keys(jobsByStatus).length === 0 && (
-                <p className="text-sm text-muted-foreground">Нет данных</p>
-              )}
-            </div>
+            {windowError ? (
+              <p className="text-sm text-destructive">Ошибка загрузки</p>
+            ) : windowLoading && dataWindow == null ? (
+              <p className="text-sm text-muted-foreground">Загрузка…</p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(jobsByStatus30d).map(([status, count]) => (
+                  <div
+                    key={status}
+                    className={`rounded-lg px-3 py-2 ${STATUS_COLORS[status] ?? 'bg-muted text-muted-foreground'}`}
+                  >
+                    <span className="text-xs font-medium">
+                      {STATUS_LABELS[status] ?? status}
+                    </span>
+                    <span className="ml-2 text-lg font-bold tabular-nums">
+                      {formatNumber(Number(count))}
+                    </span>
+                  </div>
+                ))}
+                {((dataWindow?.takes_window as number) ?? 0) > 0 && (
+                  <div className="rounded-lg px-3 py-2 bg-muted/80 text-muted-foreground">
+                    <span className="text-xs font-medium">Снимков</span>
+                    <span className="ml-2 text-lg font-bold tabular-nums">
+                      {formatNumber((dataWindow?.takes_window as number) ?? 0)}
+                    </span>
+                  </div>
+                )}
+                {Object.keys(jobsByStatus30d).length === 0 && ((dataWindow?.takes_window as number) ?? 0) === 0 && (
+                  <p className="text-sm text-muted-foreground">Нет данных</p>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>
 
-      {/* Top trends */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Sparkles className="h-4 w-4 text-muted-foreground" />
-            Топ трендов за 14 д
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          {trendList.length > 0 ? (
-            <ul className="space-y-3">
-              {trendList.map((trend: TrendAnalyticsItem) => {
-                const jobs = trend.jobs_window ?? 0
-                const takes = trend.takes_window ?? 0
-                const total = jobs + takes
-                const succeeded =
-                  (trend.succeeded_window ?? 0) + (trend.takes_succeeded_window ?? 0)
-                const failed = (trend.failed_window ?? 0) + (trend.takes_failed_window ?? 0)
-                const successRate = total > 0 ? Math.round((succeeded / total) * 100) : 0
-                const parts: string[] = []
-                if (jobs > 0) parts.push(`${jobs} задач`)
-                if (takes > 0) parts.push(`${takes} снимков`)
-                if ((trend.chosen_window ?? 0) > 0)
-                  parts.push(`${trend.chosen_window} выбрано картинок`)
-                const subtitle = parts.length > 0 ? parts.join(' · ') : '—'
-                return (
-                  <li
-                    key={trend.trend_id}
-                    className="flex items-center justify-between gap-4 rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5 transition-colors hover:bg-muted/50"
-                  >
-                    <div className="flex min-w-0 flex-1 items-center gap-3">
-                      <span className="text-xl leading-none">{trend.emoji}</span>
-                      <div className="min-w-0">
-                        <p className="truncate font-medium text-foreground">{trend.name}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {subtitle}
-                          {' · '}
-                          {successRate}% успешность
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-3">
-                      <div className="h-2 w-16 overflow-hidden rounded-full bg-muted">
-                        <div
-                          className="h-full rounded-full bg-emerald-500"
-                          style={{ width: `${successRate}%` }}
-                        />
-                      </div>
-                      <div
-                        className="text-right"
-                        title="Успешных / с ошибками за период"
-                      >
-                        <span className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">
-                          +{succeeded}
-                        </span>
-                        {failed > 0 && (
-                          <span className="ml-1 text-xs text-red-600 dark:text-red-400">
-                            −{failed}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  </li>
-                )
-              })}
-            </ul>
-          ) : (
-            <p className="py-6 text-center text-sm text-muted-foreground">
-              Пока нет активности по трендам
-            </p>
-          )}
-        </CardContent>
-      </Card>
+      <p className="text-center text-sm text-muted-foreground">
+        <Link to="/trends-analytics" className="text-primary hover:underline inline-flex items-center gap-1">
+          <BarChart3 className="h-4 w-4" />
+          Аналитика по трендам
+        </Link>
+      </p>
     </div>
   )
 }

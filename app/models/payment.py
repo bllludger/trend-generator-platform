@@ -18,7 +18,8 @@ class Payment(Base):
     telegram_payment_charge_id = Column(String, unique=True, nullable=False)
     provider_payment_charge_id = Column(String, nullable=True)
     pack_id = Column(String, nullable=False)                 # "starter" / "standard" / "pro" / "unlock"
-    stars_amount = Column(Integer, nullable=False)            # сколько Stars заплатил
+    stars_amount = Column(Integer, nullable=False)            # сколько Stars заплатил (0 для ЮMoney)
+    amount_kopecks = Column(Integer, nullable=True)           # сумма в копейках (для ЮMoney / RUB платежей)
     tokens_granted = Column(Integer, nullable=False)          # сколько генераций начислено
     status = Column(String, nullable=False, default="completed")  # completed / refunded
     payload = Column(String, nullable=False)                  # верификационный payload

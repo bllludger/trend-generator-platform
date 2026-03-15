@@ -75,7 +75,7 @@ export function CleanupPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-amber-600 to-orange-600 bg-clip-text text-transparent">
+        <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-warning to-orange-600 bg-clip-text text-transparent">
           Cleanup
         </h1>
         <p className="text-muted-foreground mt-2">
@@ -103,8 +103,8 @@ export function CleanupPage() {
                       {previewLoading ? '—' : preview?.jobs_count ?? 0}
                     </p>
                   </div>
-                  <div className="p-3 rounded-xl bg-amber-500/20">
-                    <FileX className="h-6 w-6 text-amber-600" />
+                  <div className="p-3 rounded-xl bg-warning/20">
+                    <FileX className="h-6 w-6 text-warning" />
                   </div>
                 </div>
               </CardContent>
@@ -186,7 +186,7 @@ export function CleanupPage() {
                 <Button
                   onClick={() => setConfirmOpen(true)}
                   disabled={!preview?.jobs_count || runMutation.isPending}
-                  className="bg-amber-600 hover:bg-amber-700"
+                  className="bg-warning hover:opacity-90"
                 >
                   {runMutation.isPending ? (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
@@ -253,7 +253,7 @@ export function CleanupPage() {
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-amber-600">
+            <DialogTitle className="flex items-center gap-2 text-warning">
               <AlertTriangle className="h-5 w-5" />
               Подтверждение
             </DialogTitle>
@@ -271,7 +271,7 @@ export function CleanupPage() {
             <Button
               onClick={handleRun}
               disabled={runMutation.isPending}
-              className="bg-amber-600 hover:bg-amber-700"
+              className="bg-warning hover:opacity-90"
             >
               {runMutation.isPending ? (
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />

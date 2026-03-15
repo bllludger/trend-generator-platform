@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     subscription_channel_username: str = ""
     # Автопостер трендов: Telegram chat ID или @username канала (например -1003808081075, @nanobanana_al или nanobanana_al). Пусто = отключено.
     poster_channel_id: str = ""
+    # Плашка «Подтвердите согласие» перед загрузкой фото. True = показывать, False = не показывать (временно отключено).
+    require_photo_consent: bool = False
 
     # ===========================================
     # IMAGE GENERATION - PROVIDER SELECTION
@@ -124,12 +126,25 @@ class Settings(BaseSettings):
     # ===========================================
     # MONETIZATION (Telegram Stars)
     # ===========================================
-    watermark_text: str = "NanoBanan Preview"
+    watermark_text: str = "@ai_nanobananastudio_bot"
     unlock_cost_stars: int = 2  # стоимость разблокировки одного фото (Stars) — дешевле пакета, чтобы был смысл
-    unlock_cost_tokens: int = 1  # стоимость разблокировки одного фото в токенах (кнопка «За N токен»)
+    unlock_cost_tokens: int = 1  # стоимость разблокировки одного фото с баланса (кнопка «Разблокировать за N фото»)
     # Курс 1 Star → рубли (для отображения в скобках). Пример: 1.3 при ~100 ₽/$
     star_to_rub: float = 1.3
-    
+    # Контакт поддержки в Telegram (без @). Упоминается в сообщениях и команде /paysupport.
+    support_username: str = "neobanana_sup"
+
+    # ===========================================
+    # YOOMONEY / ЮKassa (нативная оплата в Telegram + опционально API)
+    # ===========================================
+    # Платёжный бот @neobanana_pay_bot: токен для отправки инвойсов ЮMoney и приёма pre_checkout/successful_payment.
+    telegram_pay_bot_token: str = ""
+    # Платёжный токен из @BotFather → Payments (для @neobanana_pay_bot). Обязателен для sendInvoice в RUB.
+    telegram_payment_provider_token: str = ""
+    # Для API-варианта и ЛК: Shop ID и Secret key (в нативной интеграции в коде не используются).
+    yookassa_shop_id: str = ""
+    yookassa_secret_key: str = ""
+
     # ===========================================
     # REFERRAL PROGRAM
     # ===========================================

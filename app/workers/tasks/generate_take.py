@@ -39,12 +39,39 @@ from app.services.telegram_messages.runtime import runtime_templates
 from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as transfer_get_effective
 from app.services.trends.service import TrendService
 from app.utils.image_formats import aspect_ratio_to_size
-from app.paywall.watermark import apply_watermark
+from app.services.preview import PreviewService
+from app.utils.metrics import (
+    takes_created_total,
+    takes_completed_total,
+    takes_failed_total,
+    take_generation_duration_seconds,
+    take_previews_ready_total,
+    generation_failed_total,
+)
 
 logger = logging.getLogger(__name__)
 
 VARIANTS = ["A", "B", "C"]
 RATE_LIMIT_DELAY = 1.5
+
+# Текст и кнопки после генерации (выбор варианта)
+RESULT_CHOOSE_TEXT = (
+    "🎉 Ура! Ваши варианты готовы.\n\n"
+    "💰 Остался простой шаг —\n"
+    "выберите лучший снимок\n"
+    "и оплатите его.\n\n"
+    "Один снимок — в этом шаге: выберите лучший из трёх.\n\n"
+    "✨ После этого вы получите фото\n"
+    "в полном качестве\n"
+    "для соцсетей без надписей."
+)
+RESULT_CHOOSE_BUTTON_LABEL = "💎 Выбрать и оплатить {}"  # .format("A") -> "💎 Выбрать и оплатить A"
+RESULT_CHOOSE_TEXT_WITH_PACK = (
+    "🎉 Ура! Ваши варианты готовы.\n\n"
+    "Выберите лучший снимок — он будет засчитан в ваш пакет.\n\n"
+    "Один снимок — в этом шаге: выберите лучший из трёх."
+)
+RESULT_CHOOSE_BUTTON_LABEL_PACK = "💎 Выбрать вариант {}"  # без «оплатить»
 MAX_VARIANT_RETRIES = 2
 VARIANT_RETRY_DELAY = 2.0
 
@@ -55,7 +82,7 @@ COPY_VARIANT_TEMPERATURES = {"A": 0.2, "B": 0.35, "C": 0.5}
 MAIN_MENU_REPLY = {
     "keyboard": [
         [{"text": "🔥 Создать фото"}, {"text": "🔄 Сделать такую же"}],
-        [{"text": "🧩 Соединить фото"}, {"text": "🛒 Купить тариф"}],
+        [{"text": "🧩 Соединить фото"}, {"text": "🛒 Купить пакет"}],
         [{"text": "👤 Мой профиль"}],
     ],
     "resize_keyboard": True,
@@ -152,32 +179,6 @@ def _build_prompt_for_take(db: Session, take: Take, trend: Trend) -> tuple[str, 
     return prompt_text, negative, model, size, image_size_tier
 
 
-def _downscale_and_watermark(
-    original_path: str,
-    preview_path: str,
-    max_dim: int = 800,
-    watermark_params: dict | None = None,
-) -> str:
-    """Create preview: downscale to max_dim px + apply watermark. max_dim и watermark_params из админки (app_settings)."""
-    from PIL import Image as PILImage
-
-    img = PILImage.open(original_path)
-    if max(img.size) > max_dim:
-        ratio = max_dim / max(img.size)
-        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-        img = img.resize(new_size, PILImage.LANCZOS)
-    downscaled_tmp = preview_path + ".tmp.png"
-    img.save(downscaled_tmp, "PNG")
-    img.close()
-
-    apply_watermark(downscaled_tmp, preview_path, params=watermark_params)
-    try:
-        os.unlink(downscaled_tmp)
-    except OSError:
-        pass
-    return preview_path
-
-
 def _generate_one_variant(
     *,
     settings,
@@ -193,16 +194,14 @@ def _generate_one_variant(
     input_image_path: str | None,
     temperature: float | None,
     image_size_tier: str,
-    max_dim: int,
-    watermark_params: dict,
 ) -> tuple[str, int, dict | None]:
     """
     Сгенерировать один вариант (A/B/C) в потоке. Возвращает (variant, seed, result_dict) или (variant, seed, None) при ошибке.
-    Создаёт свой экземпляр провайдера в потоке (thread-safe).
+    Создаёт свой экземпляр провайдера в потоке (thread-safe). Превью строит через PreviewService (отдельная сессия БД в потоке).
     """
     ext = "png"
     original_path = os.path.join(out_dir, f"{take_id}_{variant}_original.{ext}")
-    preview_path = os.path.join(out_dir, f"{take_id}_{variant}_preview.{ext}")
+    preview_path_placeholder = os.path.join(out_dir, f"{take_id}_{variant}_preview.{ext}")
     for attempt in range(MAX_VARIANT_RETRIES + 1):
         if attempt > 0:
             time.sleep(VARIANT_RETRY_DELAY * (2 ** (attempt - 1)))
@@ -225,15 +224,20 @@ def _generate_one_variant(
                 model_version=model,
                 safety_settings_snapshot=getattr(settings, "gemini_safety_settings", None),
                 streaming_enabled=False,
+                provider_name=provider_override or "gemini",
             )
             with open(original_path, "wb") as f:
                 f.write(result.image_content)
-            _downscale_and_watermark(
-                original_path,
-                preview_path,
-                max_dim=max_dim,
-                watermark_params=watermark_params,
-            )
+            db_thread = SessionLocal()
+            try:
+                preview_path = PreviewService.build_preview(
+                    original_path,
+                    preview_path_placeholder,
+                    "take",
+                    db=db_thread,
+                )
+            finally:
+                db_thread.close()
             return (variant, seed, {"original": original_path, "preview": preview_path})
         except ImageGenerationError as e:
             logger.warning(
@@ -296,6 +300,8 @@ def generate_take(
                 telegram.edit_message(status_chat_id, status_message_id, "❌ Задача не найдена.")
             return {"ok": False, "error": "take_not_found"}
 
+        takes_created_total.inc()
+
         trend_svc = TrendService(db)
         trend = trend_svc.get(take.trend_id) if take.trend_id else None
 
@@ -304,6 +310,8 @@ def generate_take(
                 logger.error("generate_take_copy_no_prompt", extra={"take_id": take_id})
                 take_svc.set_status(take, "failed", error_code="copy_prompt_missing")
                 _refund_free_take_on_failure(db, take, "copy_prompt_missing")
+                takes_failed_total.inc()
+                generation_failed_total.labels(error_code="copy_prompt_missing", source="take").inc()
                 ProductAnalyticsService(db).track(
                     "generation_failed",
                     take.user_id,
@@ -337,6 +345,8 @@ def generate_take(
             logger.error("generate_take_no_trend", extra={"take_id": take_id})
             take_svc.set_status(take, "failed", error_code="trend_missing")
             _refund_free_take_on_failure(db, take, "trend_missing")
+            takes_failed_total.inc()
+            generation_failed_total.labels(error_code="trend_missing", source="take").inc()
             ProductAnalyticsService(db).track(
                 "generation_failed",
                 take.user_id,
@@ -376,6 +386,8 @@ def generate_take(
             logger.error("generate_take_copy_missing_identity", extra={"take_id": take_id})
             take_svc.set_status(take, "failed", error_code="identity_image_missing")
             _refund_free_take_on_failure(db, take, "identity_image_missing")
+            takes_failed_total.inc()
+            generation_failed_total.labels(error_code="identity_image_missing", source="take").inc()
             ProductAnalyticsService(db).track(
                 "generation_failed",
                 take.user_id,
@@ -388,6 +400,25 @@ def generate_take(
             if status_chat_id and status_message_id:
                 telegram.edit_message(status_chat_id, status_message_id, "❌ Не найден файл с фото. Начните заново: «🔄 Сделать такую же».")
             return {"ok": False, "error": "identity_image_missing"}
+
+        if take.take_type == "TREND" and trend and not input_image_path:
+            logger.error("generate_take_trend_missing_input", extra={"take_id": take_id})
+            take_svc.set_status(take, "failed", error_code="input_image_missing")
+            _refund_free_take_on_failure(db, take, "input_image_missing")
+            takes_failed_total.inc()
+            generation_failed_total.labels(error_code="input_image_missing", source="take").inc()
+            ProductAnalyticsService(db).track(
+                "generation_failed",
+                take.user_id,
+                take_id=take_id,
+                session_id=take.session_id,
+                trend_id=take.trend_id,
+                properties={"error_code": "input_image_missing", "latency_ms": int((time.time() - started_at) * 1000)},
+            )
+            db.commit()
+            if status_chat_id and status_message_id:
+                telegram.edit_message(status_chat_id, status_message_id, "❌ Исходное фото недоступно. Начните заново с «Создать фото».")
+            return {"ok": False, "error": "input_image_missing"}
 
         temperature = None
         if trend and trend.prompt_temperature is not None:
@@ -415,10 +446,6 @@ def generate_take(
 
         parallel_workers = getattr(settings, "take_generation_parallel_workers", 1)
         parallel_workers = max(1, min(3, int(parallel_workers)))
-        max_dim = app_svc.get_take_preview_max_dim()
-        watermark_params = app_svc.get_watermark_params(
-            getattr(settings, "watermark_text", "NanoBanan Preview")
-        )
 
         if parallel_workers > 1:
             # Параллельная генерация: прогресс-бар обновляется по мере готовности каждого варианта
@@ -464,8 +491,6 @@ def generate_take(
                         input_image_path=input_image_path,
                         temperature=variant_temperature(v),
                         image_size_tier=image_size_tier,
-                        max_dim=max_dim,
-                        watermark_params=watermark_params,
                     ): v
                     for v in VARIANTS
                 }
@@ -548,6 +573,7 @@ def generate_take(
                             model_version=model,
                             safety_settings_snapshot=getattr(settings, "gemini_safety_settings", None),
                             streaming_enabled=False,
+                            provider_name=provider_name,
                         )
 
                         ext = "png"
@@ -555,14 +581,13 @@ def generate_take(
                         with open(original_path, "wb") as f:
                             f.write(result.image_content)
 
-                        preview_path = os.path.join(out_dir, f"{take_id}_{variant}_preview.{ext}")
-                        _downscale_and_watermark(
+                        preview_path_placeholder = os.path.join(out_dir, f"{take_id}_{variant}_preview.{ext}")
+                        preview_path = PreviewService.build_preview(
                             original_path,
-                            preview_path,
-                            max_dim=max_dim,
-                            watermark_params=watermark_params,
+                            preview_path_placeholder,
+                            "take",
+                            db=db,
                         )
-
                         results[variant] = {
                             "original": original_path,
                             "preview": preview_path,
@@ -587,6 +612,8 @@ def generate_take(
         if not results:
             take_svc.set_status(take, "failed", error_code="all_variants_failed", error_variants=failed_variants)
             _refund_free_take_on_failure(db, take, "all_variants_failed")
+            takes_failed_total.inc()
+            generation_failed_total.labels(error_code="all_variants_failed", source="take").inc()
             ProductAnalyticsService(db).track(
                 "generation_failed",
                 take.user_id,
@@ -605,7 +632,7 @@ def generate_take(
                         [{"text": "📋 В меню", "callback_data": "error_action:menu"}],
                     ]
                 }
-                telegram.send_message(status_chat_id, "Попробуйте снова или вернитесь в меню.", reply_markup=keyboard)
+                telegram.send_message(status_chat_id, "Попробуйте ещё раз или вернитесь в меню.", reply_markup=keyboard)
             return {"ok": False, "error": "all_variants_failed"}
 
         take_svc.set_variants(
@@ -624,9 +651,18 @@ def generate_take(
         status = "ready" if not failed_variants else "partial_fail"
         take_svc.set_status(take, status, error_variants=failed_variants if failed_variants else None)
 
+        takes_completed_total.inc()
+        take_previews_ready_total.inc()
+        generation_duration_sec = (
+            (datetime.now(timezone.utc) - take.created_at).total_seconds()
+            if take.created_at else (time.time() - started_at)
+        )
+        if generation_duration_sec >= 0:
+            take_generation_duration_seconds.observe(generation_duration_sec)
+
         if take.session_id:
             session = session_svc.get_session(take.session_id)
-            if session:
+            if session and not getattr(take, "is_reroll", False) and not getattr(take, "is_rescue_photo_replace", False):
                 session_svc.use_take(session)
 
         audit = AuditService(db)
@@ -649,6 +685,7 @@ def generate_take(
             int((datetime.now(timezone.utc) - take.created_at).total_seconds() * 1000)
             if take.created_at else None
         )
+        # Duplicate events possible on Celery retry; see docs/TELEMETRY_PRODUCT_EVENTS_RETRY_RISK.md
         ProductAnalyticsService(db).track(
             "take_preview_ready",
             take.user_id,
@@ -704,45 +741,61 @@ def generate_take(
 
             if media:
                 try:
-                    telegram.send_media_group(status_chat_id, media)
+                    if len(media) == 1:
+                        telegram.send_photo(
+                            status_chat_id,
+                            media[0]["media_path"],
+                            caption=media[0].get("caption") or "",
+                        )
+                    else:
+                        telegram.send_media_group(status_chat_id, media)
                 except Exception as e:
-                    logger.exception("generate_take_send_media_group_failed", extra={"take_id": take_id})
-                    telegram.send_message(status_chat_id, f"✅ Снимок готов, но не удалось отправить фото: {e}")
+                    logger.exception("generate_take_send_photo_failed", extra={"take_id": take_id})
+                    telegram.send_message(status_chat_id, f"✅ Фото готово, но не удалось отправить: {e}")
 
-            buttons_row = []
-            for v in available_variants:
-                buttons_row.append({"text": f"⭐ {v}", "callback_data": f"choose:{take_id}:{v}"})
+            # При активном пакете с остатком — текст и кнопки без «оплатить»
+            # Учитываем и сессию take, и текущую активную сессию пользователя (мог купить пакет пока шла генерация)
+            has_pack_remaining = False
+            if take.session_id:
+                session = session_svc.get_session(take.session_id)
+                if session and (session.pack_id or "").strip().lower() != "free_preview":
+                    remaining = (session.takes_limit or 0) - (session.takes_used or 0)
+                    has_pack_remaining = remaining > 0
+            if not has_pack_remaining and take.user_id:
+                active = session_svc.get_active_session(take.user_id)
+                if active and (active.pack_id or "").strip().lower() != "free_preview":
+                    remaining_active = (active.takes_limit or 0) - (active.takes_used or 0)
+                    if remaining_active > 0:
+                        has_pack_remaining = True
+            result_text = RESULT_CHOOSE_TEXT_WITH_PACK if has_pack_remaining else RESULT_CHOOSE_TEXT
+            button_label_tpl = RESULT_CHOOSE_BUTTON_LABEL_PACK if has_pack_remaining else RESULT_CHOOSE_BUTTON_LABEL
 
-            keyboard = {
-                "inline_keyboard": [
-                    buttons_row,
-                    [
-                        {"text": "📸 Ещё снимок", "callback_data": "take_more"},
-                        {"text": "📋 Избранное", "callback_data": "open_favorites"},
-                    ],
-                ]
-            }
+            choose_buttons = [
+                {"text": button_label_tpl.format(v), "callback_data": f"choose:{take_id}:{v}"}
+                for v in available_variants
+            ]
+            keyboard_rows = [
+                [btn] for btn in choose_buttons
+            ] + [
+                [{"text": "🔁 Все 3 не подходят", "callback_data": f"rescue:reject_set:{take_id}"}],
+            ]
+            keyboard = {"inline_keyboard": keyboard_rows}
             telegram.send_message(
                 status_chat_id,
-                "Выберите лучший вариант:",
+                result_text,
                 reply_markup=keyboard,
             )
-            # Восстанавливаем reply-меню внизу чата (после генерации оно пропадает)
-            telegram.send_message(
-                status_chat_id,
-                "👇 Меню ниже",
-                reply_markup=MAIN_MENU_REPLY,
-            )
-            # Тарифы не шлём сразу после превью — пользователь выбирает вариант; тарифы в «Мой профиль» / «Выбрать пакет»
 
         return {"ok": True, "take_id": take_id, "status": status, "variants": list(results.keys())}
     except Exception:
         logger.exception("generate_take_fatal", extra={"take_id": take_id})
+        generation_failed_total.labels(error_code="unexpected_error", source="take").inc()
         try:
             take = take_svc.get_take(take_id)
             if take and take.status == "generating":
                 take_svc.set_status(take, "failed", error_code="unexpected_error")
                 _refund_free_take_on_failure(db, take, "unexpected_error")
+                takes_failed_total.inc()
                 db.commit()
         except Exception:
             pass

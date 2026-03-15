@@ -1,9 +1,11 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from '@/stores/authStore'
 import { MainLayout } from '@/components/layout/MainLayout'
+import { PaymentsLayout } from '@/components/layout/PaymentsLayout'
 import { LoginPage } from '@/pages/LoginPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { UsersPage } from '@/pages/UsersPage'
+import { UserDetailPage } from '@/pages/UserDetailPage'
 import { JobsPage } from '@/pages/JobsPage'
 import { PacksPage } from '@/pages/PacksPage'
 import { PaymentsPage } from '@/pages/PaymentsPage'
@@ -13,6 +15,7 @@ import { AuditPage } from '@/pages/AuditPage'
 import { TelemetryPage } from '@/pages/TelemetryPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 import { MasterPromptPage } from '@/pages/MasterPromptPage'
+import { PreviewPolicyPage } from '@/pages/PreviewPolicyPage'
 import { TelegramMessagesPage } from '@/pages/TelegramMessagesPage'
 import { BroadcastPage } from '@/pages/BroadcastPage'
 import { CleanupPage } from '@/pages/CleanupPage'
@@ -41,10 +44,15 @@ export default function App() {
         <Route path="/" element={<ProtectedLayout />}>
           <Route index element={<DashboardPage />} />
           <Route path="users" element={<UsersPage />} />
+          <Route path="users/:id" element={<UserDetailPage />} />
           <Route path="jobs" element={<JobsPage />} />
-          <Route path="packs" element={<PacksPage />} />
-          <Route path="payments" element={<PaymentsPage />} />
-          <Route path="bank-transfer" element={<BankTransferPage />} />
+          <Route path="payments" element={<PaymentsLayout />}>
+            <Route index element={<PaymentsPage />} />
+            <Route path="packs" element={<PacksPage />} />
+            <Route path="bank-transfer" element={<BankTransferPage />} />
+          </Route>
+          <Route path="packs" element={<Navigate to="/payments/packs" replace />} />
+          <Route path="bank-transfer" element={<Navigate to="/payments/bank-transfer" replace />} />
           <Route path="security" element={<SecurityPage />} />
           <Route path="audit" element={<AuditPage />} />
           <Route path="telemetry" element={<TelemetryPage />} />
@@ -55,6 +63,7 @@ export default function App() {
           <Route path="copy-style" element={<CopyStylePage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="master-prompt" element={<MasterPromptPage />} />
+          <Route path="preview-policy" element={<PreviewPolicyPage />} />
           <Route path="transfer-policy" element={<Navigate to="/master-prompt" replace />} />
           <Route path="telegram-messages" element={<TelegramMessagesPage />} />
           <Route path="broadcast" element={<BroadcastPage />} />

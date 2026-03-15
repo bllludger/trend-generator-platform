@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import get_db
+from app.utils.metrics import api_health_check_failures_total
 
 
 router = APIRouter()
@@ -22,12 +23,13 @@ def readiness(response: Response, db: Session = Depends(get_db)) -> dict:
     try:
         # Check database
         db.execute(text("SELECT 1"))
-        
+
         # Check Redis
         redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
         redis_client.ping()
-        
+
         return {"status": "ready"}
     except Exception as e:
+        api_health_check_failures_total.inc()
         response.status_code = 503
         return {"status": "not_ready", "error": str(e)}

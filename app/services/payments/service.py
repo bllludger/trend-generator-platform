@@ -9,6 +9,7 @@ PaymentService — безопасная обработка платежей Tele
 """
 import logging
 import secrets
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -17,15 +18,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models.job import Job
 from app.models.pack import Pack
 from app.models.payment import Payment
 from app.models.session import Session as SessionModel
+from app.models.unlock_order import UnlockOrder
 from app.models.take import Take
 from app.models.user import User
 from app.services.audit.service import AuditService
 from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.sessions.service import SessionService
 from app.services.hd_balance.service import HDBalanceService
+from app.utils.metrics import payment_processing_errors_total, pay_refund_total
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +82,7 @@ class PaymentService:
                     emoji="✨",
                     tokens=30,
                     stars_price=115,
-                    description="30 фото без watermark",
+                    description="30 фото без водяного знака",
                     order_index=2,
                     enabled=True,
                 )
@@ -90,8 +94,8 @@ class PaymentService:
                 self.db.flush()
                 logger.info("plus_pack_added", extra={"reason": "missing_in_existing_db"})
             for pid, pname, pemoji, ptokens, pstars, pdesc, pidx in [
-                ("premium", "Premium", "👑", 80, 249, "80 фото без watermark", 4),
-                ("ultra", "Ultra", "🚀", 170, 499, "170 фото без watermark", 5),
+                ("premium", "Premium", "👑", 80, 249, "80 фото без водяного знака", 4),
+                ("ultra", "Ultra", "🚀", 170, 499, "170 фото без водяного знака", 5),
             ]:
                 if self.get_pack(pid) is None:
                     self.db.add(Pack(
@@ -101,9 +105,9 @@ class PaymentService:
                     self.db.flush()
                     logger.info(f"{pid}_pack_added", extra={"reason": "missing_in_existing_db"})
             for pid, pname, pemoji, pstars, pdesc, pidx, ptakes, phd in [
-                ("neo_start", "Neo Start", "🚀", 153, "10 образов + 10 4K без watermark", 1, 10, 10),
-                ("neo_pro", "Neo Pro", "⭐", 538, "40 образов + 40 4K без watermark", 2, 40, 40),
-                ("neo_unlimited", "Neo Unlimited", "👑", 1531, "120 образов + 120 4K без watermark", 3, 120, 120),
+                ("neo_start", "Neo Start", "🚀", 153, "10 фото + 10 4K без водяного знака", 1, 10, 10),
+                ("neo_pro", "Neo Pro", "⭐", 538, "40 фото + 40 4K без водяного знака", 2, 40, 40),
+                ("neo_unlimited", "Neo Unlimited", "👑", 1531, "120 фото + 120 4K без водяного знака", 3, 120, 120),
             ]:
                 if self.get_pack(pid) is None:
                     self.db.add(Pack(
@@ -121,7 +125,7 @@ class PaymentService:
                 emoji="⭐",
                 tokens=5,
                 stars_price=25,
-                description="5 фото без watermark",
+                description="5 фото без водяного знака",
                 order_index=0,
             ),
             Pack(
@@ -130,7 +134,7 @@ class PaymentService:
                 emoji="🌟",
                 tokens=15,
                 stars_price=65,
-                description="15 фото без watermark",
+                description="15 фото без водяного знака",
                 order_index=1,
             ),
             Pack(
@@ -139,7 +143,7 @@ class PaymentService:
                 emoji="✨",
                 tokens=30,
                 stars_price=115,
-                description="30 фото без watermark",
+                description="30 фото без водяного знака",
                 order_index=2,
             ),
             Pack(
@@ -148,7 +152,7 @@ class PaymentService:
                 emoji="💎",
                 tokens=50,
                 stars_price=175,
-                description="50 фото без watermark",
+                description="50 фото без водяного знака",
                 order_index=3,
             ),
             Pack(
@@ -157,7 +161,7 @@ class PaymentService:
                 emoji="👑",
                 tokens=80,
                 stars_price=249,
-                description="80 фото без watermark",
+                description="80 фото без водяного знака",
                 order_index=4,
             ),
             Pack(
@@ -166,7 +170,7 @@ class PaymentService:
                 emoji="🚀",
                 tokens=170,
                 stars_price=499,
-                description="170 фото без watermark",
+                description="170 фото без водяного знака",
                 order_index=5,
             ),
         ]
@@ -235,15 +239,48 @@ class PaymentService:
         return result
 
     def validate_pre_checkout(
-        self, payload: str, telegram_user_id: str
+        self,
+        payload: str,
+        telegram_user_id: str,
+        total_amount: int | None = None,
+        currency: str | None = None,
     ) -> tuple[bool, str]:
         """
         Валидация pre_checkout_query.
         Returns: (ok, error_message)
-        Supports payloads: legacy (pack:...:user:...), session:{pack_id}, upgrade:{pack_id}:{session_id}
+        Supports payloads: yoomoney_session:{pack_id}, session:{pack_id}, upgrade:{pack_id}:{session_id}, legacy (pack:...:user:...)
         """
-        # New session-based payloads
+        # YooMoney native (RUB, amount in kopecks)
+        if payload.startswith("yoomoney_session:"):
+            if currency is not None and currency != "RUB":
+                return False, "Неверная валюта"
+            pack_id = payload.split(":", 1)[1]
+            user = self.db.query(User).filter(User.telegram_id == telegram_user_id).one_or_none()
+            if not user:
+                return False, "Пользователь не найден"
+            if user.is_access_blocked():
+                return False, "Ваш аккаунт заблокирован"
+            if not self._check_rate_limit(telegram_user_id):
+                return False, "Слишком много покупок. Попробуйте позже."
+            pack = self.get_pack(pack_id)
+            if not pack or not pack.enabled:
+                return False, "Пакет недоступен"
+            if pack.is_trial and user.trial_purchased:
+                return False, "Trial уже использован"
+            from app.services.balance_tariffs import DISPLAY_RUB
+            rub = DISPLAY_RUB.get(pack_id)
+            if rub is None:
+                from app.core.config import settings
+                rub = round((pack.stars_price or 0) * getattr(settings, "star_to_rub", 1.3))
+            expected_kopecks = rub * 100
+            if total_amount is not None and total_amount != expected_kopecks:
+                return False, "Неверная сумма платежа"
+            return True, ""
+
+        # New session-based payloads (Stars, XTR)
         if payload.startswith("session:") or payload.startswith("upgrade:"):
+            if currency is not None and currency != "XTR":
+                return False, "Неверная валюта"
             user = self.db.query(User).filter(User.telegram_id == telegram_user_id).one_or_none()
             if not user:
                 return False, "Пользователь не найден"
@@ -252,6 +289,7 @@ class PaymentService:
             if not self._check_rate_limit(telegram_user_id):
                 return False, "Слишком много покупок. Попробуйте позже."
 
+            expected_amount: int | None = None
             if payload.startswith("session:"):
                 pack_id = payload.split(":", 1)[1]
                 pack = self.get_pack(pack_id)
@@ -259,6 +297,7 @@ class PaymentService:
                     return False, "Пакет недоступен"
                 if pack.is_trial and user.trial_purchased:
                     return False, "Trial уже использован"
+                expected_amount = pack.stars_price
             elif payload.startswith("upgrade:"):
                 parts = payload.split(":")
                 if len(parts) != 3:
@@ -270,7 +309,12 @@ class PaymentService:
                 old_session = self.db.query(SessionModel).filter(SessionModel.id == old_session_id).one_or_none()
                 if not old_session or old_session.user_id != user.id:
                     return False, "Сессия не найдена"
+                old_pack = self.get_pack(old_session.pack_id)
+                old_price = old_pack.stars_price if old_pack else 0
+                expected_amount = max(0, (pack.stars_price or 0) - old_price)
 
+            if total_amount is not None and expected_amount is not None and total_amount != expected_amount:
+                return False, "Неверная сумма платежа"
             return True, ""
 
         # Legacy payloads
@@ -289,7 +333,16 @@ class PaymentService:
             return False, "Ваш аккаунт заблокирован"
 
         pack_id = parsed["pack_id"]
-        if pack_id != "unlock":
+        if pack_id == "unlock":
+            job_id = parsed.get("job_id")
+            if not job_id:
+                return False, "Некорректный payload"
+            job = self.db.query(Job).filter(Job.job_id == job_id).one_or_none()
+            if not job or job.user_id != user.id:
+                return False, "Фото не найдено"
+            if getattr(job, "unlocked_at", None) or self.has_unlock_payment_for_job(job_id):
+                return False, "Фото уже разблокировано"
+        else:
             pack = self.get_pack(pack_id)
             if not pack or not pack.enabled:
                 return False, "Пакет недоступен"
@@ -297,6 +350,16 @@ class PaymentService:
         if not self._check_rate_limit(telegram_user_id):
             return False, "Слишком много покупок. Попробуйте позже."
 
+        if total_amount is not None:
+            if pack_id == "unlock":
+                from app.paywall.config import get_unlock_cost_stars
+                expected_amount = get_unlock_cost_stars()
+            else:
+                expected_amount = pack.stars_price
+            if total_amount != expected_amount:
+                return False, "Неверная сумма платежа"
+        if currency is not None and currency != "XTR":
+            return False, "Неверная валюта"
         return True, ""
 
     # ------------------------------------------------------------------
@@ -340,6 +403,7 @@ class PaymentService:
             )
             if not user:
                 logger.error("payment_user_not_found", extra={"tg_id": telegram_user_id})
+                payment_processing_errors_total.labels(reason="user_not_found").inc()
                 return None
 
             # Начисляем токены
@@ -375,6 +439,7 @@ class PaymentService:
             return payment
         except IntegrityError:
             self.db.rollback()
+            payment_processing_errors_total.labels(reason="duplicate").inc()
             logger.warning(
                 "payment_duplicate",
                 extra={"charge_id": telegram_payment_charge_id},
@@ -396,7 +461,12 @@ class PaymentService:
         
         Telegram API refundStarPayment должен быть вызван ОТДЕЛЬНО перед этим.
         """
-        payment = self.db.query(Payment).filter(Payment.id == payment_id).one_or_none()
+        payment = (
+            self.db.query(Payment)
+            .filter(Payment.id == payment_id)
+            .with_for_update()
+            .one_or_none()
+        )
         if not payment:
             return False, "Платёж не найден", None
         if payment.status == "refunded":
@@ -410,6 +480,27 @@ class PaymentService:
         )
         if not user:
             return False, "Пользователь не найден", payment
+
+        # Session-платёж: закрыть сессию и списать HD в пределах возможного
+        if payment.session_id:
+            session = (
+                self.db.query(SessionModel)
+                .filter(SessionModel.id == payment.session_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if session:
+                session.status = "refunded"
+                self.db.add(session)
+            pack = self.get_pack(payment.pack_id)
+            if pack and (pack.hd_amount or 0) > 0:
+                hd_svc = HDBalanceService(self.db)
+                hd_deducted = hd_svc.debit(user, pack.hd_amount or 0)
+                logger.info(
+                    "refund_hd_deducted",
+                    extra={"payment_id": payment_id, "user_id": user.id, "hd_deducted": hd_deducted},
+                )
+            self.db.flush()
 
         # Списываем токены (не ниже 0)
         deduction = min(payment.tokens_granted, user.token_balance)
@@ -429,6 +520,7 @@ class PaymentService:
         except Exception:
             logger.exception("referral_revoke_on_refund_error", extra={"payment_id": payment_id})
 
+        pay_refund_total.labels(reason="refund").inc()
         logger.info(
             "payment_refunded",
             extra={
@@ -462,6 +554,67 @@ class PaymentService:
             tokens_granted=tokens_granted,
             payload=f"bank_transfer:{reference}",
         )
+
+    def record_yookassa_unlock_payment(self, order: UnlockOrder) -> Payment | None:
+        """
+        Записать в payments успешную оплату разблокировки по ЮKassa (централизация).
+        Идемпотентно по charge_id = "yookassa_unlock:{yookassa_payment_id}".
+        Вызывать из вебхука после mark_paid заказа.
+        """
+        if not order.yookassa_payment_id:
+            return None
+        charge_id = f"yookassa_unlock:{order.yookassa_payment_id}"
+        existing = (
+            self.db.query(Payment)
+            .filter(Payment.telegram_payment_charge_id == charge_id)
+            .one_or_none()
+        )
+        if existing:
+            return existing
+        user = (
+            self.db.query(User)
+            .filter(User.telegram_id == order.telegram_user_id)
+            .one_or_none()
+        )
+        if not user:
+            logger.warning(
+                "record_yookassa_unlock_user_not_found",
+                extra={"order_id": order.id, "telegram_user_id": order.telegram_user_id},
+            )
+            return None
+        try:
+            payment = Payment(
+                user_id=user.id,
+                telegram_payment_charge_id=charge_id,
+                provider_payment_charge_id=order.yookassa_payment_id,
+                pack_id="unlock",
+                stars_amount=0,
+                amount_kopecks=order.amount_kopecks,
+                tokens_granted=0,
+                status="completed",
+                payload=f"yookassa_unlock:{order.yookassa_payment_id}",
+                job_id=order.take_id,
+                session_id=None,
+            )
+            self.db.add(payment)
+            self.db.flush()
+        except IntegrityError:
+            self.db.rollback()
+            logger.warning(
+                "record_yookassa_unlock_duplicate",
+                extra={"order_id": order.id, "charge_id": charge_id},
+            )
+            raise
+        logger.info(
+            "yookassa_unlock_payment_recorded",
+            extra={
+                "payment_id": payment.id,
+                "order_id": order.id,
+                "user_id": user.id,
+                "amount_kopecks": order.amount_kopecks,
+            },
+        )
+        return payment
 
     def record_unlock_tokens(
         self, user_id: str, job_id: str, tokens_spent: int
@@ -513,6 +666,20 @@ class PaymentService:
             .one_or_none()
         )
 
+    def has_unlock_payment_for_job(self, job_id: str) -> bool:
+        """Есть ли успешный платёж за разблокировку этого job (защита от повторной оплаты)."""
+        return (
+            self.db.query(Payment.id)
+            .filter(
+                Payment.pack_id == "unlock",
+                Payment.job_id == job_id,
+                Payment.status == "completed",
+            )
+            .limit(1)
+            .first()
+            is not None
+        )
+
     # ------------------------------------------------------------------
     # Session-based purchases
     # ------------------------------------------------------------------
@@ -525,10 +692,11 @@ class PaymentService:
         pack_id: str,
         stars_amount: int,
         payload: str,
-    ) -> tuple[Payment | None, SessionModel | None]:
+    ) -> tuple[Payment | None, SessionModel | None, str | None, int]:
         """
         Process session pack purchase: create Session, credit HD to user, record Payment.
         Attaches free Take (from pre-session) to the new session if exists.
+        Returns (payment, session, None, attached_free_takes) on success; (None, None, "trial_already_used", 0) when trial was already used (caller must refund).
         """
         existing = (
             self.db.query(Payment)
@@ -536,7 +704,7 @@ class PaymentService:
             .one_or_none()
         )
         if existing:
-            return existing, None
+            return existing, None, None, 0
 
         try:
             user = (
@@ -546,11 +714,26 @@ class PaymentService:
                 .one_or_none()
             )
             if not user:
-                return None, None
+                return None, None, None, 0
 
             pack = self.get_pack(pack_id)
             if not pack:
-                return None, None
+                return None, None, None, 0
+
+            # Trial: claim trial_purchased before creating session, to avoid charging without delivery on race
+            if pack.is_trial:
+                from sqlalchemy import update as sa_update
+                res = self.db.execute(
+                    sa_update(User)
+                    .where(User.id == user.id, (User.trial_purchased == False) | (User.trial_purchased == None))
+                    .values(trial_purchased=True)
+                )
+                if res.rowcount == 0:
+                    logger.warning(
+                        "trial_already_used_on_payment",
+                        extra={"telegram_user_id": telegram_user_id, "charge_id": telegram_payment_charge_id},
+                    )
+                    return None, None, "trial_already_used", 0
 
             session_svc = SessionService(self.db)
             hd_svc = HDBalanceService(self.db)
@@ -584,17 +767,8 @@ class PaymentService:
                 session = session_svc.create_session(user.id, pack_id)
             hd_svc.credit_paid(user, pack.hd_amount or 0)
 
-            if pack.is_trial:
-                from sqlalchemy import update as sa_update
-                res = self.db.execute(
-                    sa_update(User)
-                    .where(User.id == user.id, (User.trial_purchased == False) | (User.trial_purchased == None))
-                    .values(trial_purchased=True)
-                )
-                if res.rowcount == 0:
-                    raise ValueError("Trial уже использован (race condition guard)")
-
             # Attach free Take from pre-session
+            attached_free_takes = 0
             free_session = (
                 self.db.query(SessionModel)
                 .filter(
@@ -606,9 +780,10 @@ class PaymentService:
             )
             if free_session:
                 free_takes = self.db.query(Take).filter(Take.session_id == free_session.id).all()
+                attached_free_takes = len(free_takes)
                 for take in free_takes:
                     session_svc.attach_take_to_session(take, session)
-                session.takes_used = min(len(free_takes), session.takes_limit)
+                session.takes_used = min(attached_free_takes, session.takes_limit)
                 free_session.status = "completed"
                 self.db.add(free_session)
                 self.db.add(session)
@@ -636,14 +811,555 @@ class PaymentService:
                     "hd_credited": pack.hd_amount,
                 },
             )
-            return payment, session
+            return payment, session, None, attached_free_takes
         except IntegrityError:
             self.db.rollback()
-            return (
+            logger.warning(
+                "session_purchase_race",
+                extra={"charge_id": telegram_payment_charge_id},
+            )
+            time.sleep(0.15)
+            existing = (
                 self.db.query(Payment)
                 .filter(Payment.telegram_payment_charge_id == telegram_payment_charge_id)
                 .one_or_none()
-            ), None
+            )
+            session = None
+            if existing and existing.session_id:
+                session = (
+                    self.db.query(SessionModel)
+                    .filter(SessionModel.id == existing.session_id)
+                    .one_or_none()
+                )
+            return (existing, session, None, 0)
+
+    def grant_session_pack_admin(
+        self,
+        telegram_user_id: str,
+        pack_id: str,
+        reference: str,
+    ) -> tuple[Payment | None, SessionModel | None, str | None]:
+        """
+        Ручная выдача session-pack админом (без реального платежа).
+        Returns (payment, session, None) on success; (None, None, "trial_already_used") if trial already used.
+        """
+        user = (
+            self.db.query(User)
+            .filter(User.telegram_id == telegram_user_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        if not user:
+            return None, None, None
+        pack = self.get_pack(pack_id)
+        if not pack:
+            return None, None, None
+        if pack.is_trial:
+            from sqlalchemy import update as sa_update
+            res = self.db.execute(
+                sa_update(User)
+                .where(User.id == user.id, (User.trial_purchased == False) | (User.trial_purchased == None))
+                .values(trial_purchased=True)
+            )
+            if res.rowcount == 0:
+                return None, None, "trial_already_used"
+        session_svc = SessionService(self.db)
+        hd_svc = HDBalanceService(self.db)
+        if getattr(pack, "pack_subtype", "standalone") == "collection":
+            if not pack.playlist or not isinstance(pack.playlist, list) or len(pack.playlist) == 0:
+                raise ValueError(f"Collection pack {pack_id} has no playlist")
+            session = session_svc.create_collection_session(user.id, pack)
+        else:
+            session = session_svc.create_session(user.id, pack_id)
+        hd_svc.credit_paid(user, pack.hd_amount or 0)
+        charge_id = f"admin_manual:{reference}"
+        payload = f"admin_manual:{reference}"
+        payment = Payment(
+            user_id=user.id,
+            telegram_payment_charge_id=charge_id,
+            provider_payment_charge_id=None,
+            pack_id=pack_id,
+            stars_amount=0,
+            tokens_granted=0,
+            status="completed",
+            payload=payload,
+            session_id=session.id,
+        )
+        self.db.add(payment)
+        self.db.flush()
+        logger.info(
+            "admin_grant_session_pack",
+            extra={"user_id": user.id, "pack_id": pack_id, "session_id": session.id},
+        )
+        return payment, session, None
+
+    def process_session_purchase_yoomoney(
+        self,
+        telegram_user_id: str,
+        provider_payment_charge_id: str,
+        pack_id: str,
+        amount_kopecks: int,
+        payload: str,
+    ) -> tuple[Payment | None, SessionModel | None, str | None, int]:
+        """
+        Обработка успешной оплаты через ЮMoney (нативная интеграция).
+        charge_id в Payment = "yoomoney:{provider_payment_charge_id}".
+        Returns (payment, session, None, attached_free_takes) on success; (None, None, "trial_already_used", 0) when trial was already used (caller must handle refund via YooKassa if needed).
+        """
+        charge_id = f"yoomoney:{provider_payment_charge_id}"
+        existing = (
+            self.db.query(Payment)
+            .filter(Payment.telegram_payment_charge_id == charge_id)
+            .one_or_none()
+        )
+        if existing:
+            session = (
+                self.db.query(SessionModel).filter(SessionModel.id == existing.session_id).one_or_none()
+                if existing.session_id else None
+            )
+            return existing, session, None, 0
+
+        try:
+            user = (
+                self.db.query(User)
+                .filter(User.telegram_id == telegram_user_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if not user:
+                return None, None, None, 0
+
+            pack = self.get_pack(pack_id)
+            if not pack:
+                return None, None, None, 0
+
+            if pack.is_trial:
+                from sqlalchemy import update as sa_update
+                res = self.db.execute(
+                    sa_update(User)
+                    .where(User.id == user.id, (User.trial_purchased == False) | (User.trial_purchased == None))
+                    .values(trial_purchased=True)
+                )
+                if res.rowcount == 0:
+                    logger.warning(
+                        "trial_already_used_on_payment",
+                        extra={"telegram_user_id": telegram_user_id, "charge_id": charge_id},
+                    )
+                    return None, None, "trial_already_used", 0
+
+            session_svc = SessionService(self.db)
+            hd_svc = HDBalanceService(self.db)
+
+            if getattr(pack, "pack_subtype", "standalone") == "collection":
+                if not pack.playlist or not isinstance(pack.playlist, list) or len(pack.playlist) == 0:
+                    raise ValueError(f"Collection pack {pack_id} has no playlist — cannot sell")
+                session = session_svc.create_collection_session(user.id, pack)
+                audit = AuditService(self.db)
+                audit.log(
+                    actor_type="system",
+                    actor_id="payment",
+                    action="collection_start",
+                    entity_type="session",
+                    entity_id=session.id,
+                    payload={
+                        "pack_id": pack_id,
+                        "collection_run_id": session.collection_run_id,
+                    },
+                )
+                try:
+                    ProductAnalyticsService(self.db).track(
+                        "collection_started",
+                        user.id,
+                        session_id=session.id,
+                        pack_id=pack_id,
+                    )
+                except Exception as e:
+                    logger.warning("product_analytics track(collection_started) failed: %s", e)
+            else:
+                session = session_svc.create_session(user.id, pack_id)
+            hd_svc.credit_paid(user, pack.hd_amount or 0)
+
+            attached_free_takes = 0
+            free_session = (
+                self.db.query(SessionModel)
+                .filter(
+                    SessionModel.user_id == user.id,
+                    SessionModel.pack_id == "free_preview",
+                    SessionModel.status == "active",
+                )
+                .first()
+            )
+            if free_session:
+                free_takes = self.db.query(Take).filter(Take.session_id == free_session.id).all()
+                attached_free_takes = len(free_takes)
+                for take in free_takes:
+                    session_svc.attach_take_to_session(take, session)
+                session.takes_used = min(attached_free_takes, session.takes_limit)
+                free_session.status = "completed"
+                self.db.add(free_session)
+                self.db.add(session)
+
+            payment = Payment(
+                user_id=user.id,
+                telegram_payment_charge_id=charge_id,
+                provider_payment_charge_id=provider_payment_charge_id,
+                pack_id=pack_id,
+                stars_amount=0,
+                amount_kopecks=amount_kopecks,
+                tokens_granted=0,
+                status="completed",
+                payload=payload,
+                session_id=session.id,
+            )
+            self.db.add(payment)
+            self.db.flush()
+
+            logger.info(
+                "session_purchase_yoomoney_completed",
+                extra={
+                    "user_id": user.id,
+                    "pack_id": pack_id,
+                    "session_id": session.id,
+                    "hd_credited": pack.hd_amount,
+                    "amount_kopecks": amount_kopecks,
+                },
+            )
+            return payment, session, None, attached_free_takes
+        except IntegrityError:
+            self.db.rollback()
+            logger.warning(
+                "session_purchase_yoomoney_race",
+                extra={"charge_id": charge_id},
+            )
+            time.sleep(0.15)
+            existing = (
+                self.db.query(Payment)
+                .filter(Payment.telegram_payment_charge_id == charge_id)
+                .one_or_none()
+            )
+            session = None
+            if existing and existing.session_id:
+                session = (
+                    self.db.query(SessionModel)
+                    .filter(SessionModel.id == existing.session_id)
+                    .one_or_none()
+                )
+            return (existing, session, None, 0)
+
+    def process_session_purchase_yookassa_link(
+        self,
+        telegram_user_id: str,
+        pack_id: str,
+        yookassa_payment_id: str,
+        amount_kopecks: int,
+    ) -> tuple[Payment | None, SessionModel | None, str | None, int]:
+        """
+        Обработка успешной оплаты пакета по ссылке ЮKassa (redirect).
+        charge_id = "yookassa_link:{yookassa_payment_id}" для идемпотентности (webhook и pack_check вызывают один раз).
+        Returns (payment, session, None, attached_free_takes) on success; (existing, session, None, 0) if already processed.
+        """
+        charge_id = f"yookassa_link:{yookassa_payment_id}"
+        existing = (
+            self.db.query(Payment)
+            .filter(Payment.telegram_payment_charge_id == charge_id)
+            .one_or_none()
+        )
+        if existing:
+            session = (
+                self.db.query(SessionModel).filter(SessionModel.id == existing.session_id).one_or_none()
+                if existing.session_id else None
+            )
+            return existing, session, None, 0
+
+        try:
+            user = (
+                self.db.query(User)
+                .filter(User.telegram_id == telegram_user_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if not user:
+                return None, None, None, 0
+
+            pack = self.get_pack(pack_id)
+            if not pack:
+                return None, None, None, 0
+
+            if pack.is_trial:
+                from sqlalchemy import update as sa_update
+                res = self.db.execute(
+                    sa_update(User)
+                    .where(User.id == user.id, (User.trial_purchased == False) | (User.trial_purchased == None))
+                    .values(trial_purchased=True)
+                )
+                if res.rowcount == 0:
+                    logger.warning(
+                        "session_purchase_yookassa_link_trial_already_used",
+                        extra={"telegram_user_id": telegram_user_id, "charge_id": charge_id},
+                    )
+                    return None, None, "trial_already_used", 0
+
+            session_svc = SessionService(self.db)
+            hd_svc = HDBalanceService(self.db)
+
+            if getattr(pack, "pack_subtype", "standalone") == "collection":
+                if not pack.playlist or not isinstance(pack.playlist, list) or len(pack.playlist) == 0:
+                    raise ValueError(f"Collection pack {pack_id} has no playlist — cannot sell")
+                session = session_svc.create_collection_session(user.id, pack)
+                audit = AuditService(self.db)
+                audit.log(
+                    actor_type="system",
+                    actor_id="payment",
+                    action="collection_start",
+                    entity_type="session",
+                    entity_id=session.id,
+                    payload={
+                        "pack_id": pack_id,
+                        "collection_run_id": session.collection_run_id,
+                    },
+                )
+                try:
+                    ProductAnalyticsService(self.db).track(
+                        "collection_started",
+                        user.id,
+                        session_id=session.id,
+                        pack_id=pack_id,
+                    )
+                except Exception as e:
+                    logger.warning("product_analytics track(collection_started) failed: %s", e)
+            else:
+                session = session_svc.create_session(user.id, pack_id)
+            hd_svc.credit_paid(user, pack.hd_amount or 0)
+
+            attached_free_takes = 0
+            free_session = (
+                self.db.query(SessionModel)
+                .filter(
+                    SessionModel.user_id == user.id,
+                    SessionModel.pack_id == "free_preview",
+                    SessionModel.status == "active",
+                )
+                .first()
+            )
+            if free_session:
+                free_takes = self.db.query(Take).filter(Take.session_id == free_session.id).all()
+                attached_free_takes = len(free_takes)
+                for take in free_takes:
+                    session_svc.attach_take_to_session(take, session)
+                session.takes_used = min(attached_free_takes, session.takes_limit)
+                free_session.status = "completed"
+                self.db.add(free_session)
+                self.db.add(session)
+
+            payload = f"yookassa_link_pack:{pack_id}:{yookassa_payment_id}"
+            payment = Payment(
+                user_id=user.id,
+                telegram_payment_charge_id=charge_id,
+                provider_payment_charge_id=yookassa_payment_id,
+                pack_id=pack_id,
+                stars_amount=0,
+                amount_kopecks=amount_kopecks,
+                tokens_granted=0,
+                status="completed",
+                payload=payload,
+                session_id=session.id,
+            )
+            self.db.add(payment)
+            self.db.flush()
+
+            logger.info(
+                "session_purchase_yookassa_link_completed",
+                extra={
+                    "user_id": user.id,
+                    "pack_id": pack_id,
+                    "session_id": session.id,
+                    "hd_credited": pack.hd_amount,
+                    "amount_kopecks": amount_kopecks,
+                },
+            )
+            return payment, session, None, attached_free_takes
+        except IntegrityError:
+            self.db.rollback()
+            logger.warning(
+                "session_purchase_yookassa_link_race",
+                extra={"charge_id": charge_id},
+            )
+            time.sleep(0.15)
+            existing = (
+                self.db.query(Payment)
+                .filter(Payment.telegram_payment_charge_id == charge_id)
+                .one_or_none()
+            )
+            session = None
+            if existing and existing.session_id:
+                session = (
+                    self.db.query(SessionModel)
+                    .filter(SessionModel.id == existing.session_id)
+                    .one_or_none()
+                )
+            return (existing, session, None, 0)
+
+    def process_session_purchase_bank_transfer(
+        self,
+        telegram_user_id: str,
+        pack_id: str,
+        amount_rub: float,
+        reference: str,
+    ) -> tuple[Payment | None, SessionModel | None, str | None, int]:
+        """
+        Обработка успешной оплаты переводом на карту для пакетов из продуктовой лестницы.
+        Создаёт Session, начисляет HD, записывает Payment (charge_id = bank_transfer:{reference}).
+        Returns (payment, session, None, attached_free_takes) on success; (None, None, "trial_already_used", 0) when trial already used.
+        """
+        charge_id = f"bank_transfer:{reference}"
+        existing = (
+            self.db.query(Payment)
+            .filter(Payment.telegram_payment_charge_id == charge_id)
+            .one_or_none()
+        )
+        if existing:
+            session = (
+                self.db.query(SessionModel).filter(SessionModel.id == existing.session_id).one_or_none()
+                if existing.session_id else None
+            )
+            return existing, session, None, 0
+
+        try:
+            user = (
+                self.db.query(User)
+                .filter(User.telegram_id == telegram_user_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if not user:
+                return None, None, None, 0
+
+            pack = self.get_pack(pack_id)
+            if not pack:
+                return None, None, None, 0
+
+            if pack.is_trial:
+                from sqlalchemy import update as sa_update
+                res = self.db.execute(
+                    sa_update(User)
+                    .where(User.id == user.id, (User.trial_purchased == False) | (User.trial_purchased == None))
+                    .values(trial_purchased=True)
+                )
+                if res.rowcount == 0:
+                    logger.warning(
+                        "trial_already_used_on_bank_transfer",
+                        extra={"telegram_user_id": telegram_user_id, "charge_id": charge_id},
+                    )
+                    return None, None, "trial_already_used", 0
+
+            session_svc = SessionService(self.db)
+            hd_svc = HDBalanceService(self.db)
+
+            if getattr(pack, "pack_subtype", "standalone") == "collection":
+                if not pack.playlist or not isinstance(pack.playlist, list) or len(pack.playlist) == 0:
+                    raise ValueError(f"Collection pack {pack_id} has no playlist — cannot sell")
+                session = session_svc.create_collection_session(user.id, pack)
+                audit = AuditService(self.db)
+                audit.log(
+                    actor_type="system",
+                    actor_id="payment",
+                    action="collection_start",
+                    entity_type="session",
+                    entity_id=session.id,
+                    payload={
+                        "pack_id": pack_id,
+                        "collection_run_id": session.collection_run_id,
+                    },
+                )
+                try:
+                    ProductAnalyticsService(self.db).track(
+                        "collection_started",
+                        user.id,
+                        session_id=session.id,
+                        pack_id=pack_id,
+                    )
+                except Exception as e:
+                    logger.warning("product_analytics track(collection_started) failed: %s", e)
+            else:
+                session = session_svc.create_session(user.id, pack_id)
+            hd_svc.credit_paid(user, pack.hd_amount or 0)
+
+            attached_free_takes = 0
+            free_session = (
+                self.db.query(SessionModel)
+                .filter(
+                    SessionModel.user_id == user.id,
+                    SessionModel.pack_id == "free_preview",
+                    SessionModel.status == "active",
+                )
+                .first()
+            )
+            if free_session:
+                free_takes = self.db.query(Take).filter(Take.session_id == free_session.id).all()
+                attached_free_takes = len(free_takes)
+                for take in free_takes:
+                    session_svc.attach_take_to_session(take, session)
+                session.takes_used = min(attached_free_takes, session.takes_limit)
+                free_session.status = "completed"
+                self.db.add(free_session)
+                self.db.add(session)
+
+            amount_kopecks = int(round(amount_rub * 100))
+            payment = Payment(
+                user_id=user.id,
+                telegram_payment_charge_id=charge_id,
+                provider_payment_charge_id=None,
+                pack_id=pack_id,
+                stars_amount=0,
+                amount_kopecks=amount_kopecks,
+                tokens_granted=0,
+                status="completed",
+                payload=charge_id,
+                session_id=session.id,
+            )
+            self.db.add(payment)
+            self.db.flush()
+
+            logger.info(
+                "session_purchase_bank_transfer_completed",
+                extra={
+                    "user_id": user.id,
+                    "pack_id": pack_id,
+                    "session_id": session.id,
+                    "hd_credited": pack.hd_amount,
+                    "amount_rub": amount_rub,
+                },
+            )
+            try:
+                ProductAnalyticsService(self.db).track(
+                    "pay_success",
+                    user.id,
+                    pack_id=pack_id,
+                    properties={"method": "bank_transfer", "price": 0, "price_rub": amount_rub},
+                )
+            except Exception as e:
+                logger.warning("product_analytics track(pay_success bank_transfer) failed: %s", e)
+            return payment, session, None, attached_free_takes
+        except IntegrityError:
+            self.db.rollback()
+            logger.warning(
+                "session_purchase_bank_transfer_race",
+                extra={"charge_id": charge_id},
+            )
+            time.sleep(0.15)
+            existing = (
+                self.db.query(Payment)
+                .filter(Payment.telegram_payment_charge_id == charge_id)
+                .one_or_none()
+            )
+            session = None
+            if existing and existing.session_id:
+                session = (
+                    self.db.query(SessionModel)
+                    .filter(SessionModel.id == existing.session_id)
+                    .one_or_none()
+                )
+            return (existing, session, None, 0)
 
     def process_session_upgrade(
         self,
@@ -719,18 +1435,31 @@ class PaymentService:
             return payment, new_session
         except IntegrityError:
             self.db.rollback()
-            return (
+            logger.warning(
+                "session_upgrade_race",
+                extra={"charge_id": telegram_payment_charge_id},
+            )
+            time.sleep(0.15)
+            existing = (
                 self.db.query(Payment)
                 .filter(Payment.telegram_payment_charge_id == telegram_payment_charge_id)
                 .one_or_none()
-            ), None
+            )
+            new_session = None
+            if existing and existing.session_id:
+                new_session = (
+                    self.db.query(SessionModel)
+                    .filter(SessionModel.id == existing.session_id)
+                    .one_or_none()
+                )
+            return (existing, new_session)
 
     # ------------------------------------------------------------------
     # Rate-limit (Redis — общий для всех воркеров/реплик бота)
     # ------------------------------------------------------------------
 
     def _check_rate_limit(self, telegram_user_id: str) -> bool:
-        """Не более PURCHASE_RATE_LIMIT покупок за PURCHASE_RATE_WINDOW сек. Работает при нескольких репликах бота."""
+        """Не более PURCHASE_RATE_LIMIT покупок за PURCHASE_RATE_WINDOW сек. Fail closed при недоступности Redis."""
         key = f"purchase_rate:{telegram_user_id}"
         try:
             current = self._redis.incr(key)
@@ -739,4 +1468,4 @@ class PaymentService:
             return current <= PURCHASE_RATE_LIMIT
         except redis.RedisError as e:
             logger.warning("purchase_rate_limit_redis_error", extra={"error": str(e)})
-            return True  # fail open: при недоступности Redis разрешаем покупку
+            return False  # fail closed: при недоступности Redis отклоняем покупку

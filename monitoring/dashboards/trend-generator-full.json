@@ -1,0 +1,489 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": [],
+      "title": "Обзор (ключевые метрики)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "sum(rate(http_requests_total[5m]))", "refId": "A" }],
+      "title": "HTTP RPS",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "celery_queue_length{queue=\"generation\"}", "refId": "A" }],
+      "title": "Очередь Celery (generation)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "sum(rate(pay_success_total[5m]))", "refId": "A" }],
+      "title": "Оплаты успешные (5m)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.01 }] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "sum(rate(generation_failed_total[5m]))", "refId": "A" }],
+      "title": "Генерация failed (5m)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 5,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "sum(circuit_breaker_state)", "refId": "A" }],
+      "title": "Circuit breaker (open=1)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "id": 6,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "api_health_check_failures_total", "refId": "A" }],
+      "title": "Health check failures",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 101,
+      "panels": [],
+      "title": "Инфраструктура (Node, Redis, Postgres)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 6 },
+      "id": 10,
+      "targets": [{ "expr": "1 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) or vector(0))", "legendFormat": "CPU used", "refId": "A" }],
+      "title": "CPU (node)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "min": 0 }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 6 },
+      "id": 11,
+      "targets": [{ "expr": "node_memory_MemAvailable_bytes", "legendFormat": "Available", "refId": "A" }],
+      "title": "Память доступная (node)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "min": 0 }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 6 },
+      "id": 12,
+      "targets": [{ "expr": "node_filesystem_avail_bytes{mountpoint=\"/\"}", "legendFormat": "root", "refId": "A" }, { "expr": "node_filesystem_avail_bytes{mountpoint=~\"/data.*\"}", "legendFormat": "data", "refId": "B" }],
+      "title": "Диск свободно (node)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 6 },
+      "id": 13,
+      "targets": [{ "expr": "redis_connected_clients", "legendFormat": "clients", "refId": "A" }],
+      "title": "Redis: подключения",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 11 },
+      "id": 14,
+      "targets": [{ "expr": "redis_memory_used_bytes", "legendFormat": "used", "refId": "A" }],
+      "title": "Redis: память",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 11 },
+      "id": 15,
+      "targets": [{ "expr": "sum(rate(redis_keyspace_hits_total[5m])) / (sum(rate(redis_keyspace_hits_total[5m])) + sum(rate(redis_keyspace_misses_total[5m])))", "legendFormat": "hit rate", "refId": "A" }],
+      "title": "Redis: hit rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 11 },
+      "id": 16,
+      "targets": [{ "expr": "pg_stat_database_numbackends", "legendFormat": "backends", "refId": "A" }],
+      "title": "Postgres: соединения",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 11 },
+      "id": 17,
+      "targets": [{ "expr": "rate(pg_stat_database_xact_commit[5m])", "legendFormat": "commit", "refId": "A" }, { "expr": "rate(pg_stat_database_xact_rollback[5m])", "legendFormat": "rollback", "refId": "B" }],
+      "title": "Postgres: commit/rollback rate",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 },
+      "id": 102,
+      "panels": [],
+      "title": "API и HTTP",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "id": 20,
+      "targets": [{ "expr": "sum(rate(http_requests_total[5m])) by (path, status)", "legendFormat": "{{path}} {{status}}", "refId": "A" }],
+      "title": "HTTP запросы по path и status",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "id": 21,
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, path))", "legendFormat": "p95 {{path}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, path))", "legendFormat": "p50 {{path}}", "refId": "B" }
+      ],
+      "title": "HTTP latency (p50, p95)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 },
+      "id": 103,
+      "panels": [],
+      "title": "Очереди и воркеры",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 26 },
+      "id": 30,
+      "targets": [{ "expr": "celery_queue_length", "legendFormat": "{{queue}}", "refId": "A" }],
+      "title": "Длина очереди Celery",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 26 },
+      "id": 31,
+      "targets": [{ "expr": "celery_active_tasks", "legendFormat": "{{task_name}}", "refId": "A" }],
+      "title": "Активные задачи Celery",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "id": 104,
+      "panels": [],
+      "title": "Генерация (Takes, Jobs, Image, HD)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 33 },
+      "id": 40,
+      "targets": [
+        { "expr": "rate(takes_created_total[5m])", "legendFormat": "created", "refId": "A" },
+        { "expr": "rate(takes_completed_total[5m])", "legendFormat": "completed", "refId": "B" },
+        { "expr": "rate(takes_failed_total[5m])", "legendFormat": "failed", "refId": "C" }
+      ],
+      "title": "Takes (created/completed/failed)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 33 },
+      "id": 41,
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(take_generation_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95", "refId": "A" }, { "expr": "histogram_quantile(0.50, sum(rate(take_generation_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50", "refId": "B" }],
+      "title": "Take generation duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 33 },
+      "id": 42,
+      "targets": [
+        { "expr": "rate(jobs_created_total[5m])", "legendFormat": "created", "refId": "A" },
+        { "expr": "rate(jobs_succeeded_total[5m])", "legendFormat": "succeeded", "refId": "B" },
+        { "expr": "rate(jobs_failed_total[5m])", "legendFormat": "failed", "refId": "C" }
+      ],
+      "title": "Jobs (created/succeeded/failed)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 33 },
+      "id": 43,
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(image_generation_duration_seconds_bucket[5m])) by (le, provider))", "legendFormat": "p95 {{provider}}", "refId": "A" }
+      ],
+      "title": "Image generation duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 39 },
+      "id": 44,
+      "targets": [{ "expr": "sum(rate(image_generation_requests_total[5m])) by (provider, status)", "legendFormat": "{{provider}} {{status}}", "refId": "A" }],
+      "title": "Image generation requests (provider, status)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 39 },
+      "id": 45,
+      "targets": [
+        { "expr": "rate(favorites_hd_delivery_total[5m])", "legendFormat": "{{outcome}}", "refId": "A" },
+        { "expr": "increase(favorites_hd_stuck_rendering_reset_total[1h])", "legendFormat": "stuck reset 1h", "refId": "B" }
+      ],
+      "title": "HD доставка и stuck reset",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 },
+      "id": 105,
+      "panels": [],
+      "title": "Платежи",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 46 },
+      "id": 50,
+      "targets": [
+        { "expr": "sum(rate(pay_initiated_total[5m])) by (pack_id)", "legendFormat": "initiated {{pack_id}}", "refId": "A" },
+        { "expr": "sum(rate(pay_success_total[5m])) by (pack_id, payment_method)", "legendFormat": "success {{pack_id}} {{payment_method}}", "refId": "B" }
+      ],
+      "title": "Pay initiated / success",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 46 },
+      "id": 51,
+      "targets": [
+        { "expr": "sum(rate(pay_pre_checkout_rejected_total[5m])) by (reason)", "legendFormat": "rejected {{reason}}", "refId": "A" },
+        { "expr": "sum(rate(payment_processing_errors_total[5m])) by (reason)", "legendFormat": "error {{reason}}", "refId": "B" }
+      ],
+      "title": "Rejected / processing errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 46 },
+      "id": 52,
+      "targets": [
+        { "expr": "sum(rate(payment_amount_stars_total[5m])) by (pack_id)", "legendFormat": "stars {{pack_id}}", "refId": "A" },
+        { "expr": "sum(rate(pay_refund_total[5m])) by (reason)", "legendFormat": "refund {{reason}}", "refId": "B" }
+      ],
+      "title": "Stars и refunds",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
+      "id": 106,
+      "panels": [],
+      "title": "Воронка и пользовательский флоу",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 53 },
+      "id": 60,
+      "targets": [
+        { "expr": "rate(bot_started_total[5m])", "legendFormat": "bot_started", "refId": "A" },
+        { "expr": "rate(photo_uploaded_total[5m])", "legendFormat": "photo_uploaded", "refId": "B" },
+        { "expr": "rate(take_previews_ready_total[5m])", "legendFormat": "take_previews_ready", "refId": "C" },
+        { "expr": "rate(favorite_selected_total[5m])", "legendFormat": "favorite_selected", "refId": "D" },
+        { "expr": "rate(paywall_viewed_total[5m])", "legendFormat": "paywall_viewed", "refId": "E" },
+        { "expr": "sum(rate(pay_success_total[5m]))", "legendFormat": "pay_success", "refId": "F" }
+      ],
+      "title": "Воронка (rate по шагам)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 53 },
+      "id": 61,
+      "targets": [
+        { "expr": "increase(bot_started_total[1h])", "legendFormat": "bot_started 1h", "refId": "A" },
+        { "expr": "increase(photo_uploaded_total[1h])", "legendFormat": "photo_uploaded 1h", "refId": "B" },
+        { "expr": "increase(take_previews_ready_total[1h])", "legendFormat": "previews_ready 1h", "refId": "C" },
+        { "expr": "increase(favorite_selected_total[1h])", "legendFormat": "favorite 1h", "refId": "D" },
+        { "expr": "sum(increase(pay_success_total[1h]))", "legendFormat": "pay_success 1h", "refId": "E" }
+      ],
+      "title": "Воронка (increase за 1h)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 60 },
+      "id": 107,
+      "panels": [],
+      "title": "Ошибки и надёжность",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 61 },
+      "id": 70,
+      "targets": [
+        { "expr": "sum(rate(generation_failed_total[5m])) by (error_code, source)", "legendFormat": "{{error_code}} {{source}}", "refId": "A" },
+        { "expr": "rate(balance_rejected_total[5m])", "legendFormat": "balance_rejected", "refId": "B" },
+        { "expr": "rate(telegram_send_failures_total[5m])", "legendFormat": "telegram_send_failures", "refId": "C" },
+        { "expr": "rate(hd_delivery_failed_total[5m])", "legendFormat": "hd_delivery_failed", "refId": "D" }
+      ],
+      "title": "Ошибки генерации и доставки",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 61 },
+      "id": 71,
+      "targets": [
+        { "expr": "sum(rate(token_operations_total[5m])) by (operation)", "legendFormat": "{{operation}}", "refId": "A" },
+        { "expr": "sum(rate(product_events_track_total[5m])) by (event_name, status)", "legendFormat": "{{event_name}} {{status}}", "refId": "B" },
+        { "expr": "sum(rate(image_generation_retries_total[5m])) by (failure_type)", "legendFormat": "retry {{failure_type}}", "refId": "C" }
+      ],
+      "title": "Token ops, product_events, retries",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "id": 108,
+      "panels": [],
+      "title": "Telegram и админка",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 68 },
+      "id": 80,
+      "targets": [
+        { "expr": "sum(rate(telegram_requests_total[5m])) by (method, status)", "legendFormat": "{{method}} {{status}}", "refId": "A" }
+      ],
+      "title": "Telegram API requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 68 },
+      "id": 81,
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(telegram_request_duration_seconds_bucket[5m])) by (le, method))", "legendFormat": "p95 {{method}}", "refId": "A" }
+      ],
+      "title": "Telegram request duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 74 },
+      "id": 82,
+      "targets": [{ "expr": "sum(rate(admin_api_requests_total[5m])) by (path, status)", "legendFormat": "{{path}} {{status}}", "refId": "A" }],
+      "title": "Admin API requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 74 },
+      "id": 83,
+      "targets": [
+        { "expr": "sum(rate(admin_grant_pack_total[5m])) by (status)", "legendFormat": "grant_pack {{status}}", "refId": "A" },
+        { "expr": "sum(rate(admin_reset_limits_total[5m])) by (status)", "legendFormat": "reset_limits {{status}}", "refId": "B" }
+      ],
+      "title": "Admin grant_pack / reset_limits",
+      "type": "timeseries"
+    }
+  ],
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["app", "trend-generator", "nano-banana"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Trend Generator — полный обзор",
+  "uid": "trend-generator-full",
+  "version": 1,
+  "weekStart": ""
+}

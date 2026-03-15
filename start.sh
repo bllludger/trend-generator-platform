@@ -407,6 +407,39 @@ fi
 if [ -f migrations/057_product_events.sql ]; then
     $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/057_product_events.sql 2>/dev/null || true
 fi
+if [ -f migrations/058_neobanana_terminology.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/058_neobanana_terminology.sql 2>/dev/null || true
+fi
+if [ -f migrations/059_take_rescue_photo_replace.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/059_take_rescue_photo_replace.sql 2>/dev/null || true
+fi
+if [ -f migrations/060_payment_amount_kopecks.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/060_payment_amount_kopecks.sql 2>/dev/null || true
+fi
+if [ -f migrations/061_rate_limit_60_per_hour.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/061_rate_limit_60_per_hour.sql 2>/dev/null || true
+fi
+if [ -f migrations/062_neobanana_terminology_unify.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/062_neobanana_terminology_unify.sql 2>/dev/null || true
+fi
+if [ -f migrations/063_preview_policy_central.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/063_preview_policy_central.sql 2>/dev/null || true
+fi
+if [ -f migrations/064_job_datetime_timezone.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/064_job_datetime_timezone.sql 2>/dev/null || true
+fi
+if [ -f migrations/065_unlock_orders.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/065_unlock_orders.sql 2>/dev/null || true
+fi
+if [ -f migrations/066_pack_orders.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/066_pack_orders.sql 2>/dev/null || true
+fi
+if [ -f migrations/067_audit_telemetry_indexes.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/067_audit_telemetry_indexes.sql 2>/dev/null || true
+fi
+if [ -f migrations/068_audit_logs_user_session.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/068_audit_logs_user_session.sql 2>/dev/null || true
+fi
 # Роль postgres: создать или обновить пароль (внешние клиенты/IDE часто подключаются как postgres → убираем FATAL в логах)
 if ! $COMPOSE_CMD exec -T db psql -U trends -d trends -c "
 DO \$\$

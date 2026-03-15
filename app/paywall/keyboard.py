@@ -30,11 +30,11 @@ def build_unlock_markup(
     if options.show_tokens:
         rows.append([
             {
-                "text": f"Разблокировать за {options.cost_tokens} токен",
+                "text": "Открыть фото в 4K",
                 "callback_data": f"unlock_tokens:{job_id}",
             }
         ])
-    # Unlock за Stars убран из UX (только тарифы лестницы). Кнопка не показывается.
+    # Unlock за Stars убран из UX (только пакеты лестницы). Кнопка не показывается.
     # if options.show_stars:
     #     rows.append([{"text": "Разблокировать за Stars", "callback_data": f"unlock:{job_id}"}])
     return {"inline_keyboard": rows}

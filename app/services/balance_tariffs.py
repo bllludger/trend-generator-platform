@@ -1,7 +1,7 @@
 """
-Шаблон «Баланс + Выбор фотосессии» (outcome-first).
-Один экран выбора фотосессии: без «пополнить баланс»/«генерации»/токенов.
-Порядок: Neo Start → Neo Pro → Neo Unlimited → Trial (Trial последний и только если trial_purchased=false).
+Шаблон «Баланс + Выбор пакета» (outcome-first).
+Один экран магазина: пакеты фото, один счётчик «Осталось фото».
+Порядок: Neo Start → Neo Pro → Neo Unlimited → Пробный (последний, только если trial_purchased=false).
 """
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from app.services.users.service import UserService
 
 DISPLAY_ORDER = ("neo_start", "neo_pro", "neo_unlimited", "trial")
 
-# Для кнопок: имя без эмодзи (эмодзи берём из pack.emoji)
+# Для кнопок: имя без эмодзи (эмодзи берём из pack.emoji). Без слова «Trial» — нейтральное «Пробный».
 SHORT_NAMES = {
-    "trial": "Trial",
+    "trial": "Пробный",
     "neo_start": "Neo Start",
     "neo_pro": "Neo Pro (Хит)",
     "neo_unlimited": "Neo Unlimited",
@@ -22,7 +22,7 @@ SHORT_NAMES = {
 
 # Цены в рублях для отображения на кнопках оплаты (инлайн)
 DISPLAY_RUB = {
-    "trial": 59,
+    "trial": 129,
     "neo_start": 199,
     "neo_pro": 699,
     "neo_unlimited": 1990,
@@ -32,22 +32,22 @@ DISPLAY_RUB = {
 def _pack_outcome_label(pack: Pack) -> str:
     """Короткие outcome-подписи для кнопок."""
     if pack.id == "trial":
-        return "1 снимок для пробы"
+        return "1 фото для пробы"
     if pack.id == "neo_start":
-        return "10 образов"
+        return "10 фото"
     if pack.id == "neo_pro":
-        return "40 образов"
+        return "40 фото"
     if pack.id == "neo_unlimited":
-        return "120 образов"
+        return "120 фото"
     return pack.description or ""
 
 
 def _pack_text_line(pack: Pack) -> str:
-    """Строка описания тарифа в тексте сообщения (без цены)."""
+    """Строка описания пакета в тексте сообщения (без цены)."""
     if pack.id == "trial":
-        return "1 фото — попробовать один удачный кадр."
+        return "1 фото — попробовать одно удачное фото."
     if pack.id == "neo_start":
-        return "Neo Start — 10 фото (для первых фотосессий)"
+        return "Neo Start — 10 фото (для старта)"
     if pack.id == "neo_pro":
         return "Neo Pro — 40 фото ⭐ самый популярный\nАватарки, дейтинг, соцсети"
     if pack.id == "neo_unlimited":
@@ -57,29 +57,28 @@ def _pack_text_line(pack: Pack) -> str:
 
 def get_balance_line(db, telegram_id: str) -> str:
     """
-    Блок заголовка: остаток снимков/4K или «Нет активной фотосессии».
-    Возвращает 1–2 строки баланса (без подзаголовка «Выбери фотосессию»).
+    Одна строка баланса: «Осталось фото: N» или «Купите пакет, чтобы начать».
+    В пользовательском UI отдельный счётчик 4K не показываем (терминология NeoBanana).
     """
     user_svc = UserService(db)
     session_svc = SessionService(db)
     user = user_svc.get_by_telegram_id(telegram_id)
     if not user:
-        return "Нет активной фотосессии."
+        return "Купите пакет, чтобы начать."
     session = session_svc.get_active_session(user.id)
     if not session:
-        return "Нет активной фотосессии."
+        return "Купите пакет, чтобы начать."
     remaining = session.takes_limit - session.takes_used
-    hd_rem = session_svc.hd_remaining(session)
-    return f"Осталось снимков: {remaining} из {session.takes_limit}\n4K без watermark: {hd_rem}"
+    return f"Осталось фото: {remaining} из {session.takes_limit}"
 
 
 def _shop_body_text(packs: list) -> str:
-    """Текст блока выбора фотосессии: заголовок, пояснения, список тарифов без цен."""
+    """Текст блока выбора пакета: заголовок, пояснения, список пакетов без цен."""
     lines = [
-        "Выбери фотосессию 👇",
+        "Выберите пакет 👇",
         "",
         "Превью из 3 фото бесплатно.",
-        "4K без watermark — после оплаты.",
+        "4K без водяного знака — после оплаты.",
         "",
     ]
     for pack in packs:
@@ -89,8 +88,8 @@ def _shop_body_text(packs: list) -> str:
 
 def build_balance_tariffs_message(db, telegram_id: str, star_to_rub: float = 1.3) -> tuple[str, dict | None]:
     """
-    Собрать текст и reply_markup для экрана «Выбор фотосессии».
-    Порядок: Neo Start → Neo Pro → Neo Unlimited → Trial. Trial только если trial_purchased=False.
+    Собрать текст и reply_markup для экрана магазина (выбор пакета).
+    Порядок: Neo Start → Neo Pro → Neo Unlimited → Пробный. Пробный только если trial_purchased=False.
     """
     user_svc = UserService(db)
     payment_service = PaymentService(db)
@@ -116,7 +115,7 @@ def build_balance_tariffs_message(db, telegram_id: str, star_to_rub: float = 1.3
             ordered.append(by_id[pid])
 
     if not ordered:
-        body = _shop_body_text([]) + "\n\n(Тарифы временно недоступны.)"
+        body = _shop_body_text([]) + "\n\n(Пакеты временно недоступны.)"
         return body, None
 
     body = _shop_body_text(ordered)
@@ -140,7 +139,6 @@ def build_balance_tariffs_message(db, telegram_id: str, star_to_rub: float = 1.3
         else:
             label = f"{pack.emoji} {pack.name} · {rub} ₽"
         buttons.append([{"text": label, "callback_data": f"paywall:{pack.id}"}])
-    buttons.append([{"text": "📘 Как купить Stars", "callback_data": "shop:how_buy_stars"}])
-    buttons.append([{"text": "💳 Не получается купить Stars", "callback_data": "shop:how_buy_stars"}])
+    buttons.append([{"text": "📘 Как пополнить", "callback_data": "profile:payment"}])
     buttons.append([{"text": "📋 В меню", "callback_data": "nav:menu"}])
     return text, {"inline_keyboard": buttons}

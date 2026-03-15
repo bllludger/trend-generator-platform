@@ -59,6 +59,33 @@ class HDBalanceService:
         self.db.refresh(user)
         return True
 
+    def debit(self, user: User, amount: int) -> int:
+        """
+        Списать до amount HD с баланса пользователя (при рефанде).
+        Списываем сначала paid, затем promo. Возвращает фактически списанную сумму (не больше amount и не больше баланса).
+        """
+        if amount <= 0:
+            return 0
+        locked = (
+            self.db.query(User)
+            .filter(User.id == user.id)
+            .with_for_update()
+            .one()
+        )
+        paid = locked.hd_paid_balance or 0
+        promo = locked.hd_promo_balance or 0
+        total = paid + promo
+        to_deduct = min(amount, total)
+        if to_deduct <= 0:
+            return 0
+        from_paid = min(paid, to_deduct)
+        from_promo = to_deduct - from_paid
+        locked.hd_paid_balance = paid - from_paid
+        locked.hd_promo_balance = promo - from_promo
+        self.db.flush()
+        self.db.refresh(user)
+        return to_deduct
+
     def get_balance(self, user: User) -> dict:
         paid = user.hd_paid_balance or 0
         promo = user.hd_promo_balance or 0

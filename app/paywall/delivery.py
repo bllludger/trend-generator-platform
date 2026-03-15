@@ -1,6 +1,6 @@
 """
-Execution: prepare_delivery(access_decision, raw_path, storage_dir, job_id, attempt) -> DeliveryResult.
-При show_preview: копирует raw в ..._original, генерирует ..._preview с watermark.
+Execution: prepare_delivery(access_decision, raw_path, storage_dir, job_id, attempt, db) -> DeliveryResult.
+При show_preview: копирует raw в ..._original, строит превью через PreviewService (resize + watermark + encode).
 Имена с attempt — иммутабельные (retry/regen не перезаписывают).
 """
 from __future__ import annotations
@@ -9,8 +9,10 @@ import logging
 import os
 import shutil
 
+from sqlalchemy.orm import Session
+
 from app.paywall.models import AccessDecision, DeliveryResult, UnlockOptions
-from app.paywall.watermark import apply_watermark
+from app.services.preview import PreviewService
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +24,11 @@ def prepare_delivery(
     job_id: str,
     attempt: int | str,
     *,
-    watermark_params: dict | None = None,
+    db: Session,
 ) -> DeliveryResult:
     """
-    По решению access при необходимости накладывает watermark, сохраняет файлы
-    с именами {job_id}_{attempt}_preview.{ext} / _original.{ext}; возвращает пути и флаги.
-    watermark_params: опционально {"text", "opacity", "tile_spacing"} из админки.
+    По решению access при необходимости строит превью через PreviewService (resize + watermark + webp/jpeg),
+    сохраняет файлы с именами {job_id}_{attempt}_preview.{webp|jpg} / _original.{ext}; возвращает пути и флаги.
     """
     if not os.path.isfile(raw_file_path):
         raise FileNotFoundError(f"Raw file not found: {raw_file_path}")
@@ -35,12 +36,17 @@ def prepare_delivery(
     ext = _get_ext(raw_file_path)
     base = f"{job_id}_{attempt}"
     original_path = os.path.join(storage_dir, f"{base}_original{ext}")
-    preview_path = os.path.join(storage_dir, f"{base}_preview{ext}")
+    preview_path_placeholder = os.path.join(storage_dir, f"{base}_preview{ext}")
 
     if access_decision.show_preview:
         os.makedirs(storage_dir, exist_ok=True)
         shutil.copy2(raw_file_path, original_path)
-        apply_watermark(raw_file_path, preview_path, params=watermark_params)
+        preview_path = PreviewService.build_preview(
+            original_path,
+            preview_path_placeholder,
+            "job",
+            db=db,
+        )
         logger.info(
             "paywall_delivery_preview",
             extra={"job_id": job_id, "attempt": attempt, "preview": preview_path, "original": original_path},

@@ -161,6 +161,34 @@ class SessionService:
         self.db.add(take)
         self.db.flush()
 
+    def has_reroll_for_trend(self, session_id: str, trend_id: str) -> bool:
+        """True если в сессии уже есть take с is_reroll=True для данного trend_id."""
+        return (
+            self.db.query(Take.id)
+            .filter(
+                Take.session_id == session_id,
+                Take.trend_id == trend_id,
+                Take.is_reroll.is_(True),
+            )
+            .limit(1)
+            .first()
+            is not None
+        )
+
+    def has_rescue_photo_for_trend(self, session_id: str, trend_id: str) -> bool:
+        """True если в сессии уже был take с заменой фото (is_rescue_photo_replace) для данного trend_id."""
+        return (
+            self.db.query(Take.id)
+            .filter(
+                Take.session_id == session_id,
+                Take.trend_id == trend_id,
+                Take.is_rescue_photo_replace.is_(True),
+            )
+            .limit(1)
+            .first()
+            is not None
+        )
+
     # ── Collection helpers ──────────────────────────────────────────
 
     def is_collection(self, session: Session) -> bool:

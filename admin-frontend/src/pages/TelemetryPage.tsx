@@ -12,9 +12,6 @@ import {
   Activity,
   Target,
   Zap,
-  Timer,
-  UserPlus,
-  UserMinus,
   BarChart3,
   RefreshCw,
   AlertCircle,
@@ -23,12 +20,16 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   Minus,
+  ListOrdered,
+  GitBranch,
 } from 'lucide-react'
 import {
   AreaChart,
   Area,
   BarChart,
   Bar,
+  LineChart,
+  Line,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -68,6 +69,9 @@ type TelemetryDashboardData = {
   jobs_total?: number
   jobs_window?: number
   takes_window?: number
+  takes_succeeded?: number
+  takes_failed?: number
+  take_avg_generation_sec?: number | null
   jobs_by_status?: Record<string, number>
   jobs_failed_by_error?: Record<string, number>
   queue_length?: number
@@ -86,7 +90,7 @@ interface MetricCardProps {
 }
 
 function MetricCard({ title, value, subtitle, trend, icon: Icon, color }: MetricCardProps) {
-  const trendColor = trend && trend > 0 ? 'text-green-600' : trend && trend < 0 ? 'text-red-600' : 'text-gray-500'
+  const trendColor = trend && trend > 0 ? 'text-success' : trend && trend < 0 ? 'text-destructive' : 'text-muted-foreground'
   const TrendIcon = trend && trend > 0 ? ArrowUpRight : trend && trend < 0 ? ArrowDownRight : Minus
   
   return (
@@ -120,12 +124,31 @@ function MetricCard({ title, value, subtitle, trend, icon: Icon, color }: Metric
 const FUNNEL_LABELS: Record<string, string> = {
   bot_started: 'Старт',
   photo_uploaded: 'Фото загружено',
-  take_preview_ready: 'Превью готовы',
+  take_preview_ready: 'Варианты готовы',
   favorite_selected: 'Выбор варианта',
   paywall_viewed: 'Просмотр оплаты',
+  pack_selected: 'Выбор тарифа',
   pay_initiated: 'Нажата оплата',
   pay_success: 'Оплата успешна',
-  hd_delivered: 'HD доставлен',
+  hd_delivered: '4K доставлен',
+}
+
+const BUTTON_CLICK_LABELS: Record<string, string> = {
+  pay_yoomoney: 'Оплатить через ЮMoney',
+  pay_yoomoney_link: 'Оплатить по ссылке (ЮMoney)',
+  pay_stars: 'Купить через Stars',
+  pay_other: 'Другие способы оплаты',
+  bank_transfer: 'Перевод на карту',
+  nav_menu: 'В меню',
+  pack_trial: 'Пакет: Пробный',
+  pack_neo_start: 'Пакет: Neo Start',
+  pack_neo_pro: 'Пакет: Neo Pro',
+  pack_neo_unlimited: 'Пакет: Neo Unlimited',
+  variant_a: 'Вариант A',
+  variant_b: 'Вариант B',
+  variant_c: 'Вариант C',
+  take_more: 'Все 3 не подходят / Ещё фото',
+  open_favorites: 'Избранное',
 }
 
 export function TelemetryPage() {
@@ -138,8 +161,8 @@ export function TelemetryPage() {
     refetchInterval: 60000,
   })
 
-  const historyDays = 14
-  const { data: historyData } = useQuery({
+  const historyDays = 30
+  const { data: historyData, isError: historyError } = useQuery({
     queryKey: ['telemetry-history', historyDays],
     queryFn: () => telemetryService.getHistory(historyDays),
   })
@@ -152,6 +175,20 @@ export function TelemetryPage() {
   const { data: productFunnel } = useQuery({
     queryKey: ['telemetry-product-funnel', productWindowDays],
     queryFn: () => telemetryService.getProductFunnel(productWindowDays),
+  })
+
+  const {
+    data: funnelHistoryData,
+    isError: funnelHistoryError,
+    isLoading: funnelHistoryLoading,
+  } = useQuery({
+    queryKey: ['telemetry-product-funnel-history', productWindowDays],
+    queryFn: () => telemetryService.getProductFunnelHistory(productWindowDays),
+  })
+
+  const { data: buttonClicksData, isError: buttonClicksError } = useQuery({
+    queryKey: ['telemetry-button-clicks', productWindowDays],
+    queryFn: () => telemetryService.getButtonClicks(productWindowDays),
   })
 
   const { data: productMetricsV2 } = useQuery({
@@ -170,6 +207,19 @@ export function TelemetryPage() {
     queryFn: () => telemetryService.getErrors(errorsWindowDays),
     refetchInterval: 60000,
   })
+
+  const {
+    data: pathData,
+    isLoading: pathLoading,
+    isError: pathError,
+  } = useQuery({
+    queryKey: ['telemetry-path', productWindowDays, 20],
+    queryFn: () => telemetryService.getPath(productWindowDays, 20),
+  })
+  const pathTransitionsData = pathData
+    ? { window_days: pathData.window_days, transitions: pathData.transitions, drop_off: pathData.drop_off }
+    : undefined
+  const pathSequencesData = pathData ? { window_days: pathData.window_days, paths: pathData.paths } : undefined
 
   if (isLoading) {
     return (
@@ -232,9 +282,11 @@ export function TelemetryPage() {
       </div>
 
       <Tabs defaultValue="overview" className="space-y-6">
-        <TabsList className="grid w-full grid-cols-6 lg:w-auto lg:flex-wrap">
+        <TabsList className="grid w-full grid-cols-4 lg:grid-cols-8 lg:w-auto lg:flex-wrap">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="funnel">Funnel</TabsTrigger>
+          <TabsTrigger value="path">Путь</TabsTrigger>
+          <TabsTrigger value="buttons">Кнопки</TabsTrigger>
           <TabsTrigger value="engagement">Engagement</TabsTrigger>
           <TabsTrigger value="trends">Trends</TabsTrigger>
           <TabsTrigger value="revenue">Revenue</TabsTrigger>
@@ -276,7 +328,7 @@ export function TelemetryPage() {
                 value={`${productMetrics?.stickiness_pct ?? 0}%`}
                 subtitle="DAU/MAU ratio"
                 icon={Zap}
-                color="bg-amber-500"
+                color="bg-warning"
               />
               {productMetricsV2 != null && (
                 <>
@@ -292,81 +344,73 @@ export function TelemetryPage() {
                     value={productMetricsV2.paying_users ?? 0}
                     subtitle={`Выручка: ${formatNumber(productMetricsV2.total_stars ?? 0)} ⭐`}
                     icon={Users}
-                    color="bg-emerald-500"
+                    color="bg-success"
+                  />
+                  <MetricCard
+                    title="Среднее время до результата"
+                    value={
+                      (() => {
+                        const sec = productMetricsV2.avg_time_start_to_result_sec
+                        if (sec == null) return '—'
+                        if (sec >= 86400) return `${(sec / 86400).toFixed(1)} дн.`
+                        if (sec >= 3600) return `${(sec / 3600).toFixed(1)} ч`
+                        if (sec >= 60) return `${(sec / 60).toFixed(1)} мин`
+                        return `${Math.round(sec)} сек`
+                      })()
+                    }
+                    subtitle="От /start до выбора варианта"
+                    icon={Clock}
+                    color="bg-sky-500"
+                  />
+                  <MetricCard
+                    title="Среднее шагов до результата"
+                    value={
+                      productMetricsV2.avg_steps_start_to_result != null
+                        ? Number(productMetricsV2.avg_steps_start_to_result) % 1 === 0
+                          ? String(Math.round(productMetricsV2.avg_steps_start_to_result))
+                          : productMetricsV2.avg_steps_start_to_result.toFixed(1)
+                        : '—'
+                    }
+                    subtitle="Событий от старта до избранного"
+                    icon={ListOrdered}
+                    color="bg-indigo-500"
                   />
                 </>
               )}
             </div>
           </div>
 
-          {/* Jobs & Performance */}
-          <div>
-            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-              <BarChart3 className="h-5 w-5" />
-              Производительность
-            </h2>
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-              <MetricCard
-                title="Всего задач"
-                value={formatNumber(data?.jobs_total ?? 0)}
-                subtitle="За всё время"
-                icon={BarChart3}
-                color="bg-indigo-500"
-              />
-              <MetricCard
-                title={`За ${windowHours}ч`}
-                value={formatNumber(data?.jobs_window ?? 0)}
-                subtitle="Новых задач"
-                icon={Clock}
-                color="bg-cyan-500"
-              />
-              <MetricCard
-                title="Успешно"
-                value={formatNumber(data?.jobs_by_status?.SUCCEEDED ?? 0)}
-                subtitle={`${data?.jobs_window ? Math.round(((data.jobs_by_status?.SUCCEEDED ?? 0) / data.jobs_window) * 100) : 0}% success rate`}
-                icon={CheckCircle}
-                color="bg-emerald-500"
-              />
-              <MetricCard
-                title="Ошибки"
-                value={formatNumber(data?.jobs_by_status?.FAILED ?? 0)}
-                subtitle={`${data?.jobs_window ? Math.round(((data.jobs_by_status?.FAILED ?? 0) / data.jobs_window) * 100) : 0}% error rate`}
-                icon={AlertCircle}
-                color="bg-red-500"
-              />
-              <MetricCard
-                title="В очереди"
-                value={data?.queue_length ?? 0}
-                subtitle="Celery queue"
-                icon={Clock}
-                color="bg-orange-500"
-              />
-              <MetricCard
-                title={`Снимков за ${windowHours}ч`}
-                value={formatNumber(data?.takes_window ?? 0)}
-                subtitle="Take (основной поток)"
-                icon={Activity}
-                color="bg-violet-500"
-              />
-            </div>
-          </div>
-
           {/* Charts */}
           <div className="grid gap-6 lg:grid-cols-2">
             {/* Historical trend: Jobs + Takes + active users (DAU from Job и Take) */}
-            {historyData?.history?.length ? (
-              <Card>
+            {historyError ? (
+              <Card className="lg:col-span-2">
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <TrendingUp className="h-5 w-5" />
-                    Динамика ({historyData.window_days ?? 7} д.)
+                    Динамика
                   </CardTitle>
-                  <CardDescription>Задачи (Job), снимки (Take) и активные пользователи</CardDescription>
+                  <CardDescription>Не удалось загрузить данные</CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <div className="h-[280px]">
+                  <p className="text-destructive">Ошибка загрузки. Обновите страницу или попробуйте позже.</p>
+                </CardContent>
+              </Card>
+            ) : historyData?.history?.length ? (
+              <Card className="lg:col-span-2">
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <TrendingUp className="h-5 w-5" />
+                    Динамика ({historyData.window_days ?? 30} д.)
+                  </CardTitle>
+                  <CardDescription>
+                    Все метрики за период: задачи (Job), снимки (Take), успешно, ошибки, активные пользователи, сред. время 3 снимков (правая ось)
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[320px]">
                     <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={historyData.history}>
+                      <AreaChart data={historyData.history} margin={{ top: 5, right: 50, left: 0, bottom: 5 }}>
                         <defs>
                           <linearGradient id="colorTotal" x1="0" y1="0" x2="0" y2="1">
                             <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8} />
@@ -384,19 +428,37 @@ export function TelemetryPage() {
                             <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.8} />
                             <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0.1} />
                           </linearGradient>
+                          <linearGradient id="colorFailed" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#ef4444" stopOpacity={0.8} />
+                            <stop offset="95%" stopColor="#ef4444" stopOpacity={0.1} />
+                          </linearGradient>
                         </defs>
                         <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                         <XAxis dataKey="date" tick={{ fontSize: 11 }} className="text-muted-foreground" />
-                        <YAxis tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                        <YAxis yAxisId="left" tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                        <YAxis
+                          yAxisId="right"
+                          orientation="right"
+                          tick={{ fontSize: 11 }}
+                          className="text-muted-foreground"
+                          tickFormatter={(v) => (v >= 60 ? `${(v / 60).toFixed(0)} мин` : `${v} сек`)}
+                        />
                         <Tooltip
                           contentStyle={{
                             backgroundColor: 'hsl(var(--background))',
                             border: '1px solid hsl(var(--border))',
                             borderRadius: '8px',
                           }}
+                          formatter={(value, name) => {
+                            if (name === 'Сред. время 3 снимков' && typeof value === 'number') {
+                              return [value >= 60 ? `${(value / 60).toFixed(1)} мин` : `${Math.round(value)} сек`, name]
+                            }
+                            return [value, name]
+                          }}
                         />
                         <Legend wrapperStyle={{ fontSize: '12px' }} />
                         <Area
+                          yAxisId="left"
                           type="monotone"
                           dataKey="jobs_total"
                           stroke="#3b82f6"
@@ -405,6 +467,7 @@ export function TelemetryPage() {
                           strokeWidth={2}
                         />
                         <Area
+                          yAxisId="left"
                           type="monotone"
                           dataKey="takes_total"
                           stroke="#8b5cf6"
@@ -413,6 +476,7 @@ export function TelemetryPage() {
                           strokeWidth={2}
                         />
                         <Area
+                          yAxisId="left"
                           type="monotone"
                           dataKey="jobs_succeeded"
                           stroke="#10b981"
@@ -421,6 +485,16 @@ export function TelemetryPage() {
                           strokeWidth={2}
                         />
                         <Area
+                          yAxisId="left"
+                          type="monotone"
+                          dataKey="jobs_failed"
+                          stroke="#ef4444"
+                          fill="url(#colorFailed)"
+                          name="Ошибки"
+                          strokeWidth={2}
+                        />
+                        <Area
+                          yAxisId="left"
                           type="monotone"
                           dataKey="active_users"
                           stroke="#f59e0b"
@@ -428,17 +502,27 @@ export function TelemetryPage() {
                           name="Активные пользователи"
                           strokeWidth={2}
                         />
+                        <Line
+                          yAxisId="right"
+                          type="monotone"
+                          dataKey="take_avg_generation_sec"
+                          name="Сред. время 3 снимков"
+                          stroke="#eab308"
+                          strokeWidth={2}
+                          dot={{ r: 3 }}
+                          connectNulls
+                        />
                       </AreaChart>
                     </ResponsiveContainer>
                   </div>
                 </CardContent>
               </Card>
             ) : (
-              <Card>
+              <Card className="lg:col-span-2">
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <TrendingUp className="h-5 w-5" />
-                    Динамика
+                    Динамика ({historyDays} д.)
                   </CardTitle>
                   <CardDescription>Нет данных за период</CardDescription>
                 </CardHeader>
@@ -449,6 +533,68 @@ export function TelemetryPage() {
                 </CardContent>
               </Card>
             )}
+
+            {/* Сред. время 3 снимков по дням — каждый день считается отдельно */}
+            {historyData?.history?.length ? (
+              <Card className="lg:col-span-2">
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Clock className="h-5 w-5" />
+                    Сред. время 3 снимков по дням
+                  </CardTitle>
+                  <CardDescription>
+                    Среднее время от создания снимка до готовности 3 вариантов, рассчитанное отдельно по каждому дню за {historyData.window_days ?? 30} д.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[240px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart
+                        data={historyData.history.map((d: { date: string; take_avg_generation_sec?: number | null }) => ({
+                          date: d.date,
+                          dateShort: d.date.slice(5),
+                          sec: d.take_avg_generation_sec ?? null,
+                          min: d.take_avg_generation_sec != null ? Number((d.take_avg_generation_sec / 60).toFixed(1)) : null,
+                        }))}
+                        margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                        <XAxis dataKey="dateShort" tick={{ fontSize: 11 }} />
+                        <YAxis
+                          tick={{ fontSize: 11 }}
+                          tickFormatter={(v) => (v >= 60 ? `${(v / 60).toFixed(0)} мин` : `${v} сек`)}
+                        />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: 'hsl(var(--background))',
+                            border: '1px solid hsl(var(--border))',
+                            borderRadius: '8px',
+                          }}
+                          formatter={(value: number) => [
+                            value != null && value >= 60
+                              ? `${(value / 60).toFixed(1)} мин`
+                              : value != null
+                                ? `${Math.round(value)} сек`
+                                : '—',
+                            'Среднее за день',
+                          ]}
+                          labelFormatter={(label) => `День: ${label}`}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="sec"
+                          name="Сред. время 3 снимков"
+                          stroke="#eab308"
+                          strokeWidth={2}
+                          dot={{ r: 3 }}
+                          connectNulls
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
 
             {/* Status distribution */}
             <Card>
@@ -487,14 +633,15 @@ export function TelemetryPage() {
                 </div>
               </CardContent>
             </Card>
+
           </div>
         </TabsContent>
 
         {/* FUNNEL */}
         <TabsContent value="funnel" className="space-y-6">
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">Окно:</span>
-            {[7, 14, 30].map((d) => (
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm text-muted-foreground">Окно (сводка и история):</span>
+            {[7, 14, 30, 90].map((d) => (
               <Button
                 key={d}
                 variant={productWindowDays === d ? 'default' : 'outline'}
@@ -509,7 +656,7 @@ export function TelemetryPage() {
             <CardHeader>
               <CardTitle>Воронка продукта</CardTitle>
               <CardDescription>
-                События из product_events за {productWindowDays} д.
+                Уникальные пользователи по шагам (хотя бы одно событие за {productWindowDays} д.). Выбор тарифа — нажатие на любой пакет (Stars, ЮMoney, перевод на карту). Ниже — историческая динамика по дням.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -535,80 +682,283 @@ export function TelemetryPage() {
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
               <MetricCard title="Preview → Pay" value={`${productMetricsV2.preview_to_pay_pct ?? 0}%`} subtitle="Конверсия" icon={Target} color="bg-cyan-500" />
               <MetricCard title="Hit Rate" value={`${productMetricsV2.hit_rate_pct ?? 0}%`} subtitle="Сессии с выбором / с превью" icon={CheckCircle} color="bg-green-500" />
-              <MetricCard title="AOV (Stars)" value={productMetricsV2.aov_stars ?? 0} subtitle="Средний чек" icon={TrendingUp} color="bg-amber-500" />
+              <MetricCard title="AOV (Stars)" value={productMetricsV2.aov_stars ?? 0} subtitle="Средний чек" icon={TrendingUp} color="bg-warning" />
               <MetricCard title="Repeat Purchase" value={`${productMetricsV2.repeat_purchase_rate_pct ?? 0}%`} subtitle="2+ покупок" icon={Users} color="bg-purple-500" />
             </div>
           )}
+
+          {/* Исторические данные: динамика воронки по дням (product_events) */}
+          <Card>
+            <CardHeader>
+              <CardTitle>Динамика воронки за {funnelHistoryData?.window_days ?? productWindowDays} д.</CardTitle>
+              <CardDescription>
+                Уникальные пользователи по шагам по дням (исторические данные из audit_logs, даты в UTC). Учитывайте историю при оценке конверсии.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {funnelHistoryError ? (
+                <p className="text-destructive">Ошибка загрузки истории. Обновите страницу или выберите другое окно.</p>
+              ) : funnelHistoryLoading ? (
+                <div className="h-[340px] flex items-center justify-center text-muted-foreground">
+                  Загрузка истории…
+                </div>
+              ) : funnelHistoryData?.history?.length ? (
+                <div className="h-[340px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart
+                      data={funnelHistoryData.history}
+                      margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
+                    >
+                      <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                      <XAxis dataKey="date" tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                      <YAxis tick={{ fontSize: 11 }} className="text-muted-foreground" />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: 'hsl(var(--background))',
+                          border: '1px solid hsl(var(--border))',
+                          borderRadius: '8px',
+                        }}
+                      />
+                      <Legend wrapperStyle={{ fontSize: '11px' }} />
+                      {Object.keys(FUNNEL_LABELS).map((dataKey, idx) => (
+                        <Line
+                          key={dataKey}
+                          type="monotone"
+                          dataKey={dataKey}
+                          name={FUNNEL_LABELS[dataKey] ?? dataKey}
+                          stroke={COLORS[idx % COLORS.length]}
+                          strokeWidth={2}
+                          dot={{ r: 2 }}
+                          connectNulls
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <p className="text-muted-foreground py-8 text-center">
+                  Нет исторических данных по дням за выбранный период. Выберите окно 30 или 90 д. или подождите накопления событий.
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* PATH — переходы и типичные пути */}
+        <TabsContent value="path" className="space-y-6">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm text-muted-foreground">Окно:</span>
+            {[7, 14, 30, 90].map((d) => (
+              <Button
+                key={d}
+                variant={productWindowDays === d ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setProductWindowDays(d)}
+              >
+                {d} д.
+              </Button>
+            ))}
+          </div>
+
+          {pathData?.truncated && (
+            <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-2 text-sm text-amber-800 dark:text-amber-200">
+              Данные обрезаны по лимиту строк. Уменьшите окно (например 7 или 14 д.), чтобы получить полную выборку.
+            </div>
+          )}
+
+          {/* Блок 1: Поток по шагам — таблица переходов */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <GitBranch className="h-5 w-5" />
+                Переходы между шагами
+              </CardTitle>
+              <CardDescription>
+                Переходы между шагами воронки за {pathTransitionsData?.window_days ?? productWindowDays} д. Сессий на переход, медиана и среднее времени в минутах от предыдущего шага.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {pathLoading ? (
+                <div className="py-8 text-center text-muted-foreground">Загрузка…</div>
+              ) : pathError ? (
+                <p className="py-8 text-center text-destructive">Ошибка загрузки. Обновите страницу или выберите другое окно.</p>
+              ) : (pathTransitionsData?.transitions?.length ?? 0) > 0 ? (
+                <div className="rounded-md border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-3 font-medium">От</th>
+                        <th className="text-left p-3 font-medium">К</th>
+                        <th className="text-right p-3 font-medium">Сессий</th>
+                        <th className="text-right p-3 font-medium">Медиана, мин</th>
+                        <th className="text-right p-3 font-medium">Среднее, мин</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pathTransitionsData!.transitions.map((t) => (
+                        <tr key={`${t.from}\t${t.to ?? 'null'}`} className="border-b last:border-0">
+                          <td className="p-3">{FUNNEL_LABELS[t.from] ?? t.from}</td>
+                          <td className="p-3">{t.to != null ? (FUNNEL_LABELS[t.to] ?? t.to) : '—'}</td>
+                          <td className="p-3 text-right font-medium">{formatNumber(t.sessions)}</td>
+                          <td className="p-3 text-right">{t.median_minutes != null ? t.median_minutes : '—'}</td>
+                          <td className="p-3 text-right">{t.avg_minutes != null ? t.avg_minutes : '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-muted-foreground">Нет данных за период.</p>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Отвал: последний шаг без оплаты/доставки */}
+          {pathTransitionsData?.drop_off?.length ? (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">Отвал по последнему шагу</CardTitle>
+                <CardDescription>
+                  Сессии, которые не дошли до «Оплата успешна» или «4K доставлен». Последний зафиксированный шаг.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="rounded-md border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-3 font-medium">Последний шаг</th>
+                        <th className="text-right p-3 font-medium">Сессий</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pathTransitionsData.drop_off.map((d) => (
+                        <tr key={d.from} className="border-b last:border-0">
+                          <td className="p-3">{FUNNEL_LABELS[d.from] ?? d.from}</td>
+                          <td className="p-3 text-right font-medium">{formatNumber(d.sessions)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          ) : null}
+
+          {/* Блок 2: Типичные пути */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <ListOrdered className="h-5 w-5" />
+                Типичные пути
+              </CardTitle>
+              <CardDescription>
+                Топ-20 последовательностей шагов за {pathSequencesData?.window_days ?? productWindowDays} д. Медиана времени до оплаты и до последнего шага (мин), доля дошедших до оплаты.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {pathLoading ? (
+                <div className="py-8 text-center text-muted-foreground">Загрузка…</div>
+              ) : pathError ? (
+                <p className="py-8 text-center text-destructive">Ошибка загрузки. Обновите страницу или выберите другое окно.</p>
+              ) : (pathSequencesData?.paths?.length ?? 0) > 0 ? (
+                <div className="rounded-md border overflow-x-auto">
+                  <table className="w-full text-sm min-w-[640px]">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-3 font-medium">Путь</th>
+                        <th className="text-right p-3 font-medium">Сессий</th>
+                        <th className="text-right p-3 font-medium">Медиана до оплаты, мин</th>
+                        <th className="text-right p-3 font-medium">Медиана до конца, мин</th>
+                        <th className="text-right p-3 font-medium">% до оплаты</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pathSequencesData!.paths.map((p) => (
+                        <tr key={p.steps.join('|')} className="border-b last:border-0">
+                          <td className="p-3">
+                            <span className="text-muted-foreground whitespace-nowrap">
+                              {p.steps.map((s) => FUNNEL_LABELS[s] ?? s).join(' → ')}
+                            </span>
+                          </td>
+                          <td className="p-3 text-right font-medium">{formatNumber(p.sessions)}</td>
+                          <td className="p-3 text-right">{p.median_minutes_to_pay != null ? p.median_minutes_to_pay : '—'}</td>
+                          <td className="p-3 text-right">{p.median_minutes_to_last != null ? p.median_minutes_to_last : '—'}</td>
+                          <td className="p-3 text-right">{p.pct_reached_pay}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-muted-foreground">Нет данных за период.</p>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* BUTTON CLICKS */}
+        <TabsContent value="buttons" className="space-y-6">
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-muted-foreground">Окно:</span>
+            {[7, 14, 30].map((d) => (
+              <Button
+                key={d}
+                variant={productWindowDays === d ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setProductWindowDays(d)}
+              >
+                {d} д.
+              </Button>
+            ))}
+          </div>
+          <Card>
+            <CardHeader>
+              <CardTitle>Клики по кнопкам</CardTitle>
+              <CardDescription>
+                События button_click за {buttonClicksData?.window_days ?? productWindowDays} д.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {buttonClicksError ? (
+                <p className="text-destructive">Ошибка загрузки. Обновите страницу или выберите другое окно.</p>
+              ) : buttonClicksData?.by_button_id && Object.keys(buttonClicksData.by_button_id).length > 0 ? (
+                <div className="rounded-md border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-3 font-medium">Кнопка</th>
+                        <th className="text-right p-3 font-medium">Кликов</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(buttonClicksData.by_button_id)
+                        .sort(([, a], [, b]) => (b as number) - (a as number))
+                        .map(([buttonId, count]) => (
+                          <tr key={buttonId} className="border-b last:border-0">
+                            <td className="p-3">{BUTTON_CLICK_LABELS[buttonId] ?? buttonId}</td>
+                            <td className="p-3 text-right font-medium">{formatNumber(count as number)}</td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-muted-foreground">Нет данных за период.</p>
+              )}
+            </CardContent>
+          </Card>
         </TabsContent>
 
         {/* ENGAGEMENT */}
         <TabsContent value="engagement" className="space-y-6">
-          <div>
-            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-              <Target className="h-5 w-5" />
-              Retention & Growth
-            </h2>
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-              <MetricCard
-                title="Retention D1"
-                value={`${productMetrics?.retention_d1_pct ?? 0}%`}
-                subtitle={`${productMetrics?.retained_d1 ?? 0} пользователей`}
-                icon={Target}
-                color="bg-emerald-500"
-              />
-              <MetricCard
-                title="Retention 7д"
-                value={`${productMetrics?.retention_weekly_pct ?? 0}%`}
-                subtitle={`${productMetrics?.retained_weekly ?? 0} вернулись`}
-                icon={TrendingUp}
-                color="bg-blue-500"
-              />
-              <MetricCard
-                title="Новые пользователи"
-                value={productMetrics?.new_users_7d ?? 0}
-                subtitle={`7д · 30д: ${productMetrics?.new_users_30d ?? 0}`}
-                icon={UserPlus}
-                color="bg-green-500"
-              />
-              <MetricCard
-                title="Отток"
-                value={productMetrics?.churned_users ?? 0}
-                subtitle="Не вернулись за неделю"
-                icon={UserMinus}
-                color="bg-red-500"
-              />
-            </div>
-          </div>
-
-          <div>
-            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-              <Activity className="h-5 w-5" />
-              User Behavior
-            </h2>
-            <div className="grid gap-4 md:grid-cols-3">
-              <MetricCard
-                title="Время в продукте"
-                value={productMetrics?.avg_session_str ?? '0 сек'}
-                subtitle="Средняя сессия"
-                icon={Timer}
-                color="bg-cyan-500"
-              />
-              <MetricCard
-                title="Jobs на активного"
-                value={productMetrics?.avg_jobs_per_active ?? 0}
-                subtitle="За неделю (WAU)"
-                icon={BarChart3}
-                color="bg-purple-500"
-              />
-              <MetricCard
-                title="LTV"
-                value={`${productMetrics?.ltv_jobs ?? 0} jobs`}
-                subtitle="Средний lifetime value"
-                icon={TrendingUp}
-                color="bg-indigo-500"
-              />
-            </div>
-          </div>
+          <Card className="border-dashed bg-muted/30">
+            <CardContent className="pt-6">
+              <p className="text-sm text-muted-foreground">
+                Метрики Retention, Churn, New users, Avg session и LTV пока не считаются бэкендом (GET /telemetry/product-metrics). Ниже — распределение активности по пользователям (Jobs за период).
+              </p>
+            </CardContent>
+          </Card>
 
           {/* User distribution */}
           <Card>
@@ -691,13 +1041,13 @@ export function TelemetryPage() {
                       </div>
                       <div className="text-right">
                         <div className="flex items-center gap-2">
-                          <div className="text-2xl font-bold text-green-600">{succeeded}</div>
-                          <CheckCircle className="h-5 w-5 text-green-600" />
+                          <div className="text-2xl font-bold text-success">{succeeded}</div>
+                          <CheckCircle className="h-5 w-5 text-success" />
                         </div>
                         {failed > 0 && (
                           <div className="flex items-center gap-2 justify-end mt-1">
-                            <div className="text-sm text-red-600">{failed}</div>
-                            <AlertCircle className="h-4 w-4 text-red-600" />
+                            <div className="text-sm text-destructive">{failed}</div>
+                            <AlertCircle className="h-4 w-4 text-destructive" />
                           </div>
                         )}
                       </div>
@@ -733,7 +1083,7 @@ export function TelemetryPage() {
             <>
               <div className="grid gap-4 md:grid-cols-3">
                 <MetricCard title="Выручка (Stars)" value={formatNumber(revenueData.total_stars ?? 0)} subtitle={`за ${revenueData.window_days} д.`} icon={TrendingUp} color="bg-green-500" />
-                <MetricCard title="Выручка (₽)" value={formatNumber(revenueData.revenue_rub_approx ?? 0)} subtitle="приблизительно" icon={Activity} color="bg-emerald-500" />
+                <MetricCard title="Выручка (₽)" value={formatNumber(revenueData.revenue_rub_approx ?? 0)} subtitle="приблизительно" icon={Activity} color="bg-success" />
                 <MetricCard title="Окно" value={`${revenueData.window_days} д.`} subtitle="" icon={Clock} color="bg-blue-500" />
               </div>
               <Card>
@@ -780,6 +1130,88 @@ export function TelemetryPage() {
 
         {/* HEALTH */}
         <TabsContent value="health" className="space-y-6">
+          {/* Производительность */}
+          <div>
+            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+              <BarChart3 className="h-5 w-5" />
+              Производительность
+            </h2>
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              <MetricCard
+                title="Всего задач"
+                value={formatNumber(data?.jobs_total ?? 0)}
+                subtitle="За всё время"
+                icon={BarChart3}
+                color="bg-indigo-500"
+              />
+              <MetricCard
+                title={`За ${windowHours}ч`}
+                value={formatNumber((data?.jobs_window ?? 0) + (data?.takes_window ?? 0))}
+                subtitle="Новых задач (Job + снимки)"
+                icon={Clock}
+                color="bg-cyan-500"
+              />
+              <MetricCard
+                title="Успешно"
+                value={formatNumber((data?.jobs_by_status?.SUCCEEDED ?? 0) + (data?.takes_succeeded ?? 0))}
+                subtitle={(() => {
+                  const total = (data?.jobs_window ?? 0) + (data?.takes_window ?? 0)
+                  const succeeded = (data?.jobs_by_status?.SUCCEEDED ?? 0) + (data?.takes_succeeded ?? 0)
+                  const pct = total ? Math.round((succeeded / total) * 100) : 0
+                  return `${pct}% success rate`
+                })()}
+                icon={CheckCircle}
+                color="bg-success"
+              />
+              <MetricCard
+                title="Ошибки"
+                value={formatNumber(
+                  (data?.jobs_by_status?.FAILED ?? 0) +
+                    (data?.jobs_by_status?.ERROR ?? 0) +
+                    (data?.takes_failed ?? 0)
+                )}
+                subtitle={(() => {
+                  const total = (data?.jobs_window ?? 0) + (data?.takes_window ?? 0)
+                  const failed =
+                    (data?.jobs_by_status?.FAILED ?? 0) +
+                    (data?.jobs_by_status?.ERROR ?? 0) +
+                    (data?.takes_failed ?? 0)
+                  const pct = total ? Math.round((failed / total) * 100) : 0
+                  return `${pct}% error rate`
+                })()}
+                icon={AlertCircle}
+                color="bg-destructive"
+              />
+              <MetricCard
+                title="В очереди"
+                value={data?.queue_length ?? 0}
+                subtitle="Celery queue"
+                icon={Clock}
+                color="bg-orange-500"
+              />
+              <MetricCard
+                title={`Снимков за ${windowHours}ч`}
+                value={formatNumber(data?.takes_window ?? 0)}
+                subtitle="Take (основной поток)"
+                icon={Activity}
+                color="bg-violet-500"
+              />
+              <MetricCard
+                title="Сред. время 3 снимков"
+                value={
+                  data?.take_avg_generation_sec != null
+                    ? data.take_avg_generation_sec >= 60
+                      ? `${(data.take_avg_generation_sec / 60).toFixed(1)} мин`
+                      : `${Math.round(data.take_avg_generation_sec)} сек`
+                    : '—'
+                }
+                subtitle={`За ${windowHours} ч · по дням — график ниже`}
+                icon={Zap}
+                color="bg-warning"
+              />
+            </div>
+          </div>
+
           {/* График распределения ошибок по датам за 30 дней */}
           {errorsData?.errors_by_day?.length ? (
             <Card>
@@ -845,7 +1277,7 @@ export function TelemetryPage() {
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <AlertCircle className="h-5 w-5 text-red-600" />
+                  <AlertCircle className="h-5 w-5 text-destructive" />
                   Ошибки ({errorsData?.window_days ?? 30} д.)
                 </CardTitle>
                 <CardDescription>
@@ -908,7 +1340,7 @@ export function TelemetryPage() {
                   </div>
                   <div className="flex justify-between items-center p-3 rounded-lg bg-muted/50">
                     <span className="text-sm font-medium">Активные подписки</span>
-                    <span className="text-xl font-bold text-green-600">
+                    <span className="text-xl font-bold text-success">
                       {formatNumber(data?.users_subscribed ?? 0)}
                     </span>
                   </div>

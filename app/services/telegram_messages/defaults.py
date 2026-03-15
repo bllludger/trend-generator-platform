@@ -1,12 +1,12 @@
 DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     "start.welcome_text": {
         "value": (
-            "👋 Nano Banana — ИИ фотостудия\n\n"
+            "👋 NeoBanana — ИИ фотостудия\n\n"
             "Это просто фото.\n"
             "Но оно может стать сценой.\n\n"
-            "Загрузи кадр — выбери стиль —\n"
-            "получи результат как после съёмки.\n\n"
-            "👇 Попробовать бесплатно"
+            "Загрузите фото — выберите стиль —\n"
+            "получите результат как после съёмки.\n\n"
+            "👇 Попробуйте бесплатно"
         ),
         "category": "start",
         "description": "Текст приветствия (/start).",
@@ -18,14 +18,14 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     },
     "help.main_text": {
         "value": (
-            "🎨 *NanoBanan — ИИ фотостудия*\n\n"
+            "🎨 *NeoBanana — ИИ фотостудия*\n\n"
             "*Как использовать:*\n"
             "1. «🔥 Создать фото» — отправьте фото, выберите тренд, формат — результат!\n"
             "2. «🔄 Сделать такую же» — загрузите образец, затем своё фото — копия стиля 1:1\n"
-            "3. «🛒 Купить генерации» — пакеты фото за Telegram Stars (без watermark)\n"
-            "4. «👤 Мой профиль» — баланс и статистика\n\n"
+            "3. «🛒 Купить пакет» — пакеты фото за Telegram Stars (без водяного знака)\n"
+            "4. «👤 Мой профиль» — остаток фото и статистика\n\n"
             "*Как работает оплата:*\n"
-            "— 3 бесплатных превью (с watermark)\n"
+            "— 3 бесплатных превью (с водяным знаком)\n"
             "— Купите пакет за Stars — получайте фото в полном качестве\n"
             "— Можно разблокировать отдельное фото\n\n"
             "*Команды:*\n"
@@ -33,24 +33,28 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
             "/help — Помощь\n"
             "/cancel — Отменить выбор\n"
             "/terms — Условия использования\n"
-            "/paysupport — Поддержка по платежам"
+            "/paysupport — Поддержка по платежам\n"
+            "Поддержка: @{support_username}"
         ),
         "category": "help",
-        "description": "Текст команды /help.",
+        "description": "Текст команды /help. Параметр: support_username, max_file_size_mb.",
     },
     "flow.request_photo": {
         "value": (
-            "📸 Загрузи своё фото\n"
-            "и получи съёмку как из дорогой студии — за 30 секунд\n\n"
-            "✨ Превью бесплатно\n\n"
-            "Чтобы получилось идеально:\n"
-            "— лицо крупно в кадре\n"
-            "— без очков\n"
-            "— фото чёткое\n\n"
-            "👇 Попробовать"
+            "🚀 Вы почти у цели!\n\n"
+            "Сейчас отправьте своё лучшее фото —\n"
+            "AI создаст из него уникальные образы.\n\n"
+            "📸 Нужно всего 1 фото — подойдёт обычное селфи.\n\n"
+            "Чтобы получилось идеально:\n\n"
+            "— ВАЖНО: лицо крупно в кадре\n\n"
+            "📎 Важно: отправьте фото как документ —\n"
+            "так сохранится лучшее качество.\n\n"
+            "👇 Отправьте фото\n\n"
+            "✨ Через несколько секунд\n"
+            "вы сможете выбрать стиль фотосессии."
         ),
         "category": "flow",
-        "description": "Запрос фото перед созданием.",
+        "description": "Запрос фото перед созданием (после выбора ЦА).",
     },
     "flow.reference_note": {
         "value": "📎 Фото пользователя закреплены как Image B (REFERENCE) и будут участвовать в генерации.",
@@ -58,21 +62,41 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "description": "Нотификация о закрепленном референсе.",
     },
     "flow.photo_accepted_choose_theme": {
-        "value": "✅ Фото принято\n\nМы используем его, чтобы сохранить вашу внешность и стиль.\nВыберите тематику или придумайте свой образ 👇",
+        "value": (
+            "Фото принято ✅\n\n"
+            "Отлично! Мы получили ваше фото\n"
+            "и готовы создать для вас фотосессию\n"
+            "в любом выбранном образе.\n\n"
+            "Теперь выберите стиль 👇"
+        ),
         "category": "flow",
-        "description": "После загрузки фото: приглашение выбрать тематику.",
+        "description": "После загрузки фото: приглашение выбрать тематику/стиль (с картинкой успехх.png).",
     },
     "flow.theme_page_caption": {
         "value": "Тематика: {theme_name} — стр. {current} из {total}",
         "category": "flow",
         "description": "Заголовок страницы трендов внутри тематики (пагинация).",
     },
+    "flow.theme_selected_instruction": {
+        "value": (
+            "🔥 Остался последний шаг!\n\n"
+            "Выберите образ для своей фотографии.\n\n"
+            "✨ В каждом тренде — примеры\n"
+            "готовых фотосессий и образов.\n\n"
+            "👇 Нажмите на любой тренд\n"
+            "посмотрите фото и выберите стиль.\n\n"
+            "🔄 Если не понравилось —\n"
+            "вернитесь назад и попробуйте другой."
+        ),
+        "category": "flow",
+        "description": "Текст после выбора тематики: приглашение выбрать тренд (образ) внутри темы.",
+    },
     "menu.btn.create_photo": {"value": "🔥 Создать фото", "category": "buttons", "description": "Главная кнопка создания."},
     "menu.btn.copy_style": {"value": "🔄 Сделать такую же", "category": "buttons", "description": "Главная кнопка copy style."},
     "menu.btn.merge_photos": {"value": "🧩 Соединить фото", "category": "buttons", "description": "Кнопка сервиса склейки фото."},
     "menu.btn.profile": {"value": "👤 Мой профиль", "category": "buttons", "description": "Главная кнопка профиля."},
     "menu.btn.help": {"value": "❓ Помощь", "category": "buttons", "description": "Главная кнопка помощи."},
-    "menu.btn.shop": {"value": "🛒 Купить генерации", "category": "buttons", "description": "Главная кнопка магазина."},
+    "menu.btn.shop": {"value": "🛒 Купить пакет", "category": "buttons", "description": "Главная кнопка магазина."},
     "menu.btn.custom_idea": {"value": "💡 Своя идея", "category": "buttons", "description": "Кнопка выбора своей идеи."},
     "copy.btn.one_photo": {"value": "1 фотография", "category": "buttons", "description": "Copy-style: один портрет."},
     "copy.btn.two_photos": {"value": "2 фотографии", "category": "buttons", "description": "Copy-style: два портрета."},
@@ -85,14 +109,27 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     "nav.btn.back_to_themes": {"value": "⬅️ Назад к тематикам", "category": "buttons", "description": "Навигация назад к списку тематик (из экрана трендов темы)."},
     "nav.btn.menu": {"value": "📋 В меню", "category": "buttons", "description": "Навигация в главное меню."},
     "profile.btn.top_up": {"value": "🛒 Пополнить баланс", "category": "buttons", "description": "Кнопка пополнения баланса."},
-    "progress.preparing": {"value": "⏳ Подготавливаем кадр", "category": "progress", "description": "Этап прогресса 1."},
+    "progress.preparing": {"value": "⏳ Подготавливаем фото", "category": "progress", "description": "Этап прогресса 1."},
     "progress.generating": {"value": "🎨 Генерируем стиль", "category": "progress", "description": "Этап прогресса 2."},
     "progress.finalizing": {"value": "✨ Финализируем результат", "category": "progress", "description": "Этап прогресса 3."},
-    "progress.take_step_1": {"value": "⏳ Генерация снимка [🟩⬜⬜] 1/3", "category": "progress", "description": "Прогресс снимка: шаг 1/3 (полоска из 3 сегментов)."},
-    "progress.take_step_2": {"value": "⏳ Генерация снимка [🟩🟩⬜] 2/3", "category": "progress", "description": "Прогресс снимка: шаг 2/3."},
-    "progress.take_step_3": {"value": "⏳ Генерация снимка [🟩🟩🟩] 3/3", "category": "progress", "description": "Прогресс снимка: шаг 3/3."},
-    "progress.take_final": {"value": "⏳ Генерация снимка [🟩🟩🟩] Почти готово…", "category": "progress", "description": "Прогресс снимка: последний шаг перед отправкой фото."},
-    "progress.take_parallel": {"value": "⏳ Генерация снимка [⬜⬜⬜] Генерируем 3 варианта… 0/3", "category": "progress", "description": "Начальное состояние прогресс-бара при параллельной генерации (далее обновляется воркером: 1/3, 2/3, 3/3)."},
+    "progress.generation_intro": {
+        "value": (
+            "🎉 Поздравляем, вы справились!\n\n"
+            "Теперь мы создаём вашу фотосессию.\n\n"
+            "Вы сможете посмотреть все варианты,\n"
+            "выбрать лучший\n\n"
+            "и оплатить его,\n"
+            "чтобы забрать фото\n"
+            "в полном качестве для соцсетей."
+        ),
+        "category": "progress",
+        "description": "Плашка перед прогресс-баром генерации (отправляется первой, затем обновляемый прогресс).",
+    },
+    "progress.take_step_1": {"value": "⏳ Генерация фото [🟩⬜⬜] 1/3", "category": "progress", "description": "Прогресс фото: шаг 1/3 (полоска из 3 сегментов)."},
+    "progress.take_step_2": {"value": "⏳ Генерация фото [🟩🟩⬜] 2/3", "category": "progress", "description": "Прогресс фото: шаг 2/3."},
+    "progress.take_step_3": {"value": "⏳ Генерация фото [🟩🟩🟩] 3/3", "category": "progress", "description": "Прогресс фото: шаг 3/3."},
+    "progress.take_final": {"value": "⏳ Генерация фото [🟩🟩🟩] Почти готово…", "category": "progress", "description": "Прогресс фото: последний шаг перед отправкой фото."},
+    "progress.take_parallel": {"value": "⏳ Генерация фото [⬜⬜⬜] Генерируем 3 варианта… 0/3", "category": "progress", "description": "Начальное состояние прогресс-бара при параллельной генерации (далее обновляется воркером: 1/3, 2/3, 3/3)."},
     "progress.suffix": {
         "value": "\n\nОбычно это занимает до 30 секунд.",
         "category": "progress",
@@ -130,9 +167,9 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "value": (
             "🆓 *Бесплатные превью:* {free_left} из {free_limit}\n"
             "🔄 *«Сделать такую же»:* {copy_left} из {copy_limit}\n"
-            "💰 *Баланс генераций:* {token_balance}\n"
+            "📸 *Осталось фото:* {token_balance}\n"
             "📊 *Всего куплено:* {total_purchased}\n\n"
-            "Бесплатные генерации дают превью с watermark.\n"
+            "Бесплатные превью — с водяным знаком.\n"
             "Купите пакет — получайте фото в полном качестве!"
         ),
         "category": "profile",
@@ -140,7 +177,7 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     },
     # --- Магазин и оплата ---
     "shop.unavailable": {
-        "value": "Магазин временно недоступен.",
+        "value": "Пакеты временно недоступны.",
         "category": "payments",
         "description": "Когда нет пакетов в магазине.",
     },
@@ -150,22 +187,22 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "description": "Ошибка при открытии магазина.",
     },
     "shop.header": {
-        "value": "🛒 *Магазин генераций*\n\nКупите пакет — получайте фото в полном качестве, без watermark!\n\n",
+        "value": "🛒 *Магазин*\n\nКупите пакет — получайте фото в полном качестве, без водяного знака!\n\n",
         "category": "payments",
         "description": "Заголовок экрана магазина.",
     },
     "shop.how_buy_stars": {
         "value": (
             "📘 *Как купить Telegram Stars*\n\n"
-            "1. Откройте любой тариф в боте и нажмите на него.\n"
+            "1. Откройте любой пакет в боте и нажмите на него.\n"
             "2. В открывшемся окне оплаты выберите способ — *Stars* (звёзды).\n"
             "3. Если Stars нет в списке — пополните баланс Stars в настройках Telegram: "
             "Настройки → Telegram Stars (или через оплату в другом боте).\n"
-            "4. Подтвердите оплату — генерации зачислятся автоматически.\n\n"
+            "4. Подтвердите оплату — фото зачислятся на баланс автоматически.\n\n"
             "Не получается оплатить Stars? Можно оплатить *переводом на карту* — нажмите кнопку ниже."
         ),
         "category": "payments",
-        "description": "Инструкция «Как купить Stars» в экране выбора тарифа.",
+        "description": "Инструкция «Как купить Stars» в экране выбора пакета.",
     },
     "pay.pack_unavailable": {
         "value": "Пакет недоступен.",
@@ -190,7 +227,12 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     "pay.already_full": {
         "value": "Это фото уже в полном качестве.",
         "category": "payments",
-        "description": "Unlock: фото уже без watermark.",
+        "description": "Unlock: фото уже без водяного знака.",
+    },
+    "pay.unlock_already_paid": {
+        "value": "Это фото уже оплачено. Если не получили файл — напишите в поддержку: @{support_username}.",
+        "category": "payments",
+        "description": "Unlock: фото уже оплачено, файл не пришёл (переменная: support_username).",
     },
     "unlock.invoice_title": {
         "value": "🔓 Разблокировать фото",
@@ -198,7 +240,7 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "description": "Заголовок invoice разблокировки.",
     },
     "unlock.invoice_description": {
-        "value": "Получить фото без watermark в полном качестве ({cost}⭐)",
+        "value": "Получить фото без водяного знака в полном качестве ({cost}⭐)",
         "category": "payments",
         "description": "Описание invoice (переменная: cost).",
     },
@@ -208,37 +250,57 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "description": "Label в invoice.",
     },
     "payment.unknown_order": {
-        "value": "Не удалось определить заказ по платежу. Напишите в /paysupport и укажите время платежа — разберём вручную.",
+        "value": "Не удалось определить заказ по платежу. Напишите @neobanana_sup и укажите время платежа — разберём вручную.",
         "category": "payments",
         "description": "Неверный payload успешного платежа.",
     },
     "payment.unlock_send_error": {
-        "value": "Оплата прошла, но не удалось отправить фото. Напишите в /paysupport с описанием — мы вышлем кадр вручную.",
+        "value": "Оплата прошла, но не удалось отправить фото. Напишите @neobanana_sup с описанием — мы вышлем фото вручную.",
         "category": "payments",
         "description": "Unlock оплачен, но отправить файл не удалось.",
     },
     "payment.pack_not_found": {
-        "value": "Ошибка: пакет не найден. Обратитесь в /paysupport.",
+        "value": "Ошибка: пакет не найден. Обратитесь в поддержку: @neobanana_sup.",
         "category": "payments",
         "description": "После оплаты пакет не найден в БД.",
     },
     "payment.pack_success": {
-        "value": "✅ Пакет *{emoji} {name}* активирован!\n\nНачислено: *{tokens}* генераций\nВаш баланс: *{balance}* генераций\n\nТеперь ваши фото будут без watermark!",
+        "value": "✅ Пакет *{emoji} {name}* активирован!\n\nНачислено: *{tokens}* фото\nВаш баланс: *{balance}* фото\n\nТеперь ваши фото будут без водяного знака!",
         "category": "payments",
         "description": "После успешной покупки пакета (emoji, name, tokens, balance).",
     },
     "payment.credit_error": {
-        "value": "⚠️ Оплата получена, но произошла ошибка начисления.\nОбратитесь в /paysupport — мы решим вопрос.",
+        "value": "⚠️ Оплата получена, но произошла ошибка начисления.\nОбратитесь в поддержку: @neobanana_sup — мы решим вопрос.",
         "category": "payments",
         "description": "Платёж прошёл, credit_tokens вернул False.",
     },
     "payment.generic_error": {
-        "value": "⚠️ Произошла ошибка при обработке платежа.\nОбратитесь в /paysupport.",
+        "value": "⚠️ Произошла ошибка при обработке платежа.\nОбратитесь в поддержку: @neobanana_sup.",
         "category": "payments",
         "description": "Исключение в successful_payment.",
     },
+    "payment.trial_refunded": {
+        "value": "Пробный пакет уже был использован. Средства возвращены на ваш счёт Stars.",
+        "category": "payments",
+        "description": "Повторная покупка пробного пакета (Stars).",
+    },
+    "payment.trial_refunded_yoomoney": {
+        "value": "Пробный пакет уже был использован. Обратитесь в поддержку: @{support_username} — мы вернём средства на карту.",
+        "category": "payments",
+        "description": "Повторная покупка пробного пакета (ЮMoney), переменная: support_username.",
+    },
+    "payment.unlock_file_not_ready_refunded": {
+        "value": "Файл ещё не готов. Средства возвращены на ваш счёт Stars. Попробуйте разблокировать позже или напишите @{support_username}.",
+        "category": "payments",
+        "description": "Unlock: файл не готов, возврат Stars (переменная: support_username).",
+    },
+    "payment.unlock_file_not_ready": {
+        "value": "Оплата принята, но файл ещё не готов. Обратитесь в поддержку: @{support_username} — мы вернём средства вручную.",
+        "category": "payments",
+        "description": "Unlock: файл не готов (переменная: support_username).",
+    },
     "success.unlock_caption": {
-        "value": "🔓 Фото разблокировано! Вот ваш кадр в полном качестве (без сжатия).",
+        "value": "🔓 Фото разблокировано! Вот ваше фото в полном качестве (без сжатия).",
         "category": "payments",
         "description": "Подпись к фото при отправке после unlock.",
     },
@@ -250,10 +312,10 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     "cmd.paysupport": {
         "value": (
             "💬 *Поддержка по платежам*\n\n"
-            "Если у вас возникли проблемы с оплатой или начислением генераций:\n\n"
+            "Если у вас возникли проблемы с оплатой или доступом к фото:\n\n"
             "1. Убедитесь, что у вас достаточно Telegram Stars\n"
             "2. Проверьте баланс в «👤 Мой профиль»\n"
-            "3. Напишите нам в чат поддержки\n\n"
+            "3. Напишите нам: @neobanana_sup\n\n"
             "Мы обработаем ваш запрос в кратчайшие сроки.\n\n"
             "⚠️ Telegram support не рассматривает вопросы по покупкам в ботах."
         ),
@@ -262,11 +324,11 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     },
     "cmd.terms": {
         "value": (
-            "📄 *Условия использования NanoBanan*\n\n"
-            "1. Генерации приобретаются за Telegram Stars.\n"
-            "2. Бесплатные генерации дают результат с watermark (превью).\n"
-            "3. Оплаченные генерации дают полное качество без watermark.\n"
-            "4. Возврат Stars возможен до использования генераций.\n"
+            "📄 *Условия использования NeoBanana*\n\n"
+            "1. Пакеты фото приобретаются за Telegram Stars.\n"
+            "2. Бесплатные превью — с водяным знаком.\n"
+            "3. Оплаченный пакет даёт фото в полном качестве без водяного знака.\n"
+            "4. Возврат Stars возможен до использования фото из пакета.\n"
             "5. Администрация вправе отказать в обслуживании при нарушении правил.\n"
             "6. Все сгенерированные изображения — результат работы ИИ.\n\n"
             "Используя бота, вы соглашаетесь с этими условиями."
@@ -330,7 +392,7 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     "errors.choose_new_photo": {
         "value": "Для этого сценария выберите новое фото.",
         "category": "errors",
-        "description": "Copy-flow: нужен новый снимок.",
+        "description": "Copy-flow: нужно новое фото.",
     },
     "errors.no_source_photo": {
         "value": "Нет исходного фото. Загрузите новое.",
@@ -358,7 +420,12 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "description": "Краткое сообщение об ошибке.",
     },
     "errors.try_again": {"value": "Ошибка. Попробуйте ещё раз.", "category": "errors", "description": "Повторить действие."},
-    "errors.try_again_alert": {"value": "Ошибка. Попробуйте снова.", "category": "errors", "description": "Alert в callback."},
+    "errors.try_again_alert": {"value": "Ошибка. Попробуйте ещё раз.", "category": "errors", "description": "Alert в callback."},
+    "errors.try_later": {
+        "value": "Произошла ошибка. Попробуйте позже.",
+        "category": "errors",
+        "description": "Общая ошибка с призывом повторить позже.",
+    },
     "errors.session_expired_photo": {
         "value": "Сессия истекла. Отправьте фото заново.",
         "category": "errors",
@@ -384,13 +451,13 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     "errors.enter_idea": {"value": "Введите описание своей идеи.", "category": "flow", "description": "Нужен текст для «Своя идея»."},
     "errors.request_processing": {"value": "⏳ Запрос уже обрабатывается.", "category": "flow", "description": "Двойное нажатие на тренд."},
     "errors.reserve_tokens_failed": {
-        "value": "Не удалось зарезервировать токены.",
+        "value": "Недостаточно доступа. Купите пакет.",
         "category": "errors",
-        "description": "Нет токенов/лимитов для генерации.",
+        "description": "Нехватка доступа для генерации/разблокировки (продуктовая формулировка без «баланс фото»).",
     },
     "errors.regenerate_launched": {"value": "Генерация запущена!", "category": "flow", "description": "После нажатия «Попробовать ещё раз»."},
     "errors.start_first": {"value": "Сначала нажмите /start.", "category": "errors", "description": "Пользователь не в БД."},
-    "errors.job_not_found": {"value": "Кадр не найден.", "category": "errors", "description": "Job не найден."},
+    "errors.job_not_found": {"value": "Фото не найдено.", "category": "errors", "description": "Job не найден."},
     "errors.wait_current_generation": {
         "value": "Подождите завершения текущей генерации.",
         "category": "errors",
@@ -400,6 +467,7 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     "errors.trend_no_longer": {"value": "Тренд больше недоступен.", "category": "errors", "description": "Тренд отключили."},
     "errors.general_short": {"value": "Ошибка.", "category": "errors", "description": "Краткий alert."},
     "errors.start_again": {"value": "Ошибка. Нажмите /start.", "category": "errors", "description": "Критическая ошибка."},
+    "errors.profile_load": {"value": "Ошибка загрузки профиля.", "category": "errors", "description": "Ошибка при загрузке профиля."},
     "errors.file_too_large": {
         "value": "Файл слишком большой ({size_mb:.1f} МБ). Загрузите другое фото.",
         "category": "errors",
@@ -415,7 +483,7 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "category": "errors",
         "description": "Превышен размер (только max_mb).",
     },
-    "copy.choose_one_two": {"value": "Выбери 1 или 2.", "category": "flow", "description": "Copy: выбор числа фото."},
+    "copy.choose_one_two": {"value": "Выберите 1 или 2.", "category": "flow", "description": "Copy: выбор числа фото."},
     "copy.wait_one_photo": {"value": "Жду одну фотографию.", "category": "flow", "description": "Copy: ожидание 1 фото."},
     "copy.wait_two_photos": {"value": "Жду две фотографии.", "category": "flow", "description": "Copy: ожидание 2 фото."},
     "flow.session_reset_copy": {
@@ -432,7 +500,7 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
     "flow.send_your_photo": {"value": "Отправьте свою фотографию.", "category": "flow", "description": "Запрос своего фото."},
     "flow.only_jpg_png_webp": {"value": "Поддерживаются только JPG, PNG, WEBP.", "category": "flow", "description": "Формат файла."},
     "flow.prompt_placeholder": {
-        "value": "Опишите свою идею текстом. Например: «Сделай в стиле аниме»",
+        "value": "Опишите свою идею текстом. Например: «Сделайте в стиле аниме»",
         "category": "flow",
         "description": "Подсказка в состоянии «Своя идея».",
     },
@@ -478,21 +546,21 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "value": (
             "💳 *Оплата переводом на карту*\n\n"
             "Если вы не знаете, как купить Telegram Stars — можно оплатить переводом "
-            "на карту Озон Банка. Мы проверим чек и зачислим генерации автоматически.\n\n"
-            "Выберите тариф:"
+            "на карту Озон Банка. Мы проверим чек и зачислим фото на баланс автоматически.\n\n"
+            "Выберите пакет:"
         ),
         "category": "bank_transfer",
-        "description": "Шаг 1: описание способа оплаты переводом + предложение выбрать тариф.",
+        "description": "Шаг 1: описание способа оплаты переводом + предложение выбрать пакет.",
     },
     "bank_transfer.step2_requisites": {
         "value": (
             "💳 *Оплата: {pack_name}*\n"
-            "📦 Пакет: *{tokens}* генераций\n"
+            "📦 Пакет: *{tokens}* фото\n"
             "💰 Сумма к переводу: *{expected_rub} ₽*\n"
             "🏦 Номер карты: `{card}`\n\n"
             "⚠️ *После перевода отправьте чек (скриншот или фото).* "
             "Без чека оплата не засчитывается.\n\n"
-            "Мы проверим сумму автоматически и зачислим генерации."
+            "Мы проверим сумму автоматически и зачислим фото на баланс."
         ),
         "category": "bank_transfer",
         "description": "Шаг 2: реквизиты и сумма (переменные: pack_name, tokens, expected_rub, card).",
@@ -501,9 +569,9 @@ DEFAULT_TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "value": (
             "✅ *Оплата засчитана!*\n\n"
             "Пакет: *{pack_name}*\n"
-            "Начислено: *{tokens}* генераций\n"
-            "Ваш баланс: *{balance}* генераций\n\n"
-            "Теперь ваши фото будут без watermark!"
+            "Начислено: *{tokens}* фото\n"
+            "Ваш баланс: *{balance}* фото\n\n"
+            "Теперь ваши фото будут без водяного знака!"
         ),
         "category": "bank_transfer",
         "description": "Успешное зачисление после проверки чека (pack_name, tokens, balance).",

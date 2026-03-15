@@ -19,6 +19,11 @@ from app.services.image_generation.failure_types import (
     FailureType,
     classify_failure,
 )
+from app.utils.metrics import (
+    image_generation_requests_total,
+    image_generation_duration_seconds,
+    image_generation_retries_total,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,7 @@ def generate_with_retry(
     model_version: str | None = None,
     safety_settings_snapshot: Any = None,
     streaming_enabled: bool = False,
+    provider_name: str | None = None,
 ) -> ImageGenerationResponse:
     """
     Generate image with retry budget and classification per plan §3.2–3.5.
@@ -59,14 +65,19 @@ def generate_with_retry(
         settings, "image_generation_retry_respect_retry_after", True
     )
     model_version = model_version or (request.model or getattr(provider, "model_name", ""))
+    provider_label = provider_name or getattr(provider, "model_name", "unknown") or "unknown"
 
     last_error: ImageGenerationError | None = None
     attempt = 0
+    t0 = time.perf_counter()
 
     while attempt < max_attempts:
         attempt += 1
         try:
             result = provider.generate(request)
+            duration = time.perf_counter() - t0
+            image_generation_requests_total.labels(provider=provider_label, status="ok").inc()
+            image_generation_duration_seconds.labels(provider=provider_label).observe(duration)
             # Success
             if attempt > 1:
                 _log_structured(
@@ -103,8 +114,12 @@ def generate_with_retry(
             )
 
             if not retry_allowed or attempt >= max_attempts:
+                duration = time.perf_counter() - t0
+                image_generation_requests_total.labels(provider=provider_label, status="fail").inc()
+                image_generation_duration_seconds.labels(provider=provider_label).observe(duration)
                 raise
 
+            image_generation_retries_total.labels(failure_type=failure_type.value).inc()
             # Retry: sleep with jitter
             delay = backoff_seconds
             if http_status == 429 and respect_retry_after and detail.get("retry_after"):
@@ -125,6 +140,9 @@ def generate_with_retry(
             time.sleep(delay)
 
     if last_error is not None:
+        duration = time.perf_counter() - t0
+        image_generation_requests_total.labels(provider=provider_label, status="fail").inc()
+        image_generation_duration_seconds.labels(provider=provider_label).observe(duration)
         raise last_error
     raise RuntimeError("generate_with_retry: no result and no error")
 

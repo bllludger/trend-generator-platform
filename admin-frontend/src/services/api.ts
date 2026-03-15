@@ -3,7 +3,7 @@
  * Uses axios instance from @/lib/api (baseURL, auth, interceptors).
  */
 import api from '@/lib/api'
-import type { Theme, Trend } from '@/types'
+import type { ProductMetricsV2, Theme, Trend } from '@/types'
 
 // ─── Auth ─────────────────────────────────────────────────────────────────
 export const authService = {
@@ -134,6 +134,27 @@ export const masterPromptService = {
     api.put<MasterPromptSettingsResponse>('/admin/settings/master-prompt', payload).then((r) => r.data),
 }
 
+// ─── Preview policy (единый раздел превью и вотермарка) ─────────────────────
+export interface PreviewPolicySettings {
+  preview_format?: 'webp' | 'jpeg'
+  preview_quality?: number
+  take_preview_max_dim?: number
+  job_preview_max_dim?: number
+  watermark_text?: string | null
+  watermark_text_effective?: string
+  watermark_opacity?: number
+  watermark_tile_spacing?: number
+  watermark_use_contrast?: boolean
+  updated_at?: string | null
+}
+
+export const previewPolicyService = {
+  getSettings: () =>
+    api.get<PreviewPolicySettings>('/admin/settings/preview-policy').then((r) => r.data),
+  updateSettings: (payload: Partial<PreviewPolicySettings>) =>
+    api.put<PreviewPolicySettings>('/admin/settings/preview-policy', payload).then((r) => r.data),
+}
+
 // ─── Env / App settings ─────────────────────────────────────────────────────
 export interface EnvItem {
   key: string
@@ -160,11 +181,118 @@ export const appSettingsService = {
 }
 
 // ─── Users ────────────────────────────────────────────────────────────────
+export interface UserActiveSession {
+  pack_id: string
+  pack_name: string
+  takes_limit: number
+  takes_used: number
+  takes_remaining: number
+  hd_limit: number
+  hd_used: number
+  hd_remaining: number
+}
+
+export interface UserListItem {
+  id: string
+  telegram_id: string
+  telegram_username: string | null
+  telegram_first_name: string | null
+  telegram_last_name: string | null
+  token_balance: number
+  subscription_active: boolean
+  free_generations_used: number
+  free_generations_limit: number
+  copy_generations_used: number
+  copy_generations_limit: number
+  created_at: string | null
+  jobs_count: number
+  succeeded: number
+  failed: number
+  last_active: string | null
+  trial_purchased?: boolean
+  free_takes_used?: number
+  payments_count?: number
+  active_session?: UserActiveSession | null
+}
+
+export interface UserDetailSession {
+  id: string
+  pack_id: string
+  pack_name: string
+  status: string
+  takes_limit: number | null
+  takes_used: number | null
+  hd_limit: number | null
+  hd_used: number | null
+  created_at: string | null
+  takes_remaining?: number
+  hd_remaining?: number
+}
+
+export interface UserDetailPayment {
+  id: string
+  pack_id: string
+  status: string
+  stars_amount: number
+  amount_kopecks: number | null
+  tokens_granted: number
+  session_id: string | null
+  created_at: string | null
+}
+
+export interface UserDetail {
+  id: string
+  telegram_id: string
+  telegram_username: string | null
+  telegram_first_name: string | null
+  telegram_last_name: string | null
+  token_balance: number
+  subscription_active: boolean
+  free_generations_used: number
+  free_generations_limit: number
+  copy_generations_used: number
+  copy_generations_limit: number
+  trial_purchased: boolean
+  free_takes_used?: number
+  hd_paid_balance: number
+  hd_promo_balance: number
+  admin_notes: string | null
+  is_banned: boolean
+  is_suspended: boolean
+  suspended_until: string | null
+  rate_limit_per_hour: number | null
+  is_moderator: boolean
+  created_at: string | null
+  updated_at: string | null
+  last_active?: string | null
+  active_session: (UserDetailSession & { takes_remaining: number; hd_remaining: number }) | null
+  sessions: UserDetailSession[]
+  payments: UserDetailPayment[]
+}
+
 export const usersService = {
   list: (params: { page?: number; page_size?: number; search?: string; [key: string]: unknown }) =>
-    api.get('/admin/users', { params }).then((r) => r.data),
+    api.get<{ items: UserListItem[]; total: number; page: number; pages: number }>('/admin/users', { params }).then((r) => r.data),
   getAnalytics: (timeWindow?: string) =>
     api.get('/admin/users/analytics', { params: { time_window: timeWindow } }).then((r) => r.data),
+  getDetail: (userId: string) =>
+    api.get<UserDetail>(`/admin/users/${encodeURIComponent(userId)}`).then((r) => r.data),
+  grantPack: (
+    userId: string,
+    body: { pack_id: string; activation_message?: string | null },
+    idempotencyKey?: string
+  ) =>
+    api
+      .post<{ ok: boolean; message: string; session_id: string | null; payment_id: string | null }>(
+        `/admin/users/${encodeURIComponent(userId)}/grant-pack`,
+        body,
+        idempotencyKey ? { headers: { 'Idempotency-Key': idempotencyKey } } : undefined
+      )
+      .then((r) => r.data),
+  resetLimits: (userId: string) =>
+    api
+      .post<{ ok: boolean; updated?: boolean }>(`/admin/users/${encodeURIComponent(userId)}/reset-limits`)
+      .then((r) => r.data),
 }
 
 // ─── Telegram messages ─────────────────────────────────────────────────────
@@ -215,10 +343,64 @@ export const telemetryService = {
       .then((r) => r.data as TelemetryErrorsResponse),
   getProductFunnel: (windowDays?: number) =>
     api.get('/admin/telemetry/product-funnel', { params: { window_days: windowDays } }).then((r) => r.data),
+  getProductFunnelHistory: (windowDays?: number) =>
+    api
+      .get<{ window_days: number; history: Array<{ date: string } & Record<string, number>> }>(
+        '/admin/telemetry/product-funnel-history',
+        { params: { window_days: windowDays } }
+      )
+      .then((r) => r.data),
+  getButtonClicks: (windowDays?: number) =>
+    api.get<{ window_days: number; by_button_id: Record<string, number> }>('/admin/telemetry/button-clicks', { params: { window_days: windowDays } }).then((r) => r.data),
   getProductMetricsV2: (windowDays?: number) =>
-    api.get('/admin/telemetry/product-metrics-v2', { params: { window_days: windowDays } }).then((r) => r.data),
+    api.get<ProductMetricsV2>('/admin/telemetry/product-metrics-v2', { params: { window_days: windowDays } }).then((r) => r.data),
   getRevenue: (windowDays?: number) =>
     api.get('/admin/telemetry/revenue', { params: { window_days: windowDays } }).then((r) => r.data),
+  getPathTransitions: (windowDays?: number) =>
+    api
+      .get<PathTransitionsResponse>('/admin/telemetry/path-transitions', { params: { window_days: windowDays } })
+      .then((r) => r.data),
+  getPathSequences: (windowDays?: number, limit?: number) =>
+    api
+      .get<PathSequencesResponse>('/admin/telemetry/path-sequences', {
+        params: { window_days: windowDays, limit },
+      })
+      .then((r) => r.data),
+  /** Single call for Path tab: transitions + drop_off + paths (avoids double heavy aggregation). */
+  getPath: (windowDays?: number, limit?: number) =>
+    api.get<PathTransitionsResponse & { paths: PathSequenceItem[] }>('/admin/telemetry/path', {
+      params: {
+        ...(windowDays != null && { window_days: windowDays }),
+        ...(limit != null && { limit }),
+      },
+    }).then((r) => r.data),
+}
+
+export interface PathTransitionItem {
+  from: string
+  to: string | null
+  sessions: number
+  median_minutes: number | null
+  avg_minutes: number | null
+}
+export interface PathTransitionsResponse {
+  window_days: number
+  transitions: PathTransitionItem[]
+  drop_off: PathTransitionItem[]
+  /** True if audit_logs row limit was hit; data may be partial. */
+  truncated?: boolean
+}
+
+export interface PathSequenceItem {
+  steps: string[]
+  sessions: number
+  median_minutes_to_pay: number | null
+  median_minutes_to_last: number | null
+  pct_reached_pay: number
+}
+export interface PathSequencesResponse {
+  window_days: number
+  paths: PathSequenceItem[]
 }
 
 // ─── Bank transfer ─────────────────────────────────────────────────────────
@@ -272,12 +454,47 @@ export interface BankTransferReceiptLogEntry {
   [key: string]: unknown
 }
 
+export interface BankTransferPayInitiatedEntry {
+  id: string
+  user_id: string
+  telegram_id?: string | null
+  telegram_username?: string | null
+  timestamp?: string | null
+  pack_id?: string | null
+  price_rub?: number | null
+}
+
 export const bankTransferService = {
   getSettings: () => api.get<BankTransferSettings>('/admin/bank-transfer/settings').then((r) => r.data),
   updateSettings: (payload: Partial<BankTransferSettings>) =>
     api.put<BankTransferSettings>('/admin/bank-transfer/settings', payload).then((r) => r.data),
-  getReceiptLogs: (params: { page?: number; page_size?: number; match_success?: boolean; telegram_user_id?: string }) =>
-    api.get<{ items: BankTransferReceiptLogEntry[]; total: number; page?: number; pages?: number }>('/admin/bank-transfer/receipt-logs', { params }).then((r) => r.data),
+  getPayInitiated: (params: {
+    page?: number
+    page_size?: number
+    date_from?: string
+    date_to?: string
+    price_rub?: number
+    telegram_user_id?: string
+  }) =>
+    api
+      .get<{ items: BankTransferPayInitiatedEntry[]; total: number; page?: number; pages?: number }>(
+        '/admin/bank-transfer/pay-initiated',
+        { params }
+      )
+      .then((r) => r.data),
+  getReceiptLogs: (params: {
+    page?: number
+    page_size?: number
+    match_success?: boolean
+    telegram_user_id?: string
+    expected_rub?: number
+    date_from?: string
+    date_to?: string
+  }) =>
+    api.get<{ items: BankTransferReceiptLogEntry[]; total: number; page?: number; pages?: number }>(
+      '/admin/bank-transfer/receipt-logs',
+      { params }
+    ).then((r) => r.data),
   getReceiptLogFile: (logId: string) =>
     api.get(`/admin/bank-transfer/receipt-logs/${logId}/file`, { responseType: 'blob' }).then((r) => r.data as Blob),
 }
@@ -324,10 +541,33 @@ export const sessionsService = {
     api.get('/admin/sessions', { params }).then((r) => r.data),
 }
 
+export type PaymentHistoryPoint = {
+  date: string
+  revenue_rub: number
+  revenue_stars: number
+  transactions_count: number
+  unique_buyers: number
+  by_pack?: Array<{ pack_id: string; count: number; revenue_rub: number }>
+}
+
 export const paymentsService = {
-  list: (params: { page?: number; page_size?: number; payment_method?: string }) =>
-    api.get('/admin/payments', { params }).then((r) => r.data),
+  list: (params: {
+    page?: number
+    page_size?: number
+    payment_method?: string
+    date_from?: string
+    date_to?: string
+  }) => api.get('/admin/payments', { params }).then((r) => r.data),
   getStats: (days: number) => api.get('/admin/payments/stats', { params: { days } }).then((r) => r.data),
+  getHistory: (params: {
+    date_from?: string
+    date_to?: string
+    granularity?: 'day' | 'week'
+    pack_id?: string
+  }) =>
+    api
+      .get<{ series: PaymentHistoryPoint[] }>('/admin/payments/history', { params })
+      .then((r) => r.data),
   refund: (paymentId: string) => api.post(`/admin/payments/${paymentId}/refund`).then((r) => r.data),
 }
 
@@ -387,16 +627,17 @@ export interface TrendAnalyticsItem {
   takes_total: number
   takes_succeeded: number
   takes_failed: number
+  chosen_total?: number
 }
 
 export interface TrendAnalyticsResponse {
-  window_days: number
+  window_days: number | null
   items: TrendAnalyticsItem[]
 }
 
 export const trendsService = {
   list: () => api.get<Trend[]>('/admin/trends').then((r) => r.data),
-  getAnalytics: (windowDays = 30) =>
+  getAnalytics: (windowDays: number = 30) =>
     api.get<TrendAnalyticsResponse>('/admin/trends/analytics', { params: { window_days: windowDays } }).then((r) => r.data),
   get: (id: string) => api.get<Trend>(`/admin/trends/${id}`).then((r) => r.data),
   update: (id: string, data: TrendUpdatePayload) =>
@@ -436,9 +677,24 @@ export interface AuditAnalytics {
   top_actors: Array<{ actor_id: string; actor_display_name: string; count: number }>
 }
 
+export interface AuditFiltersResponse {
+  actions: string[]
+  entity_types: string[]
+  window_days: number
+}
+
 export const auditService = {
-  list: (params: { action?: string; page?: number; page_size?: number; [key: string]: unknown }) =>
+  list: (params: {
+    action?: string
+    page?: number
+    page_size?: number
+    user_id?: string
+    session_id?: string
+    [key: string]: unknown
+  }) =>
     api.get<{ items: unknown[]; total: number; page?: number; pages?: number }>('/admin/audit', { params }).then((r) => r.data),
+  getFilters: (params?: { window_days?: number }) =>
+    api.get<AuditFiltersResponse>('/admin/audit/filters', { params: params ?? { window_days: 90 } }).then((r) => r.data),
   getStats: (windowHours: number) =>
     api.get<AuditStats>('/admin/audit/stats', { params: { window_hours: windowHours } }).then((r) => r.data),
   getAnalytics: (params: {
@@ -448,6 +704,8 @@ export const auditService = {
     actor_type?: string
     entity_type?: string
     audience?: string
+    user_id?: string
+    session_id?: string
   }) =>
     api.get<AuditAnalytics>('/admin/audit/analytics', { params }).then((r) => r.data),
 }

@@ -79,7 +79,7 @@ export function CopyStylePage() {
       <div>
         <h1 className="text-2xl font-bold">Сделать такую же</h1>
         <p className="text-muted-foreground mt-1">
-          Один системный промпт Vision (например Nano Banana Prompt Builder). Референс + своё лицо → Vision возвращает один промпт в code block → он используется 1:1 в Gemini с фото пользователя → 3 варианта (A/B/C), выбор, оплата 4K.
+          Один системный промпт Vision (например NeoBanana Prompt Builder). Референс + своё лицо → Vision возвращает один промпт в code block → он используется 1:1 в Gemini с фото пользователя → 3 варианта (A/B/C), выбор, оплата 4K.
         </p>
       </div>
 

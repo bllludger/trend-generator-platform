@@ -679,7 +679,7 @@ export default function PromptPlaygroundPage() {
                 >
                   <option value="gemini-2.5-flash-image">Стандарт (gemini-2.5-flash-image)</option>
                   <option value="gemini-3-pro-image-preview">Gemini 3 Pro (gemini-3-pro-image-preview)</option>
-                  <option value="gemini-3.1-flash-image-preview">Nano Banana 2 (gemini-3.1-flash-image-preview)</option>
+                  <option value="gemini-3.1-flash-image-preview">NeoBanana 2 (gemini-3.1-flash-image-preview)</option>
                 </select>
               </div>
               <div>
@@ -844,7 +844,7 @@ export default function PromptPlaygroundPage() {
                     </div>
                   ) : (
                     <div className="space-y-4">
-                      <div className="text-red-600 font-semibold">
+                      <div className="text-destructive font-semibold">
                         Generation Failed
                       </div>
                       <div className="text-sm">
@@ -947,7 +947,7 @@ export default function PromptPlaygroundPage() {
                 >
                   <option value="gemini-2.5-flash-image">Стандарт (gemini-2.5-flash-image)</option>
                   <option value="gemini-3-pro-image-preview">Gemini 3 Pro (gemini-3-pro-image-preview)</option>
-                  <option value="gemini-3.1-flash-image-preview">Nano Banana 2 (gemini-3.1-flash-image-preview)</option>
+                  <option value="gemini-3.1-flash-image-preview">NeoBanana 2 (gemini-3.1-flash-image-preview)</option>
                 </select>
               </div>
               <div>
@@ -1037,7 +1037,7 @@ export default function PromptPlaygroundPage() {
                   Снять все
                 </Button>
                 {batchSelectedIds.size > BATCH_TEST_TRENDS_LIMIT && (
-                  <span className="text-sm text-amber-600">
+                  <span className="text-sm text-warning">
                     Выбрано {batchSelectedIds.size} трендов (макс. {BATCH_TEST_TRENDS_LIMIT} за один запуск)
                   </span>
                 )}
@@ -1165,7 +1165,7 @@ export default function PromptPlaygroundPage() {
                           >
                             <td className="p-2">{r.trendEmoji} {r.trendName}</td>
                             <td className="p-2">
-                              <span className={r.status === 'success' ? 'text-green-600' : 'text-red-600'}>
+                              <span className={r.status === 'success' ? 'text-success' : 'text-destructive'}>
                                 {r.status === 'success' ? 'Успех' : 'Ошибка'}
                               </span>
                             </td>
@@ -1200,7 +1200,7 @@ export default function PromptPlaygroundPage() {
                   if (sel.status === 'error') {
                     return (
                       <div className="space-y-2">
-                        <p className="text-red-600 font-medium">{sel.trendEmoji} {sel.trendName}</p>
+                        <p className="text-destructive font-medium">{sel.trendEmoji} {sel.trendName}</p>
                         <p className="text-sm text-muted-foreground">{sel.error ?? 'Ошибка'}</p>
                       </div>
                     )

@@ -87,7 +87,7 @@ export function SettingsPage() {
                           </span>
                           {(it.value.startsWith('••••') || it.value.endsWith('••••')) && (
                             <span title="Секрет" className="inline-flex align-middle">
-                              <Lock className="h-3.5 w-3.5 ml-1 text-amber-500" aria-hidden />
+                              <Lock className="h-3.5 w-3.5 ml-1 text-warning" aria-hidden />
                             </span>
                           )}
                         </TableCell>
@@ -109,7 +109,7 @@ export function SettingsPage() {
         </div>
       )}
 
-      <Card className="border-amber-500/50 bg-amber-500/5">
+      <Card className="border-warning/50 bg-warning/5">
         <CardContent className="p-4">
           <p className="text-sm text-muted-foreground">
             <strong>Ограничения:</strong> изменение значений возможно только через файл <code className="rounded bg-muted px-1">.env</code> на сервере и перезапуск сервисов.

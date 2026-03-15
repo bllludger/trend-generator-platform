@@ -17,7 +17,7 @@ DEFAULTS = {
     "free_requests_per_day": 10,
     "free_generations_per_user": 3,  # 1 account = 3 free, strict
     "copy_generations_per_user": 1,  # «Сделать такую же»: 1 free per account
-    "default_rate_limit_per_hour": 20,
+    "default_rate_limit_per_hour": 60,
     "subscriber_rate_limit_per_hour": 100,
     "new_user_first_day_limit": 5,
     "max_failures_before_auto_suspend": 15,

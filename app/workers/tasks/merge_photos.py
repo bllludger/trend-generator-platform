@@ -101,7 +101,7 @@ def merge_photos(self, job_id: str) -> dict:
                 chat_id=user_id,
                 document_path=photo_path,
                 caption=(
-                    "✅ Готово! Вот ваш снимок.\n"
+                    "✅ Готово! Вот ваше фото.\n"
                     "Нажмите скачать — изображение в оригинальном качестве."
                 ),
                 filename=f"merge_{job.input_count}photos.{ext}",
@@ -146,7 +146,7 @@ def merge_photos(self, job_id: str) -> dict:
                 try:
                     telegram.send_message(
                         chat_id=job.user_id,
-                        text="❌ Не удалось создать снимок. Попробуйте ещё раз или вернитесь в меню.",
+                        text="❌ Не удалось создать фото. Попробуйте ещё раз или вернитесь в меню.",
                     )
                 except Exception:
                     pass

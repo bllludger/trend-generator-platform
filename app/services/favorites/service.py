@@ -130,6 +130,16 @@ class FavoriteService:
             .all()
         )
 
+    def get_last_pending_hd_favorite(self, user_id: str) -> Favorite | None:
+        """Последний по времени избранный кадр пользователя, готовый к выдаче 4K (hd_status == 'none')."""
+        return (
+            self.db.query(Favorite)
+            .filter(Favorite.user_id == user_id, Favorite.hd_status == "none")
+            .order_by(Favorite.created_at.desc())
+            .limit(1)
+            .first()
+        )
+
     def count_favorites(self, session_id: str) -> int:
         return (
             self.db.query(Favorite)

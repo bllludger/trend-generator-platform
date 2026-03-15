@@ -67,13 +67,6 @@ export function MasterPromptPage() {
   const [releaseForm, setReleaseForm] = useState<Partial<MasterPromptSettings>>({})
   const [globalForm, setGlobalForm] = useState<Partial<TransferPolicySettings>>({})
   const [trendsForm, setTrendsForm] = useState<Partial<TransferPolicySettings>>({})
-  const [watermarkForm, setWatermarkForm] = useState<{
-    watermark_text: string
-    watermark_opacity: number
-    watermark_tile_spacing: number
-    take_preview_max_dim: number
-  }>({ watermark_text: '', watermark_opacity: 60, watermark_tile_spacing: 200, take_preview_max_dim: 800 })
-
   useEffect(() => {
     if (masterSettings?.preview) {
       setMasterForm(masterSettings.preview)
@@ -92,16 +85,6 @@ export function MasterPromptPage() {
   useEffect(() => {
     if (transferSettings?.trends) setTrendsForm(transferSettings.trends)
   }, [transferSettings?.trends])
-  useEffect(() => {
-    if (masterSettings == null) return
-    setWatermarkForm((prev) => ({
-      ...prev,
-      watermark_text: masterSettings.watermark_text ?? '',
-      watermark_opacity: masterSettings.watermark_opacity ?? 60,
-      watermark_tile_spacing: masterSettings.watermark_tile_spacing ?? 200,
-      take_preview_max_dim: masterSettings.take_preview_max_dim ?? 800,
-    }))
-  }, [masterSettings?.watermark_text, masterSettings?.watermark_opacity, masterSettings?.watermark_tile_spacing, masterSettings?.take_preview_max_dim])
 
   const masterMutation = useMutation({
     mutationFn: masterPromptService.updateSettings,
@@ -157,15 +140,6 @@ export function MasterPromptPage() {
   const handleTrendsSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     transferMutation.mutate({ trends: { ...transferSettings?.trends, ...trendsForm } })
-  }
-  const handleWatermarkSubmit = (e: React.FormEvent) => {
-    e.preventDefault()
-    masterMutation.mutate({
-      watermark_text: watermarkForm.watermark_text.trim() || null,
-      watermark_opacity: watermarkForm.watermark_opacity,
-      watermark_tile_spacing: watermarkForm.watermark_tile_spacing,
-      take_preview_max_dim: watermarkForm.take_preview_max_dim,
-    })
   }
 
   const isLoading = masterLoading || transferLoading
@@ -257,7 +231,7 @@ export function MasterPromptPage() {
   const GLOBAL_MODEL_OPTIONS = [
     { value: 'gemini-2.5-flash-image', label: 'gemini-2.5-flash-image' },
     { value: 'gemini-3-pro-image-preview', label: 'gemini-3-pro-image-preview' },
-    { value: 'gemini-3.1-flash-image-preview', label: 'gemini-3.1-flash-image-preview (Nano Banana 2)' },
+    { value: 'gemini-3.1-flash-image-preview', label: 'gemini-3.1-flash-image-preview (NeoBanana 2)' },
   ] as const
 
   const renderGlobalDefaultsForm = (
@@ -375,65 +349,10 @@ export function MasterPromptPage() {
           </p>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* Параметры вотермарка и превью 3 вариантов — все редактируемые */}
-          <form onSubmit={handleWatermarkSubmit} className="rounded-md border border-border bg-muted/30 p-4 space-y-4">
-            <p className="text-sm font-medium">Вотермарк и качество превью</p>
-            <p className="text-xs text-muted-foreground">
-              Текст вотермарка: если пусто — берётся из .env <code className="rounded bg-muted px-1">WATERMARK_TEXT</code>. Прозрачность и шаг сетки задаются здесь. Макс. сторона превью влияет на качество картинки при показе 3 вариантов (Take): больше значение — меньше даунскейл, выше качество.
-            </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div className="grid gap-2">
-                <Label htmlFor="watermark_text">Текст вотермарка</Label>
-                <Input
-                  id="watermark_text"
-                  value={watermarkForm.watermark_text}
-                  onChange={(e) => setWatermarkForm((p) => ({ ...p, watermark_text: e.target.value }))}
-                  placeholder="пусто = из .env"
-                />
-                {masterData.watermark_text_effective != null && masterData.watermark_text == null && (
-                  <p className="text-xs text-muted-foreground">Сейчас: {masterData.watermark_text_effective}</p>
-                )}
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="watermark_opacity">Прозрачность (0–255)</Label>
-                <Input
-                  id="watermark_opacity"
-                  type="number"
-                  min={0}
-                  max={255}
-                  value={watermarkForm.watermark_opacity}
-                  onChange={(e) => setWatermarkForm((p) => ({ ...p, watermark_opacity: Number(e.target.value) || 60 }))}
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="watermark_tile_spacing">Шаг сетки (px)</Label>
-                <Input
-                  id="watermark_tile_spacing"
-                  type="number"
-                  min={50}
-                  max={500}
-                  value={watermarkForm.watermark_tile_spacing}
-                  onChange={(e) => setWatermarkForm((p) => ({ ...p, watermark_tile_spacing: Number(e.target.value) || 200 }))}
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="take_preview_max_dim">Макс. сторона превью (3 варианта)</Label>
-                <Input
-                  id="take_preview_max_dim"
-                  type="number"
-                  min={400}
-                  max={2048}
-                  value={watermarkForm.take_preview_max_dim}
-                  onChange={(e) => setWatermarkForm((p) => ({ ...p, take_preview_max_dim: Number(e.target.value) || 800 }))}
-                />
-                <p className="text-xs text-muted-foreground">800 = меньше размер; 1024+ = выше качество превью</p>
-              </div>
-            </div>
-            <Button type="submit" disabled={masterMutation.isPending}>
-              {masterMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-              Сохранить вотермарк и превью
-            </Button>
-          </form>
+          <p className="text-sm text-muted-foreground rounded-md border border-border bg-muted/30 p-4">
+            Настройки вотермарка и превью (формат, качество, макс. сторона для Take и Job) — в разделе{' '}
+            <Link to="/preview-policy" className="font-medium underline text-primary">Политика превью</Link>.
+          </p>
           <div className="grid md:grid-cols-2 gap-6 pt-2 border-t">
             {renderGlobalDefaultsForm(
               'preview',

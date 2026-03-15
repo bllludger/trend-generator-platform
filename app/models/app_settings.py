@@ -18,4 +18,9 @@ class AppSettings(Base):
     watermark_tile_spacing = Column(Integer, nullable=False, default=200)
     # Превью 3 вариантов Take: макс. сторона после даунскейла перед вотермарком (меньше = хуже качество)
     take_preview_max_dim = Column(Integer, nullable=False, default=800)
+    # Единая политика превью: формат и качество для Take и Job
+    preview_format = Column(String(10), nullable=False, default="webp")  # webp | jpeg
+    preview_quality = Column(Integer, nullable=False, default=85)  # 1-100
+    job_preview_max_dim = Column(Integer, nullable=False, default=800)  # макс. сторона превью Job (убрать full-size)
+    watermark_use_contrast = Column(Boolean, nullable=False, default=True)  # двухслойный контрастный вотермарк
     updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))

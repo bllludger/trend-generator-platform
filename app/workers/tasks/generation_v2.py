@@ -18,6 +18,7 @@ from app.paywall import decide_access, prepare_delivery
 from app.paywall.keyboard import build_unlock_markup
 from app.paywall.models import AccessContext
 from app.services.app_settings.settings_service import AppSettingsService
+from app.services.audit.service import AuditService
 from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
 from app.services.image_generation import (
     ImageGenerationError,
@@ -32,6 +33,12 @@ from app.services.telegram_messages.runtime import runtime_templates
 from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as transfer_get_effective
 from app.services.trends.service import TrendService
 from app.utils.image_formats import aspect_ratio_to_size
+from app.utils.metrics import (
+    jobs_succeeded_total,
+    jobs_failed_total,
+    job_duration_seconds,
+    generation_failed_total,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +173,20 @@ def generate_image(
         if not trend:
             logger.error("generation_v2_trend_not_found", extra={"job_id": job_id, "trend_id": job.trend_id})
             job_service.set_status(job, "FAILED", error_code="trend_missing")
+            try:
+                AuditService(db).log(
+                    actor_type="system",
+                    actor_id=None,
+                    action="job_failed",
+                    entity_type="job",
+                    entity_id=job_id,
+                    payload={"error_code": "trend_missing"},
+                )
+            except Exception:
+                logger.exception("generation_v2_audit_failed")
+            trend_id_label = job.trend_id or "unknown"
+            jobs_failed_total.labels(trend_id=trend_id_label, error_code="trend_missing").inc()
+            generation_failed_total.labels(error_code="trend_missing", source="job").inc()
             ProductAnalyticsService(db).track(
                 "generation_failed",
                 job.user_id,
@@ -181,6 +202,17 @@ def generate_image(
             return {"ok": False, "error": "trend_missing"}
 
         job_service.set_status(job, "RUNNING")
+        try:
+            AuditService(db).log(
+                actor_type="system",
+                actor_id=None,
+                action="job_started",
+                entity_type="job",
+                entity_id=job_id,
+                payload={"trend_id": job.trend_id},
+            )
+        except Exception:
+            logger.exception("generation_v2_audit_job_started_failed")
 
         if status_chat_id and status_message_id is not None:
             step1 = runtime_templates.get("progress.regenerate_step1", "⏳ Генерация изображения…")
@@ -224,6 +256,22 @@ def generate_image(
             seed=seed,
             image_size_tier=image_size_tier,
         )
+        try:
+            AuditService(db).log(
+                actor_type="system",
+                actor_id=None,
+                action="generation_request",
+                entity_type="job",
+                entity_id=job_id,
+                payload={
+                    "model": model,
+                    "prompt_length": len(prompt_text) if prompt_text else 0,
+                    "trend_id": job.trend_id,
+                    "has_input_image": input_image_path is not None,
+                },
+            )
+        except Exception:
+            logger.exception("generation_v2_audit_request_failed")
 
         if status_chat_id and status_message_id is not None:
             step2 = runtime_templates.get("progress.regenerate_step2", "⏳ Почти готово…")
@@ -240,6 +288,7 @@ def generate_image(
                 model_version=model,
                 safety_settings_snapshot=getattr(settings, "gemini_safety_settings", None),
                 streaming_enabled=False,
+                provider_name=provider_name,
             )
         except ImageGenerationError as e:
             logger.warning(
@@ -247,6 +296,28 @@ def generate_image(
                 extra={"job_id": job_id, "detail": e.detail, "error_message": str(e)},
             )
             job_service.set_status(job, "FAILED", error_code="generation_failed")
+            try:
+                AuditService(db).log(
+                    actor_type="system",
+                    actor_id=None,
+                    action="generation_response",
+                    entity_type="job",
+                    entity_id=job_id,
+                    payload={"finish_reason": "error", "error_code": "generation_failed"},
+                )
+                AuditService(db).log(
+                    actor_type="system",
+                    actor_id=None,
+                    action="job_failed",
+                    entity_type="job",
+                    entity_id=job_id,
+                    payload={"error_code": "generation_failed"},
+                )
+            except Exception:
+                logger.exception("generation_v2_audit_failed")
+            trend_id_label = job.trend_id or "unknown"
+            jobs_failed_total.labels(trend_id=trend_id_label, error_code="generation_failed").inc()
+            generation_failed_total.labels(error_code="generation_failed", source="job").inc()
             ProductAnalyticsService(db).track(
                 "generation_failed",
                 job.user_id,
@@ -287,11 +358,8 @@ def generate_image(
             reserved_tokens=job.reserved_tokens or 0,
         )
         decision = decide_access(ctx)
-        wm_params = AppSettingsService(db).get_watermark_params(
-            getattr(settings, "watermark_text", "NanoBanan Preview")
-        )
         delivery_result = prepare_delivery(
-            decision, raw_path, out_dir, job_id, attempt, watermark_params=wm_params
+            decision, raw_path, out_dir, job_id, attempt, db=db
         )
 
         if delivery_result.is_preview and delivery_result.preview_path and delivery_result.original_path:
@@ -311,7 +379,30 @@ def generate_image(
             photo_path = delivery_result.original_path
             reply_markup = None
         job_service.set_status(job, "SUCCEEDED")
-        latency_ms = int((time.time() - started_at) * 1000)
+        try:
+            AuditService(db).log(
+                actor_type="system",
+                actor_id=None,
+                action="generation_response",
+                entity_type="job",
+                entity_id=job_id,
+                payload={"finish_reason": "success"},
+            )
+            AuditService(db).log(
+                actor_type="system",
+                actor_id=None,
+                action="job_succeeded",
+                entity_type="job",
+                entity_id=job_id,
+                payload={"trend_id": job.trend_id},
+            )
+        except Exception:
+            logger.exception("generation_v2_audit_success_failed")
+        duration = time.time() - started_at
+        latency_ms = int(duration * 1000)
+        trend_id_label = job.trend_id or "unknown"
+        jobs_succeeded_total.labels(trend_id=trend_id_label).inc()
+        job_duration_seconds.labels(trend_id=trend_id_label).observe(duration)
         ProductAnalyticsService(db).track(
             "generation_completed",
             job.user_id,
@@ -336,12 +427,28 @@ def generate_image(
         return {"ok": True, "job_id": job_id, "output_path": photo_path}
     except Exception:
         logger.exception("generate_image_fatal", extra={"job_id": job_id})
+        generation_failed_total.labels(error_code="unexpected_error", source="job").inc()
         # Ensure job is not left in RUNNING (re-fetch to avoid inconsistent state)
         try:
             job_service = JobService(db)
             job = job_service.get(job_id)
             if job and job.status in ("CREATED", "RUNNING"):
                 job_service.set_status(job, "FAILED", error_code="unexpected_error")
+                try:
+                    AuditService(db).log(
+                        actor_type="system",
+                        actor_id=None,
+                        action="job_failed",
+                        entity_type="job",
+                        entity_id=job_id,
+                        payload={"error_code": "unexpected_error"},
+                    )
+                except Exception:
+                    logger.exception("generation_v2_audit_failed")
+                jobs_failed_total.labels(
+                    trend_id=job.trend_id or "unknown",
+                    error_code="unexpected_error",
+                ).inc()
         except Exception as e:
             logger.warning("generate_image_fatal_set_status_failed", extra={"job_id": job_id, "error": str(e)})
         if status_chat_id:

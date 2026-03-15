@@ -1,7 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { themesService, trendsService } from '@/services/api'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -17,7 +17,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Plus, Power, PowerOff, Pencil, ImagePlus, Trash2, ChevronUp, ChevronDown, FolderPlus, GripVertical, ClipboardPaste } from 'lucide-react'
+import { Plus, Power, PowerOff, Pencil, ImagePlus, Trash2, ChevronUp, ChevronDown, FolderPlus, GripVertical, ClipboardPaste, Copy, Link2 } from 'lucide-react'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   DndContext,
@@ -33,6 +33,7 @@ import {
 import { toast } from 'sonner'
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { parseFullTrendPrompt, buildFullTrendPrompt } from '@/utils/trendPromptParse'
 import { cn } from '@/lib/utils'
 
@@ -41,16 +42,16 @@ import { AUDIENCE_VALUES } from '@/types'
 
 const DROPPABLE_ID_NONE = 'no-theme'
 
-/** Подписи ЦА для UI */
+/** Подписи ЦА для UI (единственное число, как в боте) */
 const AUDIENCE_LABELS: Record<string, string> = {
-  women: 'Женщины',
-  men: 'Мужчины',
-  couples: 'Пары',
+  women: 'Женщина',
+  men: 'Мужчина',
+  couples: 'Пара',
 }
 
 function formatAudienceLabel(target_audiences: string[] | undefined): string {
   const list = (target_audiences ?? []).filter(Boolean)
-  if (list.length === 0) return 'Женщины'
+  if (list.length === 0) return 'Женщина'
   return list.map((a) => AUDIENCE_LABELS[a] ?? a).join(' + ')
 }
 
@@ -95,6 +96,32 @@ function getValidationErrorMessage(err: unknown, fallback: string): string {
   if (typeof detail === 'string') return detail
   if (Array.isArray(detail) && detail[0]?.msg) return detail[0].msg
   return fallback
+}
+
+/** Копирует текст в буфер обмена (с fallback для контекстов без navigator.clipboard). */
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // e.g. permission denied or non-HTTPS
+  }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.left = '-9999px'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return ok
+  } catch {
+    return false
+  }
 }
 
 function TrendExampleThumb({
@@ -710,6 +737,87 @@ export function TrendsPage() {
         </div>
       </div>
 
+      <Tabs defaultValue="trends" className="space-y-4">
+        <TabsList className="grid w-full max-w-[400px] grid-cols-2">
+          <TabsTrigger value="trends">Тренды</TabsTrigger>
+          <TabsTrigger value="deeplinks" className="flex items-center gap-2">
+            <Link2 className="h-4 w-4" />
+            Диплинки тематик
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="deeplinks" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Диплинки тематик</CardTitle>
+              <CardDescription>
+                Ссылки для рассылок: по каждой ссылке пользователь после выбора пола и загрузки фото попадёт в указанную тематику. Копируйте ссылку и вставляйте в рассылку или кнопки.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {themes.length === 0 ? (
+                <p className="text-sm text-muted-foreground">Нет тематик. Создайте тематики во вкладке «Тренды».</p>
+              ) : themes.every((t) => !t.deeplink) ? (
+                <p className="text-sm text-muted-foreground">
+                  Чтобы появились ссылки, укажите username бота в Настройках → Автопостер → Username бота (или TELEGRAM_BOT_USERNAME в .env).
+                </p>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Тематика</TableHead>
+                      <TableHead>Диплинк</TableHead>
+                      <TableHead className="w-[100px]">Действие</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {themes.map((theme) => {
+                      const label = `${theme.emoji || ''} ${theme.name}`.trim() || theme.name
+                      return (
+                        <TableRow key={theme.id}>
+                          <TableCell className="font-medium">
+                            <span className="mr-2">{theme.emoji}</span>
+                            {theme.name}
+                          </TableCell>
+                          <TableCell className="min-w-0 max-w-[50vw]">
+                            {theme.deeplink ? (
+                              <code className="block text-xs bg-muted px-2 py-1.5 rounded break-all" title={theme.deeplink}>
+                                {theme.deeplink}
+                              </code>
+                            ) : (
+                              <span className="text-muted-foreground text-sm">—</span>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {theme.deeplink ? (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={async () => {
+                                  const ok = await copyToClipboard(theme.deeplink!)
+                                  if (ok) toast.success(`Ссылка «${label}» скопирована`)
+                                  else toast.error('Не удалось скопировать в буфер обмена')
+                                }}
+                                className="gap-1"
+                              >
+                                <Copy className="h-4 w-4" />
+                                Копировать
+                              </Button>
+                            ) : (
+                              <span className="text-muted-foreground text-xs">Задайте username бота</span>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="trends" className="space-y-4">
       {isLoading ? (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {[1, 2, 3].map((i) => (
@@ -786,6 +894,22 @@ export function TrendsPage() {
                         >
                           {theme.enabled ? 'Выключить тему' : 'Включить тему'}
                         </Button>
+                        {theme.deeplink && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={async () => {
+                              const ok = await copyToClipboard(theme.deeplink!)
+                              if (ok) toast.success('Ссылка на тематику скопирована')
+                              else toast.error('Не удалось скопировать в буфер обмена')
+                            }}
+                            aria-label="Копировать ссылку для рассылки"
+                            title={theme.deeplink}
+                          >
+                            <Copy className="h-4 w-4 mr-1" />
+                            Ссылка
+                          </Button>
+                        )}
                         <Button
                           variant="outline"
                           size="sm"
@@ -927,6 +1051,8 @@ export function TrendsPage() {
           </div>
         </DndContext>
       )}
+        </TabsContent>
+      </Tabs>
 
       <Dialog open={!!editingTrend || isCreating} onOpenChange={handleDialogOpenChange}>
         <DialogContent
@@ -1223,7 +1349,7 @@ export function TrendsPage() {
                     </span>
                   </div>
                   {previewError && (
-                    <p className="text-xs text-red-500" role="alert">
+                    <p className="text-xs text-destructive" role="alert">
                       {previewError}
                     </p>
                   )}
@@ -1354,6 +1480,41 @@ export function TrendsPage() {
                 })}
               </div>
             </div>
+            {editingTheme && (
+              <div className="grid gap-2">
+                <Label>Ссылка для рассылки</Label>
+                {editingTheme.deeplink ? (
+                  <>
+                    <div className="flex items-center gap-2 rounded-md border bg-muted/50 px-3 py-2">
+                      <code className="flex-1 min-w-0 break-all text-sm" title={editingTheme.deeplink}>
+                        {editingTheme.deeplink}
+                      </code>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="shrink-0"
+                        onClick={async () => {
+                          const ok = await copyToClipboard(editingTheme.deeplink!)
+                          if (ok) toast.success('Ссылка скопирована')
+                          else toast.error('Не удалось скопировать в буфер обмена')
+                        }}
+                        aria-label="Копировать"
+                      >
+                        <Copy className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      По этой ссылке пользователь после выбора пола и загрузки фото попадёт сразу в эту тематику.
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Чтобы получить ссылку, укажите username бота в Настройках → Автопостер → Username бота (или TELEGRAM_BOT_USERNAME в .env).
+                  </p>
+                )}
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button

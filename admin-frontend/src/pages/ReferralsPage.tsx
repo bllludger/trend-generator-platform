@@ -91,7 +91,7 @@ export default function ReferralsPage() {
           <CardContent>
             <div className="text-2xl font-bold">{stats?.by_status?.pending ?? '—'}</div>
             <p className="text-xs text-muted-foreground">
-              {stats?.credits?.pending ?? 0} HD credits
+              {stats?.credits?.pending ?? 0} 4К credits
             </p>
           </CardContent>
         </Card>
@@ -103,7 +103,7 @@ export default function ReferralsPage() {
           <CardContent>
             <div className="text-2xl font-bold">{stats?.by_status?.spent ?? '—'}</div>
             <p className="text-xs text-muted-foreground">
-              {stats?.credits?.spent ?? 0} HD credits
+              {stats?.credits?.spent ?? 0} 4К credits
             </p>
           </CardContent>
         </Card>
@@ -134,7 +134,7 @@ export default function ReferralsPage() {
                 <TableHead>Реферер</TableHead>
                 <TableHead>Реферал</TableHead>
                 <TableHead>Stars</TableHead>
-                <TableHead>HD Credits</TableHead>
+                <TableHead>4К Credits</TableHead>
                 <TableHead>Статус</TableHead>
                 <TableHead>Создано</TableHead>
                 <TableHead>Действия</TableHead>

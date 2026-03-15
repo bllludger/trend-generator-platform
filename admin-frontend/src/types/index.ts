@@ -4,13 +4,13 @@ export interface User {
   token_balance: number
   subscription_active: boolean
   free_generations_used?: number
-  free_generations_left?: number
+  free_generations_limit?: number
   copy_generations_used?: number
-  copy_generations_left?: number
+  copy_generations_limit?: number
   created_at: string
   jobs_count?: number
-  jobs_succeeded?: number
-  jobs_failed?: number
+  succeeded?: number
+  failed?: number
   last_active?: string
 }
 
@@ -26,6 +26,8 @@ export interface Theme {
   enabled: boolean
   /** В каких ЦА показывать тематику (по умолчанию ['women']) */
   target_audiences?: string[]
+  /** Ссылка для рассылки: t.me/bot?start=theme_{id}. null если не задан username бота */
+  deeplink?: string | null
 }
 
 /** Секция промпта (Playground 1:1) */
@@ -94,6 +96,8 @@ export interface AuditLog {
   action: string
   entity_type: string
   entity_id?: string
+  user_id?: string | null
+  session_id?: string | null
   payload: Record<string, any>
   created_at: string
 }
@@ -153,4 +157,17 @@ export interface ProductMetrics {
   avg_session_str: string
   ltv_jobs: number
   jobs_per_user_distribution: Record<string, number>
+}
+
+export interface ProductMetricsV2 {
+  window_days: number
+  preview_to_pay_pct?: number
+  hit_rate_pct?: number
+  aov_stars?: number
+  total_stars?: number
+  paying_users?: number
+  users_started?: number
+  repeat_purchase_rate_pct?: number
+  avg_time_start_to_result_sec?: number | null
+  avg_steps_start_to_result?: number | null
 }

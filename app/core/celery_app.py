@@ -2,10 +2,25 @@
 Celery application: broker and result backend from settings.
 Tasks are in app.workers.tasks (broadcast, etc.) and app.referral.tasks.
 """
+import os
+
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import worker_process_init
 
 from app.core.config import settings
+
+
+@worker_process_init.connect
+def _start_worker_metrics_server(**kwargs: object) -> None:
+    """Expose /metrics in each worker process for Prometheus (generation_*, telegram_*, etc.)."""
+    try:
+        from app.utils.metrics_server import start_metrics_http_server
+        port = int(os.environ.get("WORKER_METRICS_PORT", "9091"))
+        start_metrics_http_server(port=port)
+    except Exception:
+        pass
+
 
 celery_app = Celery(
     "app",
@@ -19,6 +34,8 @@ celery_app = Celery(
         "app.workers.tasks.watchdog_rendering",
         "app.workers.tasks.delete_user_data",
         "app.workers.tasks.merge_photos",
+        "app.workers.tasks.send_user_message",
+        "app.workers.tasks.deliver_unlock",
         "app.referral.tasks",
     ],
 )
