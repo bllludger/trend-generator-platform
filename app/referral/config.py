@@ -30,7 +30,7 @@ def get_monthly_limit() -> int:
 
 
 def get_bonus_ladder() -> dict[int, int]:
-    """Return {min_stars: credits_4k}. Thresholds align with Neo plans: 153 (Neo Start), 538 (Neo Pro), 1531 (Neo Unlimited)."""
+    """Return {min_stars: credits_4k}. Thresholds align with Neo plans: 153 (Neo Start), 384 (Neo Pro), 762 (Neo Unlimited)."""
     raw = json.loads(settings.referral_bonus_ladder)
     return {int(k): int(v) for k, v in raw.items()}
 

@@ -36,6 +36,7 @@ celery_app = Celery(
         "app.workers.tasks.merge_photos",
         "app.workers.tasks.send_user_message",
         "app.workers.tasks.deliver_unlock",
+        "app.workers.tasks.deliver_trial_bundle",
         "app.referral.tasks",
     ],
 )
@@ -50,10 +51,6 @@ celery_app.conf.update(
     task_time_limit=3600,
     result_expires=86400,
     beat_schedule={
-        "process-pending-referral-bonuses": {
-            "task": "app.referral.tasks.process_pending_bonuses",
-            "schedule": crontab(minute="*/30"),
-        },
         "reset-stuck-rendering": {
             "task": "app.workers.tasks.watchdog_rendering.reset_stuck_rendering",
             "schedule": crontab(minute="*/5"),

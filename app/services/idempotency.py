@@ -21,6 +21,15 @@ class IdempotencyStore:
         created = self.client.set(f"idempotency:{key}", "1", nx=True, ex=ttl)
         return created is not None
 
+    def release(self, key: str) -> bool:
+        """Remove idempotency key. Returns True if key existed and was deleted."""
+        deleted = self.client.delete(f"idempotency:{key}")
+        return bool(deleted)
+
+    def is_set(self, key: str) -> bool:
+        """Check whether idempotency key already exists."""
+        return bool(self.client.exists(f"idempotency:{key}"))
+
     def get_grant_response(self, idempotency_key: str) -> dict | None:
         """Return cached grant-pack response if key was already processed. None if miss."""
         try:

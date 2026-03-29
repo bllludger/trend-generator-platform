@@ -61,6 +61,13 @@ class User(Base):
     free_takes_used = Column(Integer, nullable=False, default=0)
     trial_purchased = Column(Boolean, nullable=False, default=False)
 
+    # Trial V2 / Referral unlock
+    # Eligible only for users created after rollout (set at user creation time).
+    trial_v2_eligible = Column(Boolean, nullable=False, default=False)
+    # Atomic marker for referral condition: first successful preview set completed.
+    trial_first_preview_completed = Column(Boolean, nullable=False, default=False)
+    trial_first_preview_completed_at = Column(DateTime(timezone=True), nullable=True)
+
     # Consent & data deletion
     consent_accepted_at = Column(DateTime(timezone=True), nullable=True)
     data_deletion_requested_at = Column(DateTime(timezone=True), nullable=True)

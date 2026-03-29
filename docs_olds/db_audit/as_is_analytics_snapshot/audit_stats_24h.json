@@ -1,0 +1,8 @@
+{
+  "total": 43,
+  "by_actor_type": {
+    "system": 1,
+    "user": 42
+  },
+  "window_hours": 24
+}

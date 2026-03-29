@@ -440,6 +440,15 @@ fi
 if [ -f migrations/068_audit_logs_user_session.sql ]; then
     $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/068_audit_logs_user_session.sql 2>/dev/null || true
 fi
+if [ -f migrations/069_playground_multimodal_params.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/069_playground_multimodal_params.sql 2>/dev/null || true
+fi
+if [ -f migrations/070_take_hd_bundle_charged.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/070_take_hd_bundle_charged.sql 2>/dev/null || true
+fi
+if [ -f migrations/071_trial_v2_referral_unlock.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/071_trial_v2_referral_unlock.sql 2>/dev/null || true
+fi
 # Роль postgres: создать или обновить пароль (внешние клиенты/IDE часто подключаются как postgres → убираем FATAL в логах)
 if ! $COMPOSE_CMD exec -T db psql -U trends -d trends -c "
 DO \$\$

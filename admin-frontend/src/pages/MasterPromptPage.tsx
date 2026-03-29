@@ -230,7 +230,7 @@ export function MasterPromptPage() {
 
   const GLOBAL_MODEL_OPTIONS = [
     { value: 'gemini-2.5-flash-image', label: 'gemini-2.5-flash-image' },
-    { value: 'gemini-3-pro-image-preview', label: 'gemini-3-pro-image-preview' },
+    { value: 'gemini-3-pro-image-preview', label: 'gemini-3-pro-image-preview (Nano Banana Pro)' },
     { value: 'gemini-3.1-flash-image-preview', label: 'gemini-3.1-flash-image-preview (NeoBanana 2)' },
   ] as const
 

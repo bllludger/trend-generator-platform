@@ -41,6 +41,10 @@ class Trend(Base):
     prompt_image_size_tier = Column(String(8), nullable=True, default="1K")
     prompt_temperature = Column(Float, nullable=True)  # 0.0 .. 2.0
     prompt_seed = Column(Integer, nullable=True)
+    prompt_top_p = Column(Float, nullable=True)  # 0.0 .. 1.0
+    prompt_candidate_count = Column(Integer, nullable=True)  # 1 .. 4 (playground UI limit)
+    prompt_media_resolution = Column(String(16), nullable=True)  # LOW | MEDIUM | HIGH
+    prompt_thinking_config = Column(JSONB, nullable=True)  # {thinking_budget?: number}
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 

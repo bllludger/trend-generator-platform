@@ -74,6 +74,10 @@ class TrendAdminIn(BaseModel):
     prompt_image_size_tier: str | None = None
     prompt_temperature: float | None = None
     prompt_seed: int | float | None = None  # фронт/JSON может прислать float — при сохранении в БД приводим к int
+    prompt_top_p: float | None = None
+    prompt_candidate_count: int | None = None
+    prompt_media_resolution: str | None = None
+    prompt_thinking_config: dict[str, Any] | None = None
 
 
 def require_prompt(payload: TrendAdminIn) -> None:

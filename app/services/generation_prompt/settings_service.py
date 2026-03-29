@@ -69,7 +69,7 @@ class GenerationPromptSettingsService:
             "default_format": (row.default_format or "").strip() or "png",
             "default_temperature": self._clamp_temperature(getattr(row, "default_temperature", 0.7)),
             "default_image_size_tier": (getattr(row, "default_image_size_tier", None) or "1K").strip(),
-            "default_aspect_ratio": (getattr(row, "default_aspect_ratio", None) or "1:1").strip(),
+            "default_aspect_ratio": (getattr(row, "default_aspect_ratio", None) or "3:4").strip(),
         }
 
     def _clamp_temperature(self, value: float) -> float:
@@ -89,7 +89,7 @@ class GenerationPromptSettingsService:
             "default_format": "png",
             "default_temperature": 0.7,
             "default_image_size_tier": "1K",
-            "default_aspect_ratio": "1:1",
+            "default_aspect_ratio": "3:4",
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -120,7 +120,7 @@ class GenerationPromptSettingsService:
             "default_format": (row.default_format or "png").strip(),
             "default_temperature": float(row.default_temperature or 0.7),
             "default_image_size_tier": (getattr(row, "default_image_size_tier", None) or "1K").strip(),
-            "default_aspect_ratio": (getattr(row, "default_aspect_ratio", None) or "1:1").strip(),
+            "default_aspect_ratio": (getattr(row, "default_aspect_ratio", None) or "3:4").strip(),
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
 
@@ -139,7 +139,7 @@ class GenerationPromptSettingsService:
             "default_format": "png",
             "default_temperature": 0.7,
             "default_image_size_tier": "1K",
-            "default_aspect_ratio": "1:1",
+            "default_aspect_ratio": "3:4",
             "updated_at": None,
         }
 

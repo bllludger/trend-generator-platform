@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import update
@@ -31,11 +33,15 @@ class UserService:
                 self.db.commit()
                 self.db.refresh(user)
             return user
+        # Trial V2 applies to users created after rollout.
+        rollout_utc = datetime(2026, 3, 26, tzinfo=timezone.utc)
+        trial_v2_eligible = datetime.now(timezone.utc) >= rollout_utc
         user = User(
             telegram_id=telegram_id,
             telegram_username=telegram_username,
             telegram_first_name=telegram_first_name,
             telegram_last_name=telegram_last_name,
+            trial_v2_eligible=trial_v2_eligible,
         )
         self.db.add(user)
         self.db.commit()

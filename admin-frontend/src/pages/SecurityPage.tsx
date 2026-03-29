@@ -45,11 +45,12 @@ import {
   RotateCcw,
   UserCheck,
   UserX,
+  Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 
-type ActionType = 'ban' | 'unban' | 'suspend' | 'resume' | 'rate_limit' | 'notes' | null
+type ActionType = 'ban' | 'unban' | 'suspend' | 'resume' | 'rate_limit' | 'delete' | 'notes' | null
 
 function SecuritySettingsForm() {
   const queryClient = useQueryClient()
@@ -345,6 +346,20 @@ export function SecurityPage() {
     onError: () => toast.error('Ошибка при изменении статуса модератора'),
   })
 
+  const hardDeleteMutation = useMutation({
+    mutationFn: (userId: string) => securityService.hardDeleteUser(userId),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['security-users'] })
+      queryClient.invalidateQueries({ queryKey: ['security-overview'] })
+      const removed = Object.entries(data?.deleted || {})
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(', ')
+      toast.success(`Пользователь удалён из БД${removed ? ` (${removed})` : ''}`)
+      closeDialog()
+    },
+    onError: () => toast.error('Ошибка при полном удалении пользователя'),
+  })
+
   const closeDialog = () => {
     setActionType(null)
     setTargetUser(null)
@@ -385,6 +400,9 @@ export function SecurityPage() {
         const limit = rateLimit.trim() ? parseInt(rateLimit) : null
         rateLimitMutation.mutate({ userId: targetUser.id, limit })
         break
+      case 'delete':
+        hardDeleteMutation.mutate(targetUser.id)
+        break
     }
   }
 
@@ -414,7 +432,7 @@ export function SecurityPage() {
 
   const isPending = banMutation.isPending || unbanMutation.isPending ||
                     suspendMutation.isPending || resumeMutation.isPending ||
-                    rateLimitMutation.isPending
+                    rateLimitMutation.isPending || hardDeleteMutation.isPending
 
   return (
     <div className="space-y-6">
@@ -675,7 +693,25 @@ export function SecurityPage() {
                                   >
                                     Пауза
                                   </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="destructive"
+                                    onClick={() => openAction('delete', user)}
+                                    title="Удалить пользователя из БД полностью"
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </Button>
                                 </>
+                              )}
+                              {(user.is_banned || user.is_suspended) && (
+                                <Button
+                                  size="sm"
+                                  variant="destructive"
+                                  onClick={() => openAction('delete', user)}
+                                  title="Удалить пользователя из БД полностью"
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
                               )}
                               <Button
                                 size="sm"
@@ -795,6 +831,7 @@ export function SecurityPage() {
               {actionType === 'suspend' && <><Clock className="h-5 w-5 text-orange-600" /> Приостановить пользователя</>}
               {actionType === 'resume' && <><CheckCircle2 className="h-5 w-5 text-green-600" /> Возобновить доступ</>}
               {actionType === 'rate_limit' && <><Gauge className="h-5 w-5 text-blue-600" /> Установить Rate Limit</>}
+              {actionType === 'delete' && <><Trash2 className="h-5 w-5 text-destructive" /> Удалить пользователя из БД</>}
             </DialogTitle>
             <DialogDescription>
               Telegram ID: <strong>{targetUser?.telegram_id}</strong>
@@ -849,6 +886,15 @@ export function SecurityPage() {
                 </p>
               </div>
             )}
+
+            {actionType === 'delete' && (
+              <div className="space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+                <p className="font-medium text-destructive">Действие необратимо.</p>
+                <p>
+                  Будут удалены пользователь и связанные записи (сессии, генерации, платежи, заказы, trial/referral данные и др.).
+                </p>
+              </div>
+            )}
           </div>
 
           <DialogFooter>
@@ -858,7 +904,7 @@ export function SecurityPage() {
             <Button
               onClick={handleAction}
               disabled={isPending}
-              variant={actionType === 'ban' ? 'destructive' : 'default'}
+              variant={actionType === 'ban' || actionType === 'delete' ? 'destructive' : 'default'}
             >
               {isPending ? (
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />
@@ -868,6 +914,7 @@ export function SecurityPage() {
               {actionType === 'suspend' && 'Приостановить'}
               {actionType === 'resume' && 'Возобновить'}
               {actionType === 'rate_limit' && 'Применить'}
+              {actionType === 'delete' && 'Удалить навсегда'}
             </Button>
           </DialogFooter>
         </DialogContent>

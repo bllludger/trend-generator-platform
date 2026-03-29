@@ -104,6 +104,21 @@ class FavoriteService:
         self.db.flush()
         return True
 
+    def remove_favorite_for_user(self, user_id: str, favorite_id: str) -> bool:
+        """Удалить избранное только если оно принадлежит user_id."""
+        fav = (
+            self.db.query(Favorite)
+            .filter(Favorite.id == favorite_id, Favorite.user_id == user_id)
+            .one_or_none()
+        )
+        if not fav:
+            return False
+        if fav.hd_status == "delivered":
+            return False
+        self.db.delete(fav)
+        self.db.flush()
+        return True
+
     def clear_all_for_user(self, user_id: str) -> int:
         """Удалить все избранные пользователя, кроме уже выданных 4K. Возвращает количество удалённых."""
         deleted = (

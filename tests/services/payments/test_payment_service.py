@@ -111,7 +111,7 @@ class TestRecordYookassaUnlockPayment:
         order = MagicMock(spec=UnlockOrder)
         order.yookassa_payment_id = None
         order.telegram_user_id = "123"
-        order.amount_kopecks = 12900
+        order.amount_kopecks = 9900
         order.take_id = "take-1"
         order.id = "ord-1"
         svc = PaymentService(db)
@@ -125,10 +125,10 @@ class TestRecordYookassaUnlockPayment:
         order = MagicMock(spec=UnlockOrder)
         order.yookassa_payment_id = "pay-abc"
         order.telegram_user_id = "999"
-        order.amount_kopecks = 12900
+        order.amount_kopecks = 9900
         order.take_id = "take-1"
         order.id = "ord-1"
-        db.query.return_value.filter.return_value.one_or_none.side_effect = [None]
+        db.query.return_value.filter.return_value.one_or_none.side_effect = [None, None]
         svc = PaymentService(db)
         assert svc.record_yookassa_unlock_payment(order) is None
 
@@ -143,21 +143,33 @@ class TestRecordYookassaUnlockPayment:
         order = MagicMock(spec=UnlockOrder)
         order.yookassa_payment_id = "pay-xyz"
         order.telegram_user_id = "123"
-        order.amount_kopecks = 12900
+        order.amount_kopecks = 9900
         order.take_id = "take-1"
         order.id = "ord-1"
         db.query.return_value.filter.return_value.one_or_none.side_effect = [None, user]
         db.add = MagicMock()
         db.flush = MagicMock()
 
-        svc = PaymentService(db)
-        result = svc.record_yookassa_unlock_payment(order)
+        with patch("app.services.payments.service.ProductAnalyticsService") as analytics_cls:
+            svc = PaymentService(db)
+            result = svc.record_yookassa_unlock_payment(order)
+
         assert result is not None
         assert result.telegram_payment_charge_id == "yookassa_unlock:pay-xyz"
         assert result.pack_id == "unlock"
-        assert result.amount_kopecks == 12900
+        assert result.amount_kopecks == 9900
         assert result.user_id == "user-1"
         db.add.assert_called_once()
+        analytics_cls.return_value.track_payment_event.assert_called_once_with(
+            "pay_success",
+            "user-1",
+            method="yookassa_unlock",
+            pack_id="unlock",
+            price_rub=99.0,
+            currency="RUB",
+            source_component="service.payments",
+            properties={"job_id": "take-1", "flow": "unlock", "order_id": "ord-1"},
+        )
 
     def test_idempotent_returns_existing_payment(self):
         from app.models.payment import Payment
@@ -170,11 +182,107 @@ class TestRecordYookassaUnlockPayment:
         order = MagicMock(spec=UnlockOrder)
         order.yookassa_payment_id = "pay-dup"
         order.telegram_user_id = "123"
-        order.amount_kopecks = 12900
+        order.amount_kopecks = 9900
         order.take_id = "take-1"
         order.id = "ord-1"
         db.query.return_value.filter.return_value.one_or_none.return_value = existing
-        svc = PaymentService(db)
-        result = svc.record_yookassa_unlock_payment(order)
+        with patch("app.services.payments.service.ProductAnalyticsService") as analytics_cls:
+            svc = PaymentService(db)
+            result = svc.record_yookassa_unlock_payment(order)
         assert result is existing
         db.add.assert_not_called()
+        analytics_cls.return_value.track_payment_event.assert_not_called()
+
+
+class TestProcessSessionPurchaseYookassaLink:
+    """process_session_purchase_yookassa_link — telemetry pay_success only on new completed payment."""
+
+    def test_tracks_pay_success_when_new_payment_created(self):
+        from app.services.payments.service import PaymentService
+
+        db = MagicMock()
+        payment_query = MagicMock()
+        payment_query.filter.return_value.one_or_none.return_value = None
+        user = MagicMock()
+        user.id = "user-1"
+        user.telegram_id = "123"
+        user_query = MagicMock()
+        user_query.filter.return_value.with_for_update.return_value.one_or_none.return_value = user
+        free_session_query = MagicMock()
+        free_session_query.filter.return_value.first.return_value = None
+        db.query.side_effect = [payment_query, user_query, free_session_query]
+        db.add = MagicMock()
+        db.flush = MagicMock()
+
+        pack = MagicMock()
+        pack.id = "neo_pro"
+        pack.is_trial = False
+        pack.hd_amount = 50
+        pack.stars_price = 384
+        pack.pack_subtype = "standalone"
+        session = MagicMock()
+        session.id = "session-1"
+
+        with (
+            patch.object(PaymentService, "get_pack", return_value=pack),
+            patch("app.services.payments.service.SessionService") as session_svc_cls,
+            patch("app.services.payments.service.HDBalanceService"),
+            patch("app.services.payments.service.ProductAnalyticsService") as analytics_cls,
+        ):
+            session_svc_cls.return_value.create_session.return_value = session
+            svc = PaymentService(db)
+            payment, result_session, trial_err, attached = svc.process_session_purchase_yookassa_link(
+                telegram_user_id="123",
+                pack_id="neo_pro",
+                yookassa_payment_id="pay-xyz",
+                amount_kopecks=49900,
+            )
+
+        assert payment is not None
+        assert result_session is session
+        assert trial_err is None
+        assert attached == 0
+        analytics_cls.return_value.track_payment_event.assert_called_once_with(
+            "pay_success",
+            "user-1",
+            method="yoomoney_link",
+            session_id="session-1",
+            pack_id="neo_pro",
+            price=384.0,
+            price_rub=499.0,
+            currency="RUB",
+            source_component="service.payments",
+            properties={"amount_kopecks": 49900},
+        )
+
+    def test_skips_pay_success_when_existing_payment_returned(self):
+        from app.models.payment import Payment
+        from app.models.session import Session as SessionModel
+        from app.services.payments.service import PaymentService
+
+        db = MagicMock()
+        existing = MagicMock(spec=Payment)
+        existing.id = "pay-1"
+        existing.session_id = "session-1"
+        payment_query = MagicMock()
+        payment_query.filter.return_value.one_or_none.return_value = existing
+        session = MagicMock(spec=SessionModel)
+        session.id = "session-1"
+        session_query = MagicMock()
+        session_query.filter.return_value.one_or_none.return_value = session
+        db.query.side_effect = [payment_query, session_query]
+
+        with patch("app.services.payments.service.ProductAnalyticsService") as analytics_cls:
+            svc = PaymentService(db)
+            payment, result_session, trial_err, attached = svc.process_session_purchase_yookassa_link(
+                telegram_user_id="123",
+                pack_id="neo_pro",
+                yookassa_payment_id="pay-xyz",
+                amount_kopecks=49900,
+            )
+
+        assert payment is existing
+        assert result_session is session
+        assert trial_err is None
+        assert attached == 0
+        analytics_cls.return_value.track_payment_event.assert_not_called()

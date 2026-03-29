@@ -786,7 +786,9 @@ export function UsersPage() {
                                 )}
                               </TableCell>
                               <TableCell className="text-xs">
-                                {user.active_session?.pack_id === 'free_preview' ? 'Бесплатный' : (user.active_session?.pack_name ?? '—')}
+                                {user.active_session?.pack_id === 'free_preview'
+                                  ? (user.trial_v2_eligible ? 'Trial V2' : 'Бесплатный')
+                                  : (user.active_session?.pack_name ?? '—')}
                               </TableCell>
                               <TableCell className="tabular-nums text-xs">
                                 {user.active_session?.takes_remaining != null

@@ -68,9 +68,17 @@ export interface Trend {
   prompt_model?: string | null
   prompt_size?: string | null
   prompt_format?: string | null
+  prompt_aspect_ratio?: string | null
   /** Источник конфига промпта: playground (секции) или scene (сценарный промпт) */
   prompt_config_source?: 'playground' | 'scene'
   prompt_temperature?: number | null
+  prompt_top_p?: number | null
+  prompt_candidate_count?: number | null
+  prompt_media_resolution?: 'LOW' | 'MEDIUM' | 'HIGH' | null
+  prompt_thinking_config?: {
+    thinking_budget?: number
+    thinking_level?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH'
+  } | null
   /** В каких ЦА показывать тренд (по умолчанию ['women']) */
   target_audiences?: string[]
 }
@@ -170,4 +178,5 @@ export interface ProductMetricsV2 {
   repeat_purchase_rate_pct?: number
   avg_time_start_to_result_sec?: number | null
   avg_steps_start_to_result?: number | null
+  data_quality?: Record<string, number | string | boolean>
 }

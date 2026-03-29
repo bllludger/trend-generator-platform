@@ -1,0 +1,301 @@
+{
+  "events_by_day": [
+    {
+      "date": "2026-02-03T00:00:00+00:00",
+      "count": 6
+    },
+    {
+      "date": "2026-02-04T00:00:00+00:00",
+      "count": 211
+    },
+    {
+      "date": "2026-02-06T00:00:00+00:00",
+      "count": 4
+    },
+    {
+      "date": "2026-02-07T00:00:00+00:00",
+      "count": 54
+    },
+    {
+      "date": "2026-02-08T00:00:00+00:00",
+      "count": 90
+    },
+    {
+      "date": "2026-02-09T00:00:00+00:00",
+      "count": 44
+    },
+    {
+      "date": "2026-02-12T00:00:00+00:00",
+      "count": 71
+    },
+    {
+      "date": "2026-02-13T00:00:00+00:00",
+      "count": 363
+    },
+    {
+      "date": "2026-02-14T00:00:00+00:00",
+      "count": 461
+    },
+    {
+      "date": "2026-02-15T00:00:00+00:00",
+      "count": 100
+    },
+    {
+      "date": "2026-02-16T00:00:00+00:00",
+      "count": 28
+    },
+    {
+      "date": "2026-02-18T00:00:00+00:00",
+      "count": 3
+    },
+    {
+      "date": "2026-02-20T00:00:00+00:00",
+      "count": 23
+    },
+    {
+      "date": "2026-02-21T00:00:00+00:00",
+      "count": 5
+    },
+    {
+      "date": "2026-02-23T00:00:00+00:00",
+      "count": 12
+    },
+    {
+      "date": "2026-02-24T00:00:00+00:00",
+      "count": 67
+    },
+    {
+      "date": "2026-02-25T00:00:00+00:00",
+      "count": 1
+    },
+    {
+      "date": "2026-02-26T00:00:00+00:00",
+      "count": 18
+    },
+    {
+      "date": "2026-02-27T00:00:00+00:00",
+      "count": 10
+    },
+    {
+      "date": "2026-02-28T00:00:00+00:00",
+      "count": 45
+    },
+    {
+      "date": "2026-03-01T00:00:00+00:00",
+      "count": 5
+    },
+    {
+      "date": "2026-03-02T00:00:00+00:00",
+      "count": 38
+    },
+    {
+      "date": "2026-03-03T00:00:00+00:00",
+      "count": 43
+    },
+    {
+      "date": "2026-03-04T00:00:00+00:00",
+      "count": 20
+    },
+    {
+      "date": "2026-03-05T00:00:00+00:00",
+      "count": 47
+    },
+    {
+      "date": "2026-03-06T00:00:00+00:00",
+      "count": 110
+    },
+    {
+      "date": "2026-03-07T00:00:00+00:00",
+      "count": 2116
+    },
+    {
+      "date": "2026-03-08T00:00:00+00:00",
+      "count": 795
+    },
+    {
+      "date": "2026-03-09T00:00:00+00:00",
+      "count": 153
+    },
+    {
+      "date": "2026-03-10T00:00:00+00:00",
+      "count": 139
+    },
+    {
+      "date": "2026-03-11T00:00:00+00:00",
+      "count": 38
+    },
+    {
+      "date": "2026-03-12T00:00:00+00:00",
+      "count": 9
+    },
+    {
+      "date": "2026-03-13T00:00:00+00:00",
+      "count": 12
+    },
+    {
+      "date": "2026-03-14T00:00:00+00:00",
+      "count": 43
+    },
+    {
+      "date": "2026-03-15T00:00:00+00:00",
+      "count": 43
+    }
+  ],
+  "by_action": {
+    "choose_best_variant": 88,
+    "job_created": 277,
+    "button_click": 15,
+    "input_photo_analyzed": 3,
+    "trend_take_started": 3,
+    "photo_merge_count_selected": 47,
+    "user_moderator_set": 2,
+    "job_failed": 20,
+    "paywall_variant_shown": 122,
+    "payment_unlock": 12,
+    "create": 24,
+    "traffic_start": 472,
+    "photo_merge_completed": 29,
+    "take_preview_ready": 2,
+    "referral_invite_view": 3,
+    "generation_fallback_used": 2,
+    "generation_started": 3,
+    "bot_started": 7,
+    "pay_success": 5,
+    "start": 1130,
+    "take_started": 252,
+    "job_succeeded": 15,
+    "photo_uploaded": 3,
+    "audience_selected": 658,
+    "telegram_message_bulk_update": 2,
+    "copy_flow_reference_analyzed": 59,
+    "generation_failed": 1,
+    "unlock_with_tokens": 2,
+    "paywall_shown": 2,
+    "trend_viewed": 3,
+    "generation_response": 244,
+    "favorites_auto_add": 88,
+    "hd_delivered": 32,
+    "update": 97,
+    "generation_request": 264,
+    "photo_merge_photo_uploaded": 63,
+    "generation_completed": 2,
+    "pay_click": 35,
+    "take_previews_ready": 239,
+    "theme_selected": 3,
+    "payment_pack": 7,
+    "photo_merge_started": 72,
+    "collection_started": 3,
+    "favorites_opened": 22,
+    "job_started": 35,
+    "traffic_attribution": 4,
+    "trend_preview_ready": 2,
+    "trend_selected": 752
+  },
+  "by_actor_type": {
+    "user": 4222,
+    "admin": 125,
+    "system": 880
+  },
+  "top_actors": [
+    {
+      "actor_id": "181620034",
+      "actor_display_name": "@d_222bb",
+      "count": 465
+    },
+    {
+      "actor_id": "5121308436",
+      "actor_display_name": "Алла",
+      "count": 75
+    },
+    {
+      "actor_id": "655248227",
+      "actor_display_name": "@exclusive_maru",
+      "count": 59
+    },
+    {
+      "actor_id": "6034608649",
+      "actor_display_name": "Я_н_а",
+      "count": 53
+    },
+    {
+      "actor_id": "291729762",
+      "actor_display_name": "@arinaandrievskaya",
+      "count": 51
+    },
+    {
+      "actor_id": "660596018",
+      "actor_display_name": "@katja0610",
+      "count": 51
+    },
+    {
+      "actor_id": "5277758770",
+      "actor_display_name": "@Ksyun00",
+      "count": 48
+    },
+    {
+      "actor_id": "2050771995",
+      "actor_display_name": "@Valencia797",
+      "count": 40
+    },
+    {
+      "actor_id": "5138660668",
+      "actor_display_name": "@Ani_Zolotareva",
+      "count": 31
+    },
+    {
+      "actor_id": "8506645706",
+      "actor_display_name": "мэ",
+      "count": 31
+    },
+    {
+      "actor_id": "1279824637",
+      "actor_display_name": "Ирина Бражникова",
+      "count": 29
+    },
+    {
+      "actor_id": "1064022121",
+      "actor_display_name": "@Natalya2002",
+      "count": 29
+    },
+    {
+      "actor_id": "8138250015",
+      "actor_display_name": "Наташа",
+      "count": 26
+    },
+    {
+      "actor_id": "5125686074",
+      "actor_display_name": "@KravchenkoAnuta",
+      "count": 25
+    },
+    {
+      "actor_id": "764132428",
+      "actor_display_name": "@Red_Army_SPT",
+      "count": 24
+    },
+    {
+      "actor_id": "940797064",
+      "actor_display_name": "@Hippa69",
+      "count": 24
+    },
+    {
+      "actor_id": "6097131180",
+      "actor_display_name": "Elvin Travel",
+      "count": 22
+    },
+    {
+      "actor_id": "1341122376",
+      "actor_display_name": "Ирина",
+      "count": 22
+    },
+    {
+      "actor_id": "2096682321",
+      "actor_display_name": "Татьяна",
+      "count": 21
+    },
+    {
+      "actor_id": "791103651",
+      "actor_display_name": "Elena",
+      "count": 21
+    }
+  ]
+}

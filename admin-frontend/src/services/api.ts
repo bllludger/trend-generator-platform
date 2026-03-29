@@ -56,6 +56,8 @@ export const securityService = {
   resetLimits: () => api.post<{ users_updated?: number }>('/admin/security/reset-limits').then((r) => r.data),
   setModerator: (userId: string, isModerator: boolean) =>
     api.post(`/admin/security/users/${userId}/moderator`, { is_moderator: isModerator }).then((r) => r.data),
+  hardDeleteUser: (userId: string) =>
+    api.post<{ ok: boolean; deleted?: Record<string, number> }>(`/admin/security/users/${userId}/hard-delete`).then((r) => r.data),
 }
 
 // ─── Transfer policy (global + trends) ─────────────────────────────────────
@@ -211,6 +213,7 @@ export interface UserListItem {
   last_active: string | null
   trial_purchased?: boolean
   free_takes_used?: number
+  trial_v2_eligible?: boolean
   payments_count?: number
   active_session?: UserActiveSession | null
 }
@@ -262,6 +265,21 @@ export interface UserDetail {
   suspended_until: string | null
   rate_limit_per_hour: number | null
   is_moderator: boolean
+  trial_v2_eligible?: boolean
+  trial_first_preview_completed?: boolean
+  trial_first_preview_completed_at?: string | null
+  trial_v2?: {
+    trend_slots_used: number
+    trend_slots_total: number
+    rerolls_used: number
+    rerolls_total: number
+    takes_used: number
+    takes_total: number
+    reward_earned_total: number
+    reward_claimed_total: number
+    reward_available: number
+    reward_reserved: number
+  }
   created_at: string | null
   updated_at: string | null
   last_active?: string | null
@@ -326,6 +344,143 @@ export interface TelemetryErrorsResponse {
   combined: Record<string, number>
   errors_by_day?: TelemetryErrorsByDay[]
 }
+
+export interface TelemetryQualityMap {
+  [key: string]: number | string | boolean | Record<string, number> | undefined
+}
+
+export interface TelemetryHealthResponse {
+  window_days: number
+  status: 'ok' | 'degraded'
+  data_quality: TelemetryQualityMap
+  metrics?: TelemetryQualityMap
+  quality_warnings?: string[]
+}
+
+export interface TelemetryProductFunnelResponse {
+  window_days: number
+  funnel_counts: Record<string, number>
+  shadow_funnel_counts?: Record<string, number>
+  diff_funnel_counts?: Record<string, number>
+  data_quality?: TelemetryQualityMap
+  quality_warnings?: string[]
+}
+
+export interface TelemetryProductFunnelDiffResponse {
+  window_days: number
+  legacy_funnel_counts: Record<string, number>
+  shadow_funnel_counts: Record<string, number>
+  diff_funnel_counts: Record<string, number>
+  data_quality?: TelemetryQualityMap
+  quality_warnings?: string[]
+}
+
+export interface TelemetryProductFunnelHistoryResponse {
+  window_days: number
+  history: Array<{ date: string } & Record<string, number>>
+  data_quality?: TelemetryQualityMap
+  quality_warnings?: string[]
+}
+
+export interface TelemetryButtonClicksResponse {
+  window_days: number
+  by_button_id: Record<string, number>
+  unknown_by_button_id?: Record<string, number>
+  data_quality?: TelemetryQualityMap
+  quality_warnings?: string[]
+}
+
+export interface TelemetryRevenueResponse {
+  window_days: number
+  total_stars: number
+  revenue_rub_approx: number
+  by_pack: Record<string, number>
+  by_source: Record<string, number>
+  data_quality?: TelemetryQualityMap
+  quality_warnings?: string[]
+}
+
+export interface OverviewV3Kpi {
+  value: number | null
+  numerator: number | null
+  denominator: number | null
+  delta_vs_prev_pct: number | null
+  trust_label: 'Trusted' | 'Partial' | 'Directional' | 'Broken'
+  reason?: string | null
+}
+
+export interface TelemetryOverviewV3Response {
+  window: '24h' | '7d' | '30d' | '90d'
+  window_days: number
+  source?: string | null
+  campaign?: string | null
+  entry_type?: string | null
+  flow_mode: 'canonical_only' | 'all_flows'
+  trust_mode: 'trusted_only' | 'all_data'
+  last_updated_at: string
+  trust: {
+    status: 'Good' | 'Caution' | 'Degraded' | 'Broken'
+    session_coverage_pct: number
+    payment_validity_pct: number
+    canonical_coverage_pct: number
+    reconciliation_pct: number
+    reconciliation_session_pct?: number
+    reconciliation_fallback_pct?: number
+    reconciliation_matched_events?: number
+    audit_pay_success_events?: number
+    payments_completed_events?: number
+    legacy_share_pct: number
+    warnings: string[]
+  }
+  kpis: Record<string, OverviewV3Kpi>
+  trend_flow: Array<{
+    date: string
+    started_users: number
+    photo_uploaded: number
+    preview_ready: number
+    favorite_selected: number
+    pay_success: number
+  }>
+  trend_revenue: Array<{
+    date: string
+    orders: number
+    paid_users: number
+    revenue: number
+    revenue_per_started_user: number | null
+  }>
+  bottlenecks: {
+    steps: Array<{
+      key: string
+      label: string
+      conversion_pct: number | null
+      numerator: number
+      denominator: number
+      delta_vs_prev_pct: number | null
+      state: 'OK' | 'Watch' | 'Broken'
+      reason?: string | null
+    }>
+    biggest_drop_step?: string | null
+    biggest_negative_delta?: string | null
+  }
+  experience_health: {
+    preview_success_rate: OverviewV3Kpi
+    all_variants_failed_rate: OverviewV3Kpi
+    median_time_to_first_preview_sec: OverviewV3Kpi
+    p95_time_to_first_preview_sec: OverviewV3Kpi
+    value_delivery_success_rate: OverviewV3Kpi
+    latency_trend: Array<{
+      date: string
+      median_time_to_preview_sec: number | null
+      p95_time_to_preview_sec: number | null
+    }>
+  }
+  summary: {
+    what_is_happening: string
+    main_problem: string
+    change_vs_prev: string
+  }
+}
+
 export const telemetryService = {
   getDashboard: (windowHours?: number) =>
     api.get('/admin/telemetry', { params: { window_hours: windowHours } }).then((r) => r.data),
@@ -341,21 +496,29 @@ export const telemetryService = {
     api
       .get('/admin/telemetry/errors', { params: { window_days: windowDays } })
       .then((r) => r.data as TelemetryErrorsResponse),
+  getHealth: (windowDays?: number) =>
+    api.get<TelemetryHealthResponse>('/admin/telemetry/health', { params: { window_days: windowDays } }).then((r) => r.data),
   getProductFunnel: (windowDays?: number) =>
-    api.get('/admin/telemetry/product-funnel', { params: { window_days: windowDays } }).then((r) => r.data),
+    api.get<TelemetryProductFunnelResponse>('/admin/telemetry/product-funnel', { params: { window_days: windowDays } }).then((r) => r.data),
+  getProductFunnelDiff: (windowDays?: number) =>
+    api
+      .get<TelemetryProductFunnelDiffResponse>('/admin/telemetry/product-funnel-diff', {
+        params: { window_days: windowDays },
+      })
+      .then((r) => r.data),
   getProductFunnelHistory: (windowDays?: number) =>
     api
-      .get<{ window_days: number; history: Array<{ date: string } & Record<string, number>> }>(
+      .get<TelemetryProductFunnelHistoryResponse>(
         '/admin/telemetry/product-funnel-history',
         { params: { window_days: windowDays } }
       )
       .then((r) => r.data),
   getButtonClicks: (windowDays?: number) =>
-    api.get<{ window_days: number; by_button_id: Record<string, number> }>('/admin/telemetry/button-clicks', { params: { window_days: windowDays } }).then((r) => r.data),
+    api.get<TelemetryButtonClicksResponse>('/admin/telemetry/button-clicks', { params: { window_days: windowDays } }).then((r) => r.data),
   getProductMetricsV2: (windowDays?: number) =>
     api.get<ProductMetricsV2>('/admin/telemetry/product-metrics-v2', { params: { window_days: windowDays } }).then((r) => r.data),
   getRevenue: (windowDays?: number) =>
-    api.get('/admin/telemetry/revenue', { params: { window_days: windowDays } }).then((r) => r.data),
+    api.get<TelemetryRevenueResponse>('/admin/telemetry/revenue', { params: { window_days: windowDays } }).then((r) => r.data),
   getPathTransitions: (windowDays?: number) =>
     api
       .get<PathTransitionsResponse>('/admin/telemetry/path-transitions', { params: { window_days: windowDays } })
@@ -374,6 +537,21 @@ export const telemetryService = {
         ...(limit != null && { limit }),
       },
     }).then((r) => r.data),
+  getOverviewV3: (params?: {
+    window?: '24h' | '7d' | '30d' | '90d'
+    source?: string
+    campaign?: string
+    entry_type?: string
+    flow_mode?: 'canonical_only' | 'all_flows'
+    trust_mode?: 'trusted_only' | 'all_data'
+  }) =>
+    api
+      .get<TelemetryOverviewV3Response>('/admin/telemetry/overview-v3', {
+        params,
+        // overview-v3 can be significantly heavier than regular telemetry widgets
+        timeout: 120000,
+      })
+      .then((r) => r.data),
 }
 
 export interface PathTransitionItem {
@@ -389,6 +567,13 @@ export interface PathTransitionsResponse {
   drop_off: PathTransitionItem[]
   /** True if audit_logs row limit was hit; data may be partial. */
   truncated?: boolean
+  shadow?: {
+    transitions?: PathTransitionItem[]
+    drop_off?: PathTransitionItem[]
+    paths?: PathSequenceItem[]
+    truncated?: boolean
+  }
+  data_quality?: TelemetryQualityMap
 }
 
 export interface PathSequenceItem {
@@ -401,6 +586,9 @@ export interface PathSequenceItem {
 export interface PathSequencesResponse {
   window_days: number
   paths: PathSequenceItem[]
+  shadow_paths?: PathSequenceItem[]
+  shadow_truncated?: boolean
+  data_quality?: TelemetryQualityMap
 }
 
 // ─── Bank transfer ─────────────────────────────────────────────────────────

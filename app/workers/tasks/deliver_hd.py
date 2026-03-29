@@ -13,11 +13,11 @@ from app.db.session import SessionLocal
 from app.models.favorite import Favorite
 from app.models.pack import Pack
 from app.models.session import Session
+from app.models.take import Take
 from app.models.user import User
 from app.services.audit.service import AuditService
 from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.balance_tariffs import _pack_outcome_label
-from app.services.compensations.service import CompensationService
 from app.services.favorites.service import FavoriteService
 from app.services.hd_balance.service import HDBalanceService
 from app.services.sessions.service import SessionService
@@ -125,6 +125,8 @@ def deliver_hd(
     favorite_id: str,
     status_chat_id: str | None = None,
     status_message_id: int | None = None,
+    cleanup_message_ids: list[int] | None = None,
+    suppress_post_upsell: bool = False,
 ) -> dict:
     """Upscale original and deliver HD to user."""
     db = SessionLocal()
@@ -140,19 +142,55 @@ def deliver_hd(
                 telegram.send_message(status_chat_id, "❌ Избранное не найдено.")
             return {"ok": False, "error": "favorite_not_found"}
 
+        user = db.query(User).filter(User.id == fav.user_id).one_or_none()
+        if not user:
+            favorites_hd_delivery_total.labels(outcome="failed").inc()
+            hd_delivery_failed_total.inc()
+            fav_svc.reset_hd_status(favorite_id)
+            db.commit()
+            if status_chat_id:
+                telegram.send_message(status_chat_id, "❌ Ошибка. Попробуйте ещё раз.")
+            return {"ok": False, "error": "user_not_found"}
+
         if fav.hd_status == "delivered":
             logger.info("deliver_hd_already_delivered", extra={"favorite_id": favorite_id})
             favorites_hd_delivery_total.labels(outcome="delivered").inc()
+            if status_chat_id:
+                if cleanup_message_ids:
+                    for msg_id in cleanup_message_ids:
+                        try:
+                            telegram.delete_message(status_chat_id, int(msg_id))
+                        except Exception:
+                            pass
+                if status_message_id:
+                    try:
+                        telegram.delete_message(status_chat_id, status_message_id)
+                    except Exception:
+                        pass
             if status_chat_id and fav.hd_path and os.path.isfile(fav.hd_path):
                 try:
+                    active_session = SessionService(db).get_active_session(user.id) if user else None
+                    remaining_photos = 0
+                    if active_session:
+                        remaining_photos = max(0, int((active_session.takes_limit or 0) - (active_session.takes_used or 0)))
                     telegram.send_document(
                         status_chat_id,
                         fav.hd_path,
-                        caption="🖼 4K версия (повтор)",
+                        caption=(
+                            "🖼 Ваш результат готов\n"
+                            f"Осталось {remaining_photos} фото для создания образов"
+                        ),
                         filename="Изображение_4K.png",
+                        reply_markup={
+                            "inline_keyboard": [
+                                [{"text": "↩️ Вернуться к трендам", "callback_data": "post_hd:trends"}],
+                                [{"text": "🔥 Создать фото", "callback_data": "post_hd:create"}],
+                            ]
+                        },
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("deliver_hd_send_repeat_failed", extra={"favorite_id": favorite_id})
+                    telegram.send_message(status_chat_id, f"✅ 4K готова, но не удалось отправить: {e}")
             return {"ok": True, "already_delivered": True}
 
         if not fav_svc.mark_rendering(favorite_id):
@@ -166,22 +204,10 @@ def deliver_hd(
             favorites_hd_delivery_total.labels(outcome="failed").inc()
             hd_delivery_failed_total.inc()
             fav_svc.reset_hd_status(favorite_id)
-            comp_svc = CompensationService(db)
-            comp_svc.auto_compensate_on_fail(favorite_id)
             db.commit()
             if status_chat_id:
-                telegram.send_message(status_chat_id, "❌ Оригинал не найден — кредит 4K возвращён.")
+                telegram.send_message(status_chat_id, "❌ Оригинал не найден. Попробуйте другой вариант.")
             return {"ok": False, "error": "original_missing"}
-
-        user = db.query(User).filter(User.id == fav.user_id).one_or_none()
-        if not user:
-            favorites_hd_delivery_total.labels(outcome="failed").inc()
-            hd_delivery_failed_total.inc()
-            fav_svc.reset_hd_status(favorite_id)
-            db.commit()
-            if status_chat_id:
-                telegram.send_message(status_chat_id, "❌ Ошибка. Попробуйте ещё раз.")
-            return {"ok": False, "error": "user_not_found"}
 
         out_dir = os.path.join(settings.storage_base_path, "outputs")
         os.makedirs(out_dir, exist_ok=True)
@@ -194,35 +220,63 @@ def deliver_hd(
             favorites_hd_delivery_total.labels(outcome="failed").inc()
             hd_delivery_failed_total.inc()
             fav_svc.reset_hd_status(favorite_id)
-            comp_svc = CompensationService(db)
-            comp_svc.auto_compensate_on_fail(favorite_id)
             db.commit()
             if status_chat_id:
-                telegram.send_message(status_chat_id, "❌ Ошибка при создании 4K — кредит 4K возвращён.")
+                telegram.send_message(status_chat_id, "❌ Ошибка при создании 4K. Попробуйте ещё раз.")
             return {"ok": False, "error": "upscale_failed"}
 
-        if not hd_svc.spend(user, 1):
-            logger.warning("deliver_hd_insufficient_balance", extra={"favorite_id": favorite_id, "user_id": user.id})
-            balance_rejected_total.inc()
+        # Charge once per whole take (A/B/C), not per variant.
+        take_obj = (
+            db.query(Take)
+            .filter(Take.id == fav.take_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        if not take_obj:
             favorites_hd_delivery_total.labels(outcome="failed").inc()
             hd_delivery_failed_total.inc()
             fav_svc.reset_hd_status(favorite_id)
-            try:
-                os.unlink(hd_path)
-            except OSError:
-                pass
             db.commit()
             if status_chat_id:
-                telegram.send_message(status_chat_id, "❌ Недостаточно доступа. Купите пакет.")
-            return {"ok": False, "error": "insufficient_hd_balance"}
+                telegram.send_message(status_chat_id, "❌ Снимок не найден.")
+            return {"ok": False, "error": "take_not_found"}
+
+        charged_now = False
+        if not bool(getattr(take_obj, "hd_bundle_charged", False)):
+            if not hd_svc.spend(user, 1):
+                logger.warning("deliver_hd_insufficient_balance", extra={"favorite_id": favorite_id, "user_id": user.id})
+                balance_rejected_total.inc()
+                favorites_hd_delivery_total.labels(outcome="failed").inc()
+                hd_delivery_failed_total.inc()
+                fav_svc.reset_hd_status(favorite_id)
+                try:
+                    os.unlink(hd_path)
+                except OSError:
+                    pass
+                db.commit()
+                if status_chat_id:
+                    telegram.send_message(status_chat_id, "❌ Недостаточно доступа. Купите пакет.")
+                return {"ok": False, "error": "insufficient_hd_balance"}
+            take_obj.hd_bundle_charged = True
+            db.add(take_obj)
+            charged_now = True
 
         fav_svc.mark_hd_delivered(favorite_id, hd_path)
 
-        if fav.session_id:
+        if fav.session_id and charged_now:
             session_obj = db.query(Session).filter(Session.id == fav.session_id).one_or_none()
             if session_obj:
                 session_svc = SessionService(db)
-                session_svc.use_hd(session_obj)
+                used_ok = session_svc.use_hd(session_obj)
+                if not used_ok:
+                    logger.error(
+                        "deliver_hd_session_counter_desync",
+                        extra={
+                            "favorite_id": favorite_id,
+                            "session_id": fav.session_id,
+                            "take_id": fav.take_id,
+                        },
+                    )
 
         audit = AuditService(db)
         audit.log(
@@ -231,14 +285,20 @@ def deliver_hd(
             action="hd_delivered",
             entity_type="favorite",
             entity_id=favorite_id,
-            payload={"session_id": fav.session_id, "take_id": fav.take_id, "variant": fav.variant},
+            payload={
+                "session_id": fav.session_id,
+                "take_id": fav.take_id,
+                "variant": fav.variant,
+                "charged_now": charged_now,
+            },
         )
         try:
-            ProductAnalyticsService(db).track(
+            ProductAnalyticsService(db).track_funnel_step(
                 "hd_delivered",
                 fav.user_id,
                 session_id=fav.session_id,
                 take_id=fav.take_id,
+                source_component="worker.deliver_hd",
                 properties={"variant": fav.variant},
             )
         except Exception as e:
@@ -247,17 +307,36 @@ def deliver_hd(
         db.commit()
 
         if status_chat_id:
+            if cleanup_message_ids:
+                for msg_id in cleanup_message_ids:
+                    try:
+                        telegram.delete_message(status_chat_id, int(msg_id))
+                    except Exception:
+                        pass
             if status_message_id:
                 try:
                     telegram.delete_message(status_chat_id, status_message_id)
                 except Exception:
                     pass
             try:
+                active_session = SessionService(db).get_active_session(user.id) if user else None
+                remaining_photos = 0
+                if active_session:
+                    remaining_photos = max(0, int((active_session.takes_limit or 0) - (active_session.takes_used or 0)))
                 telegram.send_document(
                     status_chat_id,
                     hd_path,
-                    caption="🖼 4K версия готова!",
+                    caption=(
+                        "🖼 Ваш результат готов\n"
+                        f"Осталось {remaining_photos} фото для создания образов"
+                    ),
                     filename="Изображение_4K.png",
+                    reply_markup={
+                        "inline_keyboard": [
+                            [{"text": "↩️ Вернуться к трендам", "callback_data": "post_hd:trends"}],
+                            [{"text": "🔥 Создать фото", "callback_data": "post_hd:create"}],
+                        ]
+                    },
                 )
                 favorites_hd_delivery_total.labels(outcome="delivered").inc()
             except Exception as e:
@@ -266,7 +345,8 @@ def deliver_hd(
                 hd_delivery_failed_total.inc()
                 telegram.send_message(status_chat_id, f"✅ 4K готова, но не удалось отправить: {e}")
 
-            _try_upsell_after_hd(db, fav, status_chat_id, telegram)
+            if not suppress_post_upsell:
+                _try_upsell_after_hd(db, fav, status_chat_id, telegram)
 
         if status_chat_id is None:
             favorites_hd_delivery_total.labels(outcome="delivered").inc()

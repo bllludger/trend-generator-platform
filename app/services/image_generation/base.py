@@ -19,6 +19,17 @@ class ImageGenerationRequest:
     temperature: float | None = None
     seed: int | None = None
     image_size_tier: str | None = None  # e.g. "1K", "2K" for Gemini imageConfig
+    # Optional multimodal input for playground/tests.
+    # Each item: {"path": "/tmp/file", "mime_type": "image/jpeg"}
+    input_files: list[dict[str, Any]] | None = None
+    # Optional Gemini generationConfig fields.
+    aspect_ratio: str | None = None
+    top_p: float | None = None
+    candidate_count: int | None = None
+    media_resolution: str | None = None
+    thinking_config: dict[str, Any] | None = None
+    # Keep production guardrails by default; playground may override.
+    allow_high_temperature: bool = False
 
 
 @dataclass
@@ -29,6 +40,8 @@ class ImageGenerationResponse:
     provider: str
     image_url: str | None = None
     image_b64: str | None = None
+    image_contents: list[bytes] | None = None
+    image_b64s: list[str] | None = None
     raw_response_sanitized: dict[str, Any] | None = None
 
 

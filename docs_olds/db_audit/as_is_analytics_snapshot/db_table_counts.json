@@ -1,0 +1,42 @@
+[
+  {
+    "table_name": "audit_logs",
+    "row_count": "5227"
+  },
+  {
+    "table_name": "bank_transfer_receipt_log",
+    "row_count": "23"
+  },
+  {
+    "table_name": "favorites",
+    "row_count": "78"
+  },
+  {
+    "table_name": "jobs",
+    "row_count": "277"
+  },
+  {
+    "table_name": "pack_orders",
+    "row_count": "1"
+  },
+  {
+    "table_name": "payments",
+    "row_count": "34"
+  },
+  {
+    "table_name": "referral_bonuses",
+    "row_count": "0"
+  },
+  {
+    "table_name": "sessions",
+    "row_count": "240"
+  },
+  {
+    "table_name": "takes",
+    "row_count": "253"
+  },
+  {
+    "table_name": "users",
+    "row_count": "557"
+  }
+]

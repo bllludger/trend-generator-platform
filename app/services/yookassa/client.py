@@ -57,7 +57,7 @@ class YooKassaClient:
         :param order_id: идентификатор unlock_order (в metadata и для return_url).
         :param return_url: URL возврата после оплаты (должен содержать order_id, например t.me/bot?start=unlock_done_<order_id>).
         :param idempotence_key: уникальный ключ попытки (UUID или order:order_id:attempt:attempt_id). При ретрае — тот же ключ.
-        :param amount_value: сумма в рублях строкой, например "129.00". По умолчанию из get_unlock_amount_yookassa_value().
+        :param amount_value: сумма в рублях строкой, например "99.00". По умолчанию из get_unlock_amount_yookassa_value().
         :param description: описание платежа.
         :return: dict с id, confirmation.confirmation_url, status и т.д. Или raise YooKassaClientError.
         """
@@ -80,26 +80,38 @@ class YooKassaClient:
             "Content-Type": "application/json",
         }
 
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(url, json=payload, headers=headers)
-            body = resp.text
-            try:
-                data = resp.json()
-            except Exception:
-                data = {}
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(url, json=payload, headers=headers)
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            logger.warning(
+                "yookassa_create_payment_network_error",
+                extra={"order_id": order_id, "error": str(exc)},
+            )
+            raise YooKassaClientError(
+                f"Network error: {exc}",
+                status_code=None,
+                response_body=None,
+            ) from exc
 
-            if resp.status_code >= 400:
-                logger.warning(
-                    "yookassa_create_payment_error",
-                    extra={"status": resp.status_code, "order_id": order_id, "body": body[:500]},
-                )
-                raise YooKassaClientError(
-                    data.get("description", body) or f"HTTP {resp.status_code}",
-                    status_code=resp.status_code,
-                    response_body=body,
-                )
+        body = resp.text
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
 
-            return data
+        if resp.status_code >= 400:
+            logger.warning(
+                "yookassa_create_payment_error",
+                extra={"status": resp.status_code, "order_id": order_id, "body": body[:500]},
+            )
+            raise YooKassaClientError(
+                data.get("description", body) or f"HTTP {resp.status_code}",
+                status_code=resp.status_code,
+                response_body=body,
+            )
+
+        return data
 
     def get_payment(self, payment_id: str) -> dict[str, Any] | None:
         """
@@ -110,9 +122,13 @@ class YooKassaClient:
             return None
         url = f"{YOOKASSA_API_BASE}/payments/{payment_id}"
         headers = {"Authorization": f"Basic {self._auth}"}
-        with httpx.Client(timeout=15.0) as client:
-            resp = client.get(url, headers=headers)
-            if resp.status_code != 200:
-                logger.warning("yookassa_get_payment_error", extra={"payment_id": payment_id, "status": resp.status_code})
-                return None
-            return resp.json()
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.get(url, headers=headers)
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            logger.warning("yookassa_get_payment_network_error", extra={"payment_id": payment_id, "error": str(exc)})
+            return None
+        if resp.status_code != 200:
+            logger.warning("yookassa_get_payment_error", extra={"payment_id": payment_id, "status": resp.status_code})
+            return None
+        return resp.json()

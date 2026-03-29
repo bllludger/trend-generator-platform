@@ -16,7 +16,6 @@ from app.models.referral_bonus import ReferralBonus
 from app.models.user import User
 from app.referral.config import (
     calc_bonus_credits,
-    get_attribution_window_days,
     get_daily_limit,
     get_hold_hours,
     get_min_pack_stars,
@@ -60,9 +59,12 @@ class ReferralService:
 
     def attribute(self, referral_user: User, referrer_code: str) -> bool:
         """
-        Assign referrer to a new user. Idempotent — ignores if already attributed.
-        Only works for users created within attribution_window_days.
+        Assign referrer to a user. Idempotent — ignores if already attributed.
+        Trial V2 model uses no attribution time window.
         """
+        if not bool(getattr(referral_user, "trial_v2_eligible", False)):
+            return False
+
         if referral_user.referred_by_user_id:
             return False
 
@@ -71,19 +73,13 @@ class ReferralService:
             logger.warning("referral_code_not_found", extra={"code": referrer_code})
             return False
 
+        if not bool(getattr(referrer, "trial_v2_eligible", False)):
+            return False
+
         if referrer.id == referral_user.id:
             return False
 
-        window = timedelta(days=get_attribution_window_days())
-        if referral_user.created_at and (
-            datetime.now(timezone.utc) - referral_user.created_at.replace(tzinfo=timezone.utc)
-            > window
-        ):
-            logger.info(
-                "referral_attribution_expired",
-                extra={"user_id": referral_user.id, "referrer_id": referrer.id},
-            )
-            return False
+        # Trial V2 referral unlock: attribution has no time window.
 
         referral_user.referred_by_user_id = referrer.id
         referral_user.referred_at = datetime.now(timezone.utc)

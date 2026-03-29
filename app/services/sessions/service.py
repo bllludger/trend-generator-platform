@@ -1,7 +1,7 @@
 import logging
 from uuid import uuid4
 
-from sqlalchemy import update
+from sqlalchemy import case, update
 from sqlalchemy.orm import Session as DBSession
 
 from app.models.pack import Pack
@@ -15,7 +15,7 @@ class SessionService:
     def __init__(self, db: DBSession):
         self.db = db
 
-    def create_session(self, user_id: str, pack_id: str) -> Session:
+    def create_session(self, user_id: str, pack_id: str, session_id: str | None = None) -> Session:
         pack = self.db.query(Pack).filter(Pack.id == pack_id).one_or_none()
         if not pack:
             raise ValueError(f"Pack not found: {pack_id}")
@@ -24,7 +24,7 @@ class SessionService:
                 "Use create_collection_session for collection packs"
             )
         session = Session(
-            id=str(uuid4()),
+            id=session_id or str(uuid4()),
             user_id=user_id,
             pack_id=pack_id,
             takes_limit=pack.takes_limit or 0,
@@ -40,6 +40,7 @@ class SessionService:
         self,
         user_id: str,
         pack: Pack,
+        session_id: str | None = None,
         input_photo_path: str | None = None,
         input_file_id: str | None = None,
     ) -> Session:
@@ -49,7 +50,7 @@ class SessionService:
                 f"Collection pack {pack.id} has no playlist — cannot create session"
             )
         session = Session(
-            id=str(uuid4()),
+            id=session_id or str(uuid4()),
             user_id=user_id,
             pack_id=pack.id,
             takes_limit=pack.takes_limit or len(playlist),
@@ -67,12 +68,12 @@ class SessionService:
         self.db.flush()
         return session
 
-    def create_free_preview_session(self, user_id: str) -> Session:
+    def create_free_preview_session(self, user_id: str, takes_limit: int = 1) -> Session:
         session = Session(
             id=str(uuid4()),
             user_id=user_id,
             pack_id="free_preview",
-            takes_limit=1,
+            takes_limit=max(int(takes_limit or 1), 1),
             takes_used=0,
             status="active",
         )
@@ -84,7 +85,12 @@ class SessionService:
         return (
             self.db.query(Session)
             .filter(Session.user_id == user_id, Session.status == "active")
-            .order_by(Session.created_at.desc())
+            # Если по историческим причинам осталось несколько active-сессий,
+            # для пользователя с оплатой всегда приоритизируем платный пакет.
+            .order_by(
+                case((Session.pack_id == "free_preview", 1), else_=0).asc(),
+                Session.created_at.desc(),
+            )
             .first()
         )
 
@@ -124,7 +130,7 @@ class SessionService:
         self.db.flush()
 
     def upgrade_session(
-        self, old_session: Session, new_pack_id: str, credit_stars: int
+        self, old_session: Session, new_pack_id: str, credit_stars: int, new_session_id: str | None = None
     ) -> Session:
         old_session.status = "upgraded"
         self.db.add(old_session)
@@ -134,7 +140,7 @@ class SessionService:
             raise ValueError(f"Pack not found: {new_pack_id}")
 
         new_session = Session(
-            id=str(uuid4()),
+            id=new_session_id or str(uuid4()),
             user_id=old_session.user_id,
             pack_id=new_pack_id,
             takes_limit=pack.takes_limit or 0,

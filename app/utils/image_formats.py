@@ -12,8 +12,8 @@ ASPECT_RATIO_TO_SIZE: dict[str, str] = {
     "3:4": "768x1024",     # Вертикальный
 }
 
-DEFAULT_ASPECT_RATIO = "1:1"
-DEFAULT_SIZE = "1024x1024"
+DEFAULT_ASPECT_RATIO = "3:4"
+DEFAULT_SIZE = "768x1024"
 
 
 def aspect_ratio_to_size(aspect_ratio: str | None) -> str:

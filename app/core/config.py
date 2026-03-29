@@ -103,7 +103,7 @@ class Settings(BaseSettings):
     gemini_project_id: str = ""  # Optional
     gemini_location: str = "us-central1"
     gemini_api_endpoint: str = "https://generativelanguage.googleapis.com"
-    gemini_image_model: str = "gemini-2.5-flash-image"  # or gemini-3-pro-image-preview
+    gemini_image_model: str = "gemini-2.5-flash-image"  # or gemini-3-pro-image-preview (Nano Banana Pro)
     gemini_timeout: float = 180.0  # генерация + загрузка тела ответа (изображение)
     # SafetySettings для generateContent (JSON-массив или пусто). Управляется только через конфиг/админку.
     gemini_safety_settings: str = ""
@@ -153,7 +153,7 @@ class Settings(BaseSettings):
     referral_attribution_window_days: int = 7
     referral_daily_limit: int = 2
     referral_monthly_limit: int = 10
-    referral_bonus_ladder: str = '{"153": 2, "538": 4, "1531": 8}'  # Neo Start / Neo Pro / Neo Unlimited
+    referral_bonus_ladder: str = '{"153": 2, "384": 4, "762": 8}'  # Neo Start / Neo Pro / Neo Unlimited
 
     # ===========================================
     # BANK TRANSFER (альтернативная оплата переводом на карту)

@@ -250,6 +250,18 @@ export function UserDetailPage() {
 
   const sessions = Array.isArray(user.sessions) ? user.sessions : []
   const payments = Array.isArray(user.payments) ? user.payments : []
+  const isTrialV2User = Boolean(user.trial_v2_eligible)
+  const trialV2 = user.trial_v2
+  const trialSlotsUsed = trialV2?.trend_slots_used ?? 0
+  const trialSlotsTotal = trialV2?.trend_slots_total ?? 3
+  const trialSlotsRemaining = Math.max(0, trialSlotsTotal - trialSlotsUsed)
+  const trialRerollsUsed = trialV2?.rerolls_used ?? 0
+  const trialRerollsTotal = trialV2?.rerolls_total ?? 3
+  const trialRewardsAvailable = trialV2?.reward_available ?? 0
+  const trialRewardsEarned = trialV2?.reward_earned_total ?? 0
+  const trialRewardsClaimed = trialV2?.reward_claimed_total ?? 0
+  const activePackId = String(user.active_session?.pack_id ?? '').trim().toLowerCase()
+  const isTrialSession = Boolean(user.active_session) && (activePackId === 'trial' || (activePackId === 'free_preview' && isTrialV2User))
 
   return (
     <UserDetailErrorBoundary>
@@ -362,20 +374,44 @@ export function UserDetailPage() {
                 {user.token_balance != null ? formatNumber(user.token_balance) : '—'}
               </span>
             </div>
-            <div>
-              <span className="text-muted-foreground">Пробный тариф:</span>{' '}
-              {user.trial_purchased ? 'Использован' : 'Нет'}
-            </div>
-            <div
-              title="Один бесплатный снимок на аккаунт; при 0 из 1 в боте можно получить новую free_preview-сессию"
-            >
-              <span className="text-muted-foreground">Бесплатное фото (аккаунт):</span>{' '}
-              {typeof user.free_takes_used === 'number'
-                ? user.free_takes_used >= 1
-                  ? 'исчерпано'
-                  : `использовано ${user.free_takes_used} из 1`
-                : '—'}
-            </div>
+            {isTrialV2User ? (
+              <>
+                <div>
+                  <span className="text-muted-foreground">Trial V2:</span>{' '}
+                  <span className="font-medium">включен</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Слоты образов:</span>{' '}
+                  <span className="font-mono">{trialSlotsUsed} / {trialSlotsTotal}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Reroll:</span>{' '}
+                  <span className="font-mono">{trialRerollsUsed} / {trialRerollsTotal}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Referral reward:</span>{' '}
+                  <span className="font-mono">{trialRewardsAvailable}</span>
+                  <span className="text-muted-foreground"> (доступно)</span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <span className="text-muted-foreground">Пробный тариф:</span>{' '}
+                  {user.trial_purchased ? 'Использован' : 'Нет'}
+                </div>
+                <div
+                  title="Один бесплатный снимок на аккаунт; при 0 из 1 в боте можно получить новую free_preview-сессию"
+                >
+                  <span className="text-muted-foreground">Бесплатное фото (аккаунт):</span>{' '}
+                  {typeof user.free_takes_used === 'number'
+                    ? user.free_takes_used >= 1
+                      ? 'исчерпано'
+                      : `использовано ${user.free_takes_used} из 1`
+                    : '—'}
+                </div>
+              </>
+            )}
             <div>
               <span className="text-muted-foreground">Беспл. генерации:</span>{' '}
               {(user.free_generations_used ?? 0)} / {(user.free_generations_limit != null ? user.free_generations_limit : '—')}
@@ -409,16 +445,33 @@ export function UserDetailPage() {
             <div className="space-y-2 text-sm">
               <p>
                 <span className="font-medium">
-                  {user.active_session.pack_id === 'free_preview' ? 'Бесплатный' : (user.active_session.pack_name ?? '—')}
+                  {isTrialSession
+                    ? 'Trial V2'
+                    : user.active_session.pack_id === 'free_preview'
+                      ? 'Бесплатный'
+                      : (user.active_session.pack_name ?? '—')}
                 </span>{' '}
                 <span className="text-muted-foreground">({user.active_session.pack_id})</span>
               </p>
-              <p title="По текущей сессии; для free_preview лимит 1 фото">
-                Осталось фото: <span className="font-mono">{user.active_session.takes_remaining ?? 0}</span>
-                {user.active_session.takes_limit != null && (
-                  <span className="text-muted-foreground"> из {user.active_session.takes_limit}</span>
-                )}
-              </p>
+              {isTrialSession ? (
+                <>
+                  <p title="Trial V2: 3 уникальных образа, по 1 reroll на каждый слот">
+                    Осталось образов: <span className="font-mono">{trialSlotsRemaining}</span>
+                    <span className="text-muted-foreground"> из {trialSlotsTotal}</span>
+                  </p>
+                  <p>
+                    Referral rewards: <span className="font-mono">{trialRewardsAvailable}</span>
+                    <span className="text-muted-foreground"> доступно, начислено {trialRewardsEarned}, забрано {trialRewardsClaimed}</span>
+                  </p>
+                </>
+              ) : (
+                <p title="По текущей сессии; для free_preview лимит 1 фото">
+                  Осталось фото: <span className="font-mono">{user.active_session.takes_remaining ?? 0}</span>
+                  {user.active_session.takes_limit != null && (
+                    <span className="text-muted-foreground"> из {user.active_session.takes_limit}</span>
+                  )}
+                </p>
+              )}
               <p>
                 Осталось 4К: <span className="font-mono">{user.active_session.hd_remaining ?? 0}</span>
                 {user.active_session.hd_limit != null && (
@@ -460,7 +513,9 @@ export function UserDetailPage() {
                   {sessions.map((s: UserDetailSession, idx: number) => (
                     <TableRow key={s?.id ?? `session-${idx}`}>
                       <TableCell>
-                        {s.pack_id === 'free_preview' ? 'Бесплатный' : (s.pack_name ?? '—')}{' '}
+                        {s.pack_id === 'free_preview'
+                          ? (isTrialV2User ? 'Trial V2' : 'Бесплатный')
+                          : (s.pack_name ?? '—')}{' '}
                         <span className="text-muted-foreground">({s.pack_id ?? '—'})</span>
                       </TableCell>
                       <TableCell>{s.status ?? '—'}</TableCell>

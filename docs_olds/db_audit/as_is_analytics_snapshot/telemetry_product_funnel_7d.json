@@ -1,0 +1,56 @@
+{
+  "window_days": 7,
+  "funnel_counts": {
+    "bot_started": 6,
+    "photo_uploaded": 2,
+    "take_preview_ready": 2,
+    "favorite_selected": 0,
+    "paywall_viewed": 0,
+    "pack_selected": 0,
+    "pay_initiated": 0,
+    "pay_success": 0,
+    "hd_delivered": 0
+  },
+  "shadow_funnel_counts": {
+    "bot_started": 0,
+    "photo_uploaded": 1,
+    "take_preview_ready": 2,
+    "favorite_selected": 0,
+    "paywall_viewed": 0,
+    "pack_selected": 0,
+    "pay_initiated": 0,
+    "pay_success": 0,
+    "hd_delivered": 0
+  },
+  "diff_funnel_counts": {
+    "bot_started": -6,
+    "photo_uploaded": -1,
+    "take_preview_ready": 0,
+    "favorite_selected": 0,
+    "paywall_viewed": 0,
+    "pack_selected": 0,
+    "pay_initiated": 0,
+    "pay_success": 0,
+    "hd_delivered": 0
+  },
+  "data_quality": {
+    "required_session_id": true,
+    "total_funnel_events": 25,
+    "missing_session_events": 22,
+    "funnel_session_coverage_pct": 12.0,
+    "missing_session_events_by_step": {
+      "bot_started": 7,
+      "photo_uploaded": 2,
+      "take_preview_ready": 0,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 1,
+      "hd_delivered": 12
+    }
+  },
+  "quality_warnings": [
+    "Часть funnel-событий без session_id. Path/shadow-метрики могут быть ниже legacy."
+  ]
+}

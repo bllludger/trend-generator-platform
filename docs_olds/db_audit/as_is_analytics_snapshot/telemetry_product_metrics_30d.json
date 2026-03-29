@@ -1,0 +1,25 @@
+{
+  "window_days": 30,
+  "dau": 1,
+  "wau": 22,
+  "mau": 226,
+  "stickiness_pct": 0,
+  "funnel_counts": {
+    "collection_start": 0,
+    "take_previews_ready": 239,
+    "pay_success": 5,
+    "collection_complete": 0,
+    "hd_delivered": 32
+  },
+  "share_trial_purchases": 40.0,
+  "avg_stars_per_pay_success": 0.0,
+  "trial_purchases_count": 2,
+  "total_pay_success_count": 5,
+  "jobs_per_user_distribution": {
+    "1": 10,
+    "2_5": 29,
+    "6_10": 1,
+    "11_20": 1,
+    "21_plus": 1
+  }
+}

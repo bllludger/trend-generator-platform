@@ -17,7 +17,7 @@ class UnlockOrder(Base):
     telegram_user_id = Column(String, nullable=False, index=True)
     take_id = Column(String, nullable=False, index=True)
     variant = Column(String(1), nullable=False)
-    amount_kopecks = Column(Integer, nullable=False, default=12900)
+    amount_kopecks = Column(Integer, nullable=False, default=9900)
     status = Column(String, nullable=False, default="created")
     yookassa_payment_id = Column(String, nullable=True, index=True)
     confirmation_url = Column(String, nullable=True)

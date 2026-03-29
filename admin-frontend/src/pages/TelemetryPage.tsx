@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { telemetryService } from '@/services/api'
+import { TelemetryOverviewV3 } from '@/components/telemetry/TelemetryOverviewV3'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -151,6 +152,12 @@ const BUTTON_CLICK_LABELS: Record<string, string> = {
   open_favorites: 'Избранное',
 }
 
+const TELEMETRY_OVERVIEW_V3_ENABLED = ['1', 'true', 'yes'].includes(
+  String(import.meta.env.VITE_TELEMETRY_OVERVIEW_V3 ?? '')
+    .trim()
+    .toLowerCase()
+)
+
 export function TelemetryPage() {
   const [windowHours, setWindowHours] = useState(24)
   const [productWindowDays, setProductWindowDays] = useState(7)
@@ -175,6 +182,12 @@ export function TelemetryPage() {
   const { data: productFunnel } = useQuery({
     queryKey: ['telemetry-product-funnel', productWindowDays],
     queryFn: () => telemetryService.getProductFunnel(productWindowDays),
+  })
+
+  const { data: telemetryHealth } = useQuery({
+    queryKey: ['telemetry-health', productWindowDays],
+    queryFn: () => telemetryService.getHealth(productWindowDays),
+    refetchInterval: 60000,
   })
 
   const {
@@ -217,11 +230,23 @@ export function TelemetryPage() {
     queryFn: () => telemetryService.getPath(productWindowDays, 20),
   })
   const pathTransitionsData = pathData
-    ? { window_days: pathData.window_days, transitions: pathData.transitions, drop_off: pathData.drop_off }
+    ? {
+        window_days: pathData.window_days,
+        transitions: pathData.transitions,
+        drop_off: pathData.drop_off,
+        data_quality: pathData.data_quality,
+        shadow: pathData.shadow,
+      }
     : undefined
-  const pathSequencesData = pathData ? { window_days: pathData.window_days, paths: pathData.paths } : undefined
+  const pathSequencesData = pathData
+    ? {
+        window_days: pathData.window_days,
+        paths: pathData.paths,
+        shadow: pathData.shadow,
+      }
+    : undefined
 
-  if (isLoading) {
+  if (isLoading && !TELEMETRY_OVERVIEW_V3_ENABLED) {
     return (
       <div className="flex items-center justify-center h-96">
         <div className="text-muted-foreground">Загрузка аналитики...</div>
@@ -243,6 +268,23 @@ export function TelemetryPage() {
         { range: '21+', users: productMetrics.jobs_per_user_distribution['21_plus'] ?? 0 },
       ]
     : []
+
+  const qualityWarnings = Array.from(
+    new Set([
+      ...(telemetryHealth?.quality_warnings ?? []),
+      ...(productFunnel?.quality_warnings ?? []),
+      ...(funnelHistoryData?.quality_warnings ?? []),
+      ...(buttonClicksData?.quality_warnings ?? []),
+      ...(revenueData?.quality_warnings ?? []),
+    ])
+  )
+  const unknownButtonIds = new Set(
+    Object.keys(buttonClicksData?.unknown_by_button_id ?? {})
+  )
+  const knownButtonEntries = Object.entries(buttonClicksData?.by_button_id ?? {}).filter(
+    ([buttonId]) => !unknownButtonIds.has(buttonId)
+  )
+  const hasUnknownButtons = unknownButtonIds.size > 0
 
   return (
     <div className="space-y-8 pb-8">
@@ -281,6 +323,60 @@ export function TelemetryPage() {
         </div>
       </div>
 
+      {!TELEMETRY_OVERVIEW_V3_ENABLED && (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge
+              variant={
+                telemetryHealth == null
+                  ? 'outline'
+                  : telemetryHealth.status === 'ok'
+                  ? 'secondary'
+                  : 'destructive'
+              }
+            >
+              {telemetryHealth == null
+                ? 'Quality: Loading...'
+                : telemetryHealth.status === 'ok'
+                ? 'Quality: OK'
+                : 'Quality: Degraded'}
+            </Badge>
+            <Badge variant="outline">Источник: audit_logs</Badge>
+            {typeof telemetryHealth?.data_quality?.funnel_session_coverage_pct === 'number' && (
+              <Badge variant="outline">
+                Session coverage: {telemetryHealth.data_quality.funnel_session_coverage_pct}%
+              </Badge>
+            )}
+            {typeof telemetryHealth?.data_quality?.button_id_coverage_pct === 'number' && (
+              <Badge variant="outline">
+                Button coverage: {telemetryHealth.data_quality.button_id_coverage_pct}%
+              </Badge>
+            )}
+          </div>
+
+          {qualityWarnings.length > 0 && (
+            <Card className="border-amber-500/50 bg-amber-500/10">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2">
+                  <AlertCircle className="h-4 w-4" />
+                  Внимание к качеству данных
+                </CardTitle>
+                <CardDescription>
+                  Система показывает предупреждения сбора. Решения по продукту лучше принимать с учётом этих ограничений.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="pt-0">
+                <div className="space-y-1 text-sm">
+                  {qualityWarnings.map((w) => (
+                    <p key={w} className="text-amber-900 dark:text-amber-200">{w}</p>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </>
+      )}
+
       <Tabs defaultValue="overview" className="space-y-6">
         <TabsList className="grid w-full grid-cols-4 lg:grid-cols-8 lg:w-auto lg:flex-wrap">
           <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -295,6 +391,10 @@ export function TelemetryPage() {
 
         {/* OVERVIEW */}
         <TabsContent value="overview" className="space-y-6">
+          {TELEMETRY_OVERVIEW_V3_ENABLED ? (
+            <TelemetryOverviewV3 />
+          ) : (
+            <>
           {/* User Metrics */}
           <div>
             <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
@@ -632,9 +732,11 @@ export function TelemetryPage() {
                   )}
                 </div>
               </CardContent>
-            </Card>
+              </Card>
 
           </div>
+            </>
+          )}
         </TabsContent>
 
         {/* FUNNEL */}
@@ -656,7 +758,7 @@ export function TelemetryPage() {
             <CardHeader>
               <CardTitle>Воронка продукта</CardTitle>
               <CardDescription>
-                Уникальные пользователи по шагам (хотя бы одно событие за {productWindowDays} д.). Выбор тарифа — нажатие на любой пакет (Stars, ЮMoney, перевод на карту). Ниже — историческая динамика по дням.
+                Уникальные пользователи по шагам (хотя бы одно событие за {productWindowDays} д.). Источник: audit_logs (action/user_id/session_id). Выбор тарифа — нажатие на любой пакет (Stars, ЮMoney, перевод на карту). Ниже — историческая динамика по дням.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -675,6 +777,31 @@ export function TelemetryPage() {
                 </div>
               ) : (
                 <p className="text-muted-foreground">Нет данных за период.</p>
+              )}
+
+              {productFunnel?.shadow_funnel_counts && (
+                <div className="mt-6 rounded-md border">
+                  <div className="border-b bg-muted/50 px-3 py-2 text-sm font-medium">
+                    Shadow compare (legacy vs session-required)
+                  </div>
+                  <div className="p-3 space-y-2">
+                    {Object.keys(productFunnel.funnel_counts ?? {}).map((key) => {
+                      const legacy = Number(productFunnel.funnel_counts?.[key] ?? 0)
+                      const shadow = Number(productFunnel.shadow_funnel_counts?.[key] ?? 0)
+                      const diff = Number(productFunnel.diff_funnel_counts?.[key] ?? 0)
+                      return (
+                        <div key={key} className="grid grid-cols-4 gap-2 text-xs">
+                          <span>{FUNNEL_LABELS[key] ?? key}</span>
+                          <span className="text-muted-foreground">legacy: {legacy}</span>
+                          <span className="text-muted-foreground">shadow: {shadow}</span>
+                          <span className={diff < 0 ? 'text-destructive' : 'text-muted-foreground'}>
+                            Δ {diff}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
               )}
             </CardContent>
           </Card>
@@ -763,6 +890,11 @@ export function TelemetryPage() {
           {pathData?.truncated && (
             <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-2 text-sm text-amber-800 dark:text-amber-200">
               Данные обрезаны по лимиту строк. Уменьшите окно (например 7 или 14 д.), чтобы получить полную выборку.
+            </div>
+          )}
+          {(Number(pathTransitionsData?.data_quality?.excluded_without_session_events ?? 0) > 0) && (
+            <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-2 text-sm text-amber-800 dark:text-amber-200">
+              Для shadow-расчёта исключено событий без session_id: {Number(pathTransitionsData?.data_quality?.excluded_without_session_events ?? 0)}.
             </div>
           )}
 
@@ -916,32 +1048,73 @@ export function TelemetryPage() {
             <CardHeader>
               <CardTitle>Клики по кнопкам</CardTitle>
               <CardDescription>
-                События button_click за {buttonClicksData?.window_days ?? productWindowDays} д.
+                События button_click за {buttonClicksData?.window_days ?? productWindowDays} д. Источник: audit_logs.payload.button_id.
               </CardDescription>
             </CardHeader>
             <CardContent>
+              <div className="mb-3 flex flex-wrap gap-2">
+                {typeof buttonClicksData?.data_quality?.button_id_coverage_pct === 'number' && (
+                  <Badge variant="outline">
+                    Coverage: {buttonClicksData.data_quality.button_id_coverage_pct}%
+                  </Badge>
+                )}
+                {typeof buttonClicksData?.data_quality?.unknown_button_id_events === 'number' && (
+                  <Badge variant="outline">
+                    Unknown IDs: {buttonClicksData.data_quality.unknown_button_id_events}
+                  </Badge>
+                )}
+              </div>
               {buttonClicksError ? (
                 <p className="text-destructive">Ошибка загрузки. Обновите страницу или выберите другое окно.</p>
-              ) : buttonClicksData?.by_button_id && Object.keys(buttonClicksData.by_button_id).length > 0 ? (
-                <div className="rounded-md border">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b bg-muted/50">
-                        <th className="text-left p-3 font-medium">Кнопка</th>
-                        <th className="text-right p-3 font-medium">Кликов</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {Object.entries(buttonClicksData.by_button_id)
-                        .sort(([, a], [, b]) => (b as number) - (a as number))
-                        .map(([buttonId, count]) => (
-                          <tr key={buttonId} className="border-b last:border-0">
-                            <td className="p-3">{BUTTON_CLICK_LABELS[buttonId] ?? buttonId}</td>
-                            <td className="p-3 text-right font-medium">{formatNumber(count as number)}</td>
+              ) : knownButtonEntries.length > 0 || hasUnknownButtons ? (
+                <div className="space-y-4">
+                  {knownButtonEntries.length > 0 && (
+                    <div className="rounded-md border">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b bg-muted/50">
+                            <th className="text-left p-3 font-medium">Кнопка</th>
+                            <th className="text-right p-3 font-medium">Кликов</th>
                           </tr>
-                        ))}
-                    </tbody>
-                  </table>
+                        </thead>
+                        <tbody>
+                          {knownButtonEntries
+                            .sort(([, a], [, b]) => (b as number) - (a as number))
+                            .map(([buttonId, count]) => (
+                              <tr key={buttonId} className="border-b last:border-0">
+                                <td className="p-3">{BUTTON_CLICK_LABELS[buttonId] ?? buttonId}</td>
+                                <td className="p-3 text-right font-medium">{formatNumber(count as number)}</td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  {hasUnknownButtons && buttonClicksData?.unknown_by_button_id && (
+                    <div className="rounded-md border border-amber-500/50">
+                      <div className="border-b bg-amber-500/10 px-3 py-2 text-sm font-medium">
+                        Не классифицировано (unknown button_id)
+                      </div>
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b bg-muted/30">
+                            <th className="text-left p-3 font-medium">button_id</th>
+                            <th className="text-right p-3 font-medium">Кликов</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {Object.entries(buttonClicksData.unknown_by_button_id)
+                            .sort(([, a], [, b]) => (b as number) - (a as number))
+                            .map(([buttonId, count]) => (
+                              <tr key={buttonId} className="border-b last:border-0">
+                                <td className="p-3 font-mono text-xs">{buttonId}</td>
+                                <td className="p-3 text-right font-medium">{formatNumber(count as number)}</td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <p className="text-muted-foreground">Нет данных за период.</p>
@@ -1081,6 +1254,24 @@ export function TelemetryPage() {
           </div>
           {revenueData != null ? (
             <>
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="outline">Источник: audit_logs.pay_success</Badge>
+                {typeof revenueData?.data_quality?.valid_price_pct === 'number' && (
+                  <Badge variant="outline">
+                    Valid price: {revenueData.data_quality.valid_price_pct}%
+                  </Badge>
+                )}
+                {typeof revenueData?.data_quality?.invalid_price_events === 'number' && (
+                  <Badge variant="outline">
+                    Invalid price events: {revenueData.data_quality.invalid_price_events}
+                  </Badge>
+                )}
+              </div>
+              {(revenueData.quality_warnings?.length ?? 0) > 0 && (
+                <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-2 text-sm text-amber-800 dark:text-amber-200">
+                  {revenueData.quality_warnings?.join(' ')}
+                </div>
+              )}
               <div className="grid gap-4 md:grid-cols-3">
                 <MetricCard title="Выручка (Stars)" value={formatNumber(revenueData.total_stars ?? 0)} subtitle={`за ${revenueData.window_days} д.`} icon={TrendingUp} color="bg-green-500" />
                 <MetricCard title="Выручка (₽)" value={formatNumber(revenueData.revenue_rub_approx ?? 0)} subtitle="приблизительно" icon={Activity} color="bg-success" />

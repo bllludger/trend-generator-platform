@@ -19,12 +19,12 @@ def get_unlock_cost_stars() -> int:
 
 
 # Разблокировка одного фото по ссылке ЮKassa — фиксированная цена в рублях
-UNLOCK_PRICE_RUB = 129
-UNLOCK_AMOUNT_KOPECKS = 12900  # 129 * 100
+UNLOCK_PRICE_RUB = 99
+UNLOCK_AMOUNT_KOPECKS = 9900  # 99 * 100
 
 
 def get_unlock_amount_yookassa_value() -> str:
-    """Сумма для API ЮKassa: строка в рублях, например '129.00'."""
+    """Сумма для API ЮKassa: строка в рублях, например '99.00'."""
     return f"{UNLOCK_PRICE_RUB}.00"
 
 

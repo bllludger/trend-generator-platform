@@ -137,7 +137,7 @@ class TestCreateBonus:
         db = MagicMock()
         referrer = _make_user()
         referral = _make_user()
-        payment = _make_payment(stars_amount=538, pack_id="unlock")
+        payment = _make_payment(stars_amount=384, pack_id="unlock")
 
         from app.referral.service import ReferralService
 
@@ -170,7 +170,7 @@ class TestCreateBonus:
         db.query.return_value.filter.return_value.first.return_value = None
         referrer = _make_user()
         referral = _make_user()
-        payment = _make_payment(stars_amount=538)
+        payment = _make_payment(stars_amount=384)
 
         from app.referral.service import ReferralService
 
@@ -284,9 +284,7 @@ class TestCodeGeneration:
 
 class TestBotParsing:
     def test_parse_referral_code(self):
-        import sys
-        sys.modules.pop("app.bot.main", None)
-        from app.bot.main import _parse_referral_code
+        from app.bot.helpers import _parse_referral_code
 
         assert _parse_referral_code("/start ref_ABC123") == "ABC123"
         assert _parse_referral_code("/start trend_xyz") is None
@@ -294,7 +292,7 @@ class TestBotParsing:
         assert _parse_referral_code(None) is None
 
     def test_parse_start_arg_still_works(self):
-        from app.bot.main import _parse_start_arg
+        from app.bot.helpers import _parse_start_arg
 
         assert _parse_start_arg("/start trend_abc") == "abc"
         assert _parse_start_arg("/start ref_xyz") is None

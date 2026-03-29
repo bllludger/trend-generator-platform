@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+from celery.exceptions import Retry
 from sqlalchemy.orm import Session
 
 from app.core.celery_app import celery_app
@@ -19,7 +20,7 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models.take import Take
 from app.models.trend import Trend
-from app.models.user import User
+from app.services.idempotency import IdempotencyStore
 from app.services.app_settings.settings_service import AppSettingsService
 from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
 from app.services.image_generation import (
@@ -33,6 +34,7 @@ from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.sessions.service import SessionService
 from app.services.takes.service import TakeService
 from app.services.users.service import UserService
+from app.services.trial_v2.service import TrialV2Service
 from app.services.telegram.client import TelegramClient
 from app.services.telegram_messages.runtime import runtime_templates
 
@@ -40,6 +42,7 @@ from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as 
 from app.services.trends.service import TrendService
 from app.utils.image_formats import aspect_ratio_to_size
 from app.services.preview import PreviewService
+from app.models.user import User
 from app.utils.metrics import (
     takes_created_total,
     takes_completed_total,
@@ -53,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 VARIANTS = ["A", "B", "C"]
 RATE_LIMIT_DELAY = 1.5
+GENERATE_TAKE_LOCK_TTL_SECONDS = 900
 
 # Текст и кнопки после генерации (выбор варианта)
 RESULT_CHOOSE_TEXT = (
@@ -67,9 +71,10 @@ RESULT_CHOOSE_TEXT = (
 )
 RESULT_CHOOSE_BUTTON_LABEL = "💎 Выбрать и оплатить {}"  # .format("A") -> "💎 Выбрать и оплатить A"
 RESULT_CHOOSE_TEXT_WITH_PACK = (
-    "🎉 Ура! Ваши варианты готовы.\n\n"
-    "Выберите лучший снимок — он будет засчитан в ваш пакет.\n\n"
-    "Один снимок — в этом шаге: выберите лучший из трёх."
+    "🎉 Ваши фото готовы\n\n"
+    "Выберите лучший вариант — он будет сохранён\n\n"
+    "Или получите все 3 фото сразу\n"
+    "в максимальном качестве и без водяных знаков"
 )
 RESULT_CHOOSE_BUTTON_LABEL_PACK = "💎 Выбрать вариант {}"  # без «оплатить»
 MAX_VARIANT_RETRIES = 2
@@ -268,8 +273,16 @@ def _refund_free_take_on_failure(db, take, error_code: str | None = None) -> Non
         return
     from app.models.session import Session as SessionModel
     sess = db.query(SessionModel).filter(SessionModel.id == take.session_id).one_or_none()
-    if sess and getattr(sess, "pack_id", None) == "free_preview":
+    if not sess:
+        return
+    if getattr(sess, "pack_id", None) == "free_preview":
         UserService(db).return_free_take(take.user_id)
+        return
+    # Для платных пакетов возвращаем слот генерации при серверной ошибке.
+    try:
+        SessionService(db).return_take(sess)
+    except Exception:
+        logger.exception("refund_paid_take_failed", extra={"take_id": getattr(take, "id", None), "session_id": getattr(sess, "id", None)})
 
 
 # Лимиты: 3 варианта × (до 2 попыток каждый) × ~60–90 с на генерацию — запас 400/420 с
@@ -284,11 +297,15 @@ def generate_take(
     take_id: str,
     status_chat_id: str | None = None,
     status_message_id: int | None = None,
+    intro_message_id: int | None = None,
 ) -> dict:
     """Generate 3 preview variants (A/B/C) for a Take."""
     db: Session = SessionLocal()
     telegram = TelegramClient()
     started_at = time.time()
+    lock_store = None
+    lock_key = f"take:generate:{take_id}"
+    lock_acquired = False
     try:
         take_svc = TakeService(db)
         session_svc = SessionService(db)
@@ -299,6 +316,33 @@ def generate_take(
             if status_chat_id and status_message_id:
                 telegram.edit_message(status_chat_id, status_message_id, "❌ Задача не найдена.")
             return {"ok": False, "error": "take_not_found"}
+
+        if take.status in {"ready", "partial_fail", "failed"}:
+            logger.info("generate_take_skip_terminal", extra={"take_id": take_id, "status": take.status})
+            return {"ok": True, "take_id": take_id, "status": take.status, "skipped": "terminal"}
+
+        try:
+            lock_store = IdempotencyStore()
+            lock_acquired = lock_store.check_and_set(lock_key, ttl_seconds=GENERATE_TAKE_LOCK_TTL_SECONDS)
+        except Exception as e:
+            logger.warning("generate_take_lock_unavailable", extra={"take_id": take_id, "error": str(e)})
+            # Fail open: generation must still work if Redis is temporarily unavailable.
+            lock_store = None
+            lock_acquired = True
+
+        if not lock_acquired:
+            logger.info("generate_take_skip_in_progress", extra={"take_id": take_id})
+            retry_count = int(getattr(getattr(self, "request", None), "retries", 0) or 0)
+            max_retries = 60
+            if retry_count < max_retries:
+                raise self.retry(countdown=15, max_retries=max_retries)
+            logger.warning("generate_take_in_progress_retry_exhausted", extra={"take_id": take_id, "retries": retry_count})
+            return {"ok": False, "take_id": take_id, "status": take.status, "error": "in_progress_timeout"}
+
+        db.refresh(take)
+        if take.status in {"ready", "partial_fail", "failed"}:
+            logger.info("generate_take_skip_terminal_after_lock", extra={"take_id": take_id, "status": take.status})
+            return {"ok": True, "take_id": take_id, "status": take.status, "skipped": "terminal"}
 
         takes_created_total.inc()
 
@@ -452,7 +496,10 @@ def generate_take(
             def _parallel_progress_text(done: int, total: int = 3) -> str:
                 filled = "🟩" * done + "⬜" * (total - done)
                 if done == 0:
-                    return f"⏳ Генерация снимка [{filled}] Генерируем 3 варианта… 0/{total}"
+                    return runtime_templates.get(
+                        "progress.take_parallel",
+                        f"⏳ Анализируем фото [{filled}]\nСоздаём варианты · 1 из {total}",
+                    )
                 if done < total:
                     return f"⏳ Генерация снимка [{filled}] {done}/{total} готово"
                 return f"⏳ Генерация снимка [{filled}] Почти готово…"
@@ -660,10 +707,8 @@ def generate_take(
         if generation_duration_sec >= 0:
             take_generation_duration_seconds.observe(generation_duration_sec)
 
-        if take.session_id:
-            session = session_svc.get_session(take.session_id)
-            if session and not getattr(take, "is_reroll", False) and not getattr(take, "is_rescue_photo_replace", False):
-                session_svc.use_take(session)
+        # Не списываем лимит на этапе превью:
+        # расход идёт только при фактической выдаче full-quality (4K).
 
         audit = AuditService(db)
         audit.log(
@@ -686,38 +731,63 @@ def generate_take(
             if take.created_at else None
         )
         # Duplicate events possible on Celery retry; see docs/TELEMETRY_PRODUCT_EVENTS_RETRY_RISK.md
-        ProductAnalyticsService(db).track(
+        analytics = ProductAnalyticsService(db)
+        analytics.track_funnel_step(
             "take_preview_ready",
             take.user_id,
             session_id=take.session_id,
             trend_id=take.trend_id,
             take_id=take_id,
+            source_component="worker.generate_take",
             properties={
                 "preview_count": len(results),
                 "generation_latency_ms": generation_latency_ms,
             },
         )
         if take.trend_id:
-            ProductAnalyticsService(db).track(
+            analytics.track(
                 "trend_preview_ready",
                 take.user_id,
                 session_id=take.session_id,
                 trend_id=take.trend_id,
                 take_id=take_id,
+                source_component="worker.generate_take",
                 properties={
                     "preview_count": len(results),
                     "generation_latency_ms": generation_latency_ms,
                 },
             )
         latency_ms = int((time.time() - started_at) * 1000)
-        ProductAnalyticsService(db).track(
+        analytics.track(
             "generation_completed",
             take.user_id,
             take_id=take_id,
             session_id=take.session_id,
             trend_id=take.trend_id,
+            source_component="worker.generate_take",
             properties={"model": model, "provider": provider_name, "latency_ms": latency_ms},
         )
+
+        reward_push_payload = None
+        should_process_trial_referral = (
+            status == "ready"
+            and len(results) == 3
+            and str(getattr(take, "take_type", "") or "").upper() != "COPY"
+        )
+        if should_process_trial_referral:
+            try:
+                with db.begin_nested():
+                    reward_push_payload = TrialV2Service(db).process_first_successful_preview(take.user_id)
+                    if reward_push_payload:
+                        analytics.track(
+                            "trial_referral_reward_earned",
+                            reward_push_payload["referrer_user_id"],
+                            take_id=take_id,
+                            source_component="worker.generate_take",
+                            properties={"referral_user_id": take.user_id},
+                        )
+            except Exception:
+                logger.exception("trial_referral_reward_process_failed", extra={"take_id": take_id, "user_id": take.user_id})
 
         db.commit()
 
@@ -727,58 +797,98 @@ def generate_take(
                     telegram.delete_message(status_chat_id, status_message_id)
                 except Exception:
                     pass
+            if intro_message_id:
+                try:
+                    telegram.delete_message(status_chat_id, intro_message_id)
+                except Exception:
+                    pass
 
+            # Платным считаем любой пакет, кроме free_preview.
+            # Для платных отправляем сразу оригиналы (без watermark, без сжатия).
+            has_active_paid_package = False
+            paid_session = None
+            if take.session_id:
+                session = session_svc.get_session(take.session_id)
+                if session and (session.pack_id or "").strip().lower() != "free_preview":
+                    has_active_paid_package = True
+                    paid_session = session
+            if not has_active_paid_package and take.user_id:
+                active = session_svc.get_active_session(take.user_id)
+                if active and (active.pack_id or "").strip().lower() != "free_preview":
+                    has_active_paid_package = True
+                    paid_session = active
             media = []
             available_variants = []
             for variant in VARIANTS:
-                if variant in results:
-                    media.append({
-                        "type": "photo",
-                        "media_path": results[variant]["preview"],
-                        "caption": variant,
-                    })
-                    available_variants.append(variant)
+                if variant not in results:
+                    continue
+                media_path = results[variant]["original"] if has_active_paid_package else results[variant]["preview"]
+                media_type = "document" if has_active_paid_package else "photo"
+                media.append({
+                    "type": media_type,
+                    "media_path": media_path,
+                    "caption": variant,
+                })
+                available_variants.append(variant)
 
             if media:
                 try:
                     if len(media) == 1:
-                        telegram.send_photo(
-                            status_chat_id,
-                            media[0]["media_path"],
-                            caption=media[0].get("caption") or "",
-                        )
+                        if has_active_paid_package:
+                            telegram.send_document(
+                                status_chat_id,
+                                media[0]["media_path"],
+                                caption=f"Вариант {media[0].get('caption') or ''}".strip(),
+                            )
+                        else:
+                            telegram.send_photo(
+                                status_chat_id,
+                                media[0]["media_path"],
+                                caption=media[0].get("caption") or "",
+                            )
                     else:
                         telegram.send_media_group(status_chat_id, media)
                 except Exception as e:
                     logger.exception("generate_take_send_photo_failed", extra={"take_id": take_id})
                     telegram.send_message(status_chat_id, f"✅ Фото готово, но не удалось отправить: {e}")
 
-            # При активном пакете с остатком — текст и кнопки без «оплатить»
-            # Учитываем и сессию take, и текущую активную сессию пользователя (мог купить пакет пока шла генерация)
-            has_pack_remaining = False
-            if take.session_id:
-                session = session_svc.get_session(take.session_id)
-                if session and (session.pack_id or "").strip().lower() != "free_preview":
-                    remaining = (session.takes_limit or 0) - (session.takes_used or 0)
-                    has_pack_remaining = remaining > 0
-            if not has_pack_remaining and take.user_id:
-                active = session_svc.get_active_session(take.user_id)
-                if active and (active.pack_id or "").strip().lower() != "free_preview":
-                    remaining_active = (active.takes_limit or 0) - (active.takes_used or 0)
-                    if remaining_active > 0:
-                        has_pack_remaining = True
-            result_text = RESULT_CHOOSE_TEXT_WITH_PACK if has_pack_remaining else RESULT_CHOOSE_TEXT
-            button_label_tpl = RESULT_CHOOSE_BUTTON_LABEL_PACK if has_pack_remaining else RESULT_CHOOSE_BUTTON_LABEL
+            trial_v2_mode = False
+            if not has_active_paid_package and take.user_id:
+                trial_user = db.query(User).filter(User.id == take.user_id).one_or_none()
+                trial_v2_mode = bool(trial_user and getattr(trial_user, "trial_v2_eligible", False))
 
-            choose_buttons = [
-                {"text": button_label_tpl.format(v), "callback_data": f"choose:{take_id}:{v}"}
-                for v in available_variants
-            ]
-            keyboard_rows = [
-                [btn] for btn in choose_buttons
-            ] + [
-                [{"text": "🔁 Все 3 не подходят", "callback_data": f"rescue:reject_set:{take_id}"}],
-            ]
+            if trial_v2_mode:
+                result_text = (
+                    "✨ Готово! Посмотри, что получилось — выбери вариант:"
+                )
+                idx_map = {"A": "1", "B": "2", "C": "3"}
+                label_map = {"A": "1️⃣ Выбрать первый вариант", "B": "2️⃣ Выбрать второй вариант", "C": "3️⃣ Выбрать третий вариант"}
+                choose_buttons = [
+                    {"text": label_map.get(v, f"{idx_map.get(v, v)}️⃣ Выбрать вариант"), "callback_data": f"trial_select:{take_id}:{v}"}
+                    for v in available_variants
+                ]
+                keyboard_rows = [[btn] for btn in choose_buttons]
+                if len(available_variants) == 3:
+                    keyboard_rows.append([{"text": "🤍 Выбрать все 3", "callback_data": f"trial_select:{take_id}:ALL"}])
+            else:
+                if has_active_paid_package and paid_session:
+                    remaining = max(0, int((paid_session.takes_limit or 0) - (paid_session.takes_used or 0)))
+                    result_text = (
+                        f"Осталось {remaining} фото для создания образов\n\n"
+                        f"{RESULT_CHOOSE_TEXT_WITH_PACK}"
+                    )
+                else:
+                    result_text = RESULT_CHOOSE_TEXT_WITH_PACK if has_active_paid_package else RESULT_CHOOSE_TEXT
+                button_label_tpl = RESULT_CHOOSE_BUTTON_LABEL_PACK if has_active_paid_package else RESULT_CHOOSE_BUTTON_LABEL
+                choose_buttons = [
+                    {"text": button_label_tpl.format(v), "callback_data": f"choose:{take_id}:{v}"}
+                    for v in available_variants
+                ]
+                keyboard_rows = [[btn] for btn in choose_buttons]
+                if has_active_paid_package:
+                    keyboard_rows.append([{"text": "📦 Вернуть все 3 в лучшем качестве", "callback_data": f"return_all_hq:{take_id}"}])
+
+            keyboard_rows.append([{"text": "🔁 Все 3 не подходят", "callback_data": f"rescue:reject_set:{take_id}"}])
             keyboard = {"inline_keyboard": keyboard_rows}
             telegram.send_message(
                 status_chat_id,
@@ -786,7 +896,23 @@ def generate_take(
                 reply_markup=keyboard,
             )
 
+        if reward_push_payload:
+            try:
+                telegram.send_message(
+                    str(reward_push_payload["referrer_telegram_id"]),
+                    "🎉 Вы получили 1 фото в полном качестве за приглашённого друга.\n\n"
+                    "Теперь вы можете забрать выбранный результат бесплатно и без водяных знаков.",
+                    reply_markup={"inline_keyboard": [[{"text": "⬇️ Забрать фото", "callback_data": "trial_claim:next"}]]},
+                )
+            except Exception:
+                logger.exception(
+                    "trial_referral_reward_push_failed",
+                    extra={"referrer_telegram_id": reward_push_payload.get("referrer_telegram_id")},
+                )
+
         return {"ok": True, "take_id": take_id, "status": status, "variants": list(results.keys())}
+    except Retry:
+        raise
     except Exception:
         logger.exception("generate_take_fatal", extra={"take_id": take_id})
         generation_failed_total.labels(error_code="unexpected_error", source="take").inc()
@@ -807,5 +933,10 @@ def generate_take(
                 pass
         return {"ok": False, "error": "unexpected_error"}
     finally:
+        if lock_store is not None and lock_acquired:
+            try:
+                lock_store.release(lock_key)
+            except Exception as e:
+                logger.warning("generate_take_lock_release_failed", extra={"take_id": take_id, "error": str(e)})
         db.close()
         telegram.close()

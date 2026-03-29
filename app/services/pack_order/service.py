@@ -18,8 +18,8 @@ PACK_ORDER_PACK_IDS = ("neo_start", "neo_pro", "neo_unlimited")
 # Цены в рублях (DISPLAY_RUB из balance_tariffs)
 PACK_AMOUNT_RUB = {
     "neo_start": 199,
-    "neo_pro": 699,
-    "neo_unlimited": 1990,
+    "neo_pro": 499,
+    "neo_unlimited": 990,
 }
 
 

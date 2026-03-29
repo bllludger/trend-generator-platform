@@ -69,9 +69,17 @@ from app.models.traffic_source import TrafficSource
 from app.models.ad_campaign import AdCampaign
 from app.models.photo_merge_job import PhotoMergeJob
 from app.models.poster_settings import PosterSettings
+from app.models.trial_v2_progress import TrialV2Progress
 from app.models.trend_post import TrendPost
 from app.services.photo_merge.settings_service import PhotoMergeSettingsService
 from app.services.telegram.client import TelegramClient
+from app.services.product_analytics.service import (
+    FUNNEL_EVENT_NAMES as TRACKED_FUNNEL_EVENT_NAMES,
+    PRODUCT_ANALYTICS_SCHEMA_VERSION,
+    is_known_button_id,
+    is_known_product_event,
+)
+from app.services.product_analytics.overview_v3 import build_overview_v3
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(get_current_user)])
 
@@ -218,6 +226,10 @@ def security_unban_user(
     user.ban_reason = None
     user.banned_at = None
     user.banned_by = None
+    # Разбан должен полностью восстанавливать доступ: снимаем и возможную временную приостановку.
+    user.is_suspended = False
+    user.suspended_until = None
+    user.suspend_reason = None
     db.add(user)
     db.commit()
     _admin_audit(db, current_user, "user_unbanned", "user", user_id, {})
@@ -295,6 +307,123 @@ def security_set_moderator(
     db.commit()
     _admin_audit(db, current_user, "moderator", "user", user_id, {"is_moderator": user.is_moderator})
     return {"ok": True}
+
+
+@router.post("/security/users/{user_id}/hard-delete")
+def security_hard_delete_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Permanently delete a user and all directly related records.
+    This action is irreversible and intended for admin-only data purge.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    # Local imports keep this endpoint isolated from module import side effects.
+    from app.models.favorite import Favorite
+    from app.models.session import Session as SessionModel
+    from app.models.take import Take as TakeModel
+    from app.models.job import Job
+    from app.models.payment import Payment
+    from app.models.photo_merge_job import PhotoMergeJob
+    from app.models.compensation import CompensationLog
+    from app.models.token_ledger import TokenLedger
+    from app.models.product_event import ProductEvent
+    from app.models.referral_bonus import ReferralBonus
+    from app.models.referral_trial_reward import ReferralTrialReward
+    from app.models.trial_v2_progress import TrialV2Progress
+    from app.models.trial_v2_selection import TrialV2Selection
+    from app.models.trial_v2_trend_slot import TrialV2TrendSlot
+    from app.models.pack_order import PackOrder
+    from app.models.unlock_order import UnlockOrder
+    from app.models.trial_bundle_order import TrialBundleOrder
+    from app.models.bank_transfer_receipt_log import BankTransferReceiptLog
+
+    telegram_id = str(user.telegram_id or "")
+    deleted: dict[str, int] = {}
+
+    def _del(model, *conditions, label: str):
+        q = db.query(model)
+        for cond in conditions:
+            q = q.filter(cond)
+        count = q.delete(synchronize_session=False)
+        deleted[label] = int(count or 0)
+
+    try:
+        # Rows linked by internal user.id
+        # Keep dependency order: children first (payments can reference sessions/takes).
+        _del(Payment, Payment.user_id == user.id, label="payments")
+        _del(Favorite, Favorite.user_id == user.id, label="favorites")
+        _del(TakeModel, TakeModel.user_id == user.id, label="takes")
+        _del(SessionModel, SessionModel.user_id == user.id, label="sessions")
+        _del(Job, Job.user_id == user.id, label="jobs")
+        _del(PhotoMergeJob, PhotoMergeJob.user_id == user.id, label="photo_merge_jobs")
+        _del(CompensationLog, CompensationLog.user_id == user.id, label="compensation_log")
+        _del(TokenLedger, TokenLedger.user_id == user.id, label="token_ledger")
+        _del(ProductEvent, ProductEvent.user_id == user.id, label="product_events")
+        _del(TrialV2Progress, TrialV2Progress.user_id == user.id, label="trial_v2_progress")
+        _del(TrialV2Selection, TrialV2Selection.user_id == user.id, label="trial_v2_selections")
+        _del(TrialV2TrendSlot, TrialV2TrendSlot.user_id == user.id, label="trial_v2_trend_slots")
+
+        # Referral entities where user may appear in either role
+        _del(
+            ReferralBonus,
+            or_(ReferralBonus.referrer_user_id == user.id, ReferralBonus.referral_user_id == user.id),
+            label="referral_bonuses",
+        )
+        _del(
+            ReferralTrialReward,
+            or_(ReferralTrialReward.referrer_user_id == user.id, ReferralTrialReward.referral_user_id == user.id),
+            label="referral_trial_rewards",
+        )
+
+        # Rows linked by telegram_id (external checkout/order tables)
+        if telegram_id:
+            _del(PackOrder, PackOrder.telegram_user_id == telegram_id, label="pack_orders")
+            _del(UnlockOrder, UnlockOrder.telegram_user_id == telegram_id, label="unlock_orders")
+            _del(TrialBundleOrder, TrialBundleOrder.telegram_user_id == telegram_id, label="trial_bundle_orders")
+            _del(
+                BankTransferReceiptLog,
+                or_(BankTransferReceiptLog.telegram_user_id == telegram_id, BankTransferReceiptLog.user_id == user.id),
+                label="bank_transfer_receipt_log",
+            )
+        else:
+            _del(BankTransferReceiptLog, BankTransferReceiptLog.user_id == user.id, label="bank_transfer_receipt_log")
+
+        # Detach referrals in remaining users that point to the removed user.
+        detached_referrals = (
+            db.query(User)
+            .filter(User.referred_by_user_id == user.id)
+            .update(
+                {
+                    User.referred_by_user_id: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        deleted["users_detached_referrals"] = int(detached_referrals or 0)
+
+        # Delete the user itself last.
+        db.delete(user)
+        deleted["users"] = 1
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    _admin_audit(
+        db,
+        current_user,
+        "user_hard_deleted",
+        "user",
+        user_id,
+        {"telegram_id": telegram_id, "deleted": deleted},
+    )
+    return {"ok": True, "deleted": deleted}
 
 
 @router.post("/security/reset-limits")
@@ -782,6 +911,7 @@ def users_list(
             "last_active": last_active_iso,
             "trial_purchased": bool(getattr(u, "trial_purchased", False)),
             "free_takes_used": getattr(u, "free_takes_used", 0) or 0,
+            "trial_v2_eligible": bool(getattr(u, "trial_v2_eligible", False)),
             "payments_count": payments_count_by_user.get(u.id, 0),
             "active_session": active_session,
         })
@@ -824,6 +954,11 @@ def user_detail(user_id: str, db: Session = Depends(get_db)):
     sec = SecuritySettingsService(db).get_or_create()
     free_limit = getattr(sec, "free_generations_per_user", 3)
     copy_limit = getattr(sec, "copy_generations_per_user", 1)
+    trial_progress = (
+        db.query(TrialV2Progress)
+        .filter(TrialV2Progress.user_id == user.id)
+        .one_or_none()
+    )
 
     def _session_row(s: SessionModel):
         pack = pack_map.get(s.pack_id)
@@ -877,6 +1012,21 @@ def user_detail(user_id: str, db: Session = Depends(get_db)):
         "suspended_until": user.suspended_until.isoformat() if user.suspended_until else None,
         "rate_limit_per_hour": user.rate_limit_per_hour,
         "is_moderator": user.is_moderator,
+        "trial_v2_eligible": bool(getattr(user, "trial_v2_eligible", False)),
+        "trial_first_preview_completed": bool(getattr(user, "trial_first_preview_completed", False)),
+        "trial_first_preview_completed_at": user.trial_first_preview_completed_at.isoformat() if getattr(user, "trial_first_preview_completed_at", None) else None,
+        "trial_v2": {
+            "trend_slots_used": int(getattr(trial_progress, "trend_slots_used", 0) or 0),
+            "trend_slots_total": 3,
+            "rerolls_used": int(getattr(trial_progress, "rerolls_used", 0) or 0),
+            "rerolls_total": 3,
+            "takes_used": int(getattr(trial_progress, "takes_used", 0) or 0),
+            "takes_total": 6,
+            "reward_earned_total": int(getattr(trial_progress, "reward_earned_total", 0) or 0),
+            "reward_claimed_total": int(getattr(trial_progress, "reward_claimed_total", 0) or 0),
+            "reward_available": int(getattr(trial_progress, "reward_available", 0) or 0),
+            "reward_reserved": int(getattr(trial_progress, "reward_reserved", 0) or 0),
+        },
         "created_at": user.created_at.isoformat() if user.created_at else None,
         "updated_at": user.updated_at.isoformat() if user.updated_at else None,
         "last_active": last_active_iso,
@@ -944,7 +1094,7 @@ def user_grant_pack(
         if pack.id in PRODUCT_LADDER_IDS:
             try:
                 payment, session, trial_error = payment_svc.grant_session_pack_admin(
-                    user.telegram_id, body.pack_id, reference
+                    user.telegram_id, body.pack_id, reference, allow_trial_regrant=True
                 )
             except ValueError as e:
                 admin_grant_pack_total.labels(status="failure").inc()
@@ -1612,17 +1762,7 @@ def telemetry_product_metrics(db: Session = Depends(get_db), window_days: int = 
 
 
 # ---------- Product analytics (from audit_logs — single event log) ----------
-FUNNEL_EVENT_NAMES = [
-    "bot_started",
-    "photo_uploaded",
-    "take_preview_ready",
-    "favorite_selected",
-    "paywall_viewed",
-    "pack_selected",
-    "pay_initiated",
-    "pay_success",
-    "hd_delivered",
-]
+FUNNEL_EVENT_NAMES = list(TRACKED_FUNNEL_EVENT_NAMES)
 
 
 def _audit_user_id_expr():
@@ -1645,19 +1785,88 @@ def telemetry_product_funnel(
     db: Session = Depends(get_db),
     window_days: int = Query(7, ge=1, le=90),
 ):
-    """Funnel: уникальные пользователи по шагам (хотя бы одно событие за период). Source: audit_logs."""
+    """Funnel from audit_logs. Keeps legacy counts and adds session-only shadow + quality block."""
     since = datetime.now(timezone.utc) - timedelta(days=window_days)
     user_expr = _audit_user_id_expr()
-    rows = (
+    legacy_rows = (
         db.query(AuditLog.action, func.count(func.distinct(user_expr)).label("users"))
         .filter(AuditLog.created_at >= since, AuditLog.action.in_(FUNNEL_EVENT_NAMES))
         .group_by(AuditLog.action)
         .all()
     )
+    shadow_rows = (
+        db.query(AuditLog.action, func.count(func.distinct(user_expr)).label("users"))
+        .filter(
+            AuditLog.created_at >= since,
+            AuditLog.action.in_(FUNNEL_EVENT_NAMES),
+            AuditLog.session_id.isnot(None),
+        )
+        .group_by(AuditLog.action)
+        .all()
+    )
+    event_rows = (
+        db.query(AuditLog.action, AuditLog.session_id)
+        .filter(AuditLog.created_at >= since, AuditLog.action.in_(FUNNEL_EVENT_NAMES))
+        .all()
+    )
     funnel_counts = {name: 0 for name in FUNNEL_EVENT_NAMES}
-    for name, cnt in rows:
+    shadow_funnel_counts = {name: 0 for name in FUNNEL_EVENT_NAMES}
+    missing_session_events_by_step = {name: 0 for name in FUNNEL_EVENT_NAMES}
+    for name, cnt in legacy_rows:
         funnel_counts[name] = cnt
-    return {"window_days": window_days, "funnel_counts": funnel_counts}
+    for name, cnt in shadow_rows:
+        shadow_funnel_counts[name] = cnt
+    total_funnel_events = 0
+    missing_session_events = 0
+    for action_name, session_id in event_rows:
+        total_funnel_events += 1
+        if not session_id:
+            missing_session_events += 1
+            if action_name in missing_session_events_by_step:
+                missing_session_events_by_step[action_name] += 1
+    session_coverage_pct = round(
+        ((total_funnel_events - missing_session_events) / total_funnel_events * 100), 1
+    ) if total_funnel_events else 100.0
+    diff_funnel_counts = {
+        name: int(shadow_funnel_counts.get(name, 0) - funnel_counts.get(name, 0))
+        for name in FUNNEL_EVENT_NAMES
+    }
+    quality_warnings = []
+    if missing_session_events > 0:
+        quality_warnings.append(
+            "Часть funnel-событий без session_id. Path/shadow-метрики могут быть ниже legacy."
+        )
+    return {
+        "window_days": window_days,
+        "funnel_counts": funnel_counts,
+        "shadow_funnel_counts": shadow_funnel_counts,
+        "diff_funnel_counts": diff_funnel_counts,
+        "data_quality": {
+            "required_session_id": True,
+            "total_funnel_events": total_funnel_events,
+            "missing_session_events": missing_session_events,
+            "funnel_session_coverage_pct": session_coverage_pct,
+            "missing_session_events_by_step": missing_session_events_by_step,
+        },
+        "quality_warnings": quality_warnings,
+    }
+
+
+@router.get("/telemetry/product-funnel-diff")
+def telemetry_product_funnel_diff(
+    db: Session = Depends(get_db),
+    window_days: int = Query(7, ge=1, le=90),
+):
+    """Compatibility endpoint for explicit legacy-vs-shadow funnel comparison."""
+    result = telemetry_product_funnel(db=db, window_days=window_days)
+    return {
+        "window_days": result["window_days"],
+        "legacy_funnel_counts": result["funnel_counts"],
+        "shadow_funnel_counts": result["shadow_funnel_counts"],
+        "diff_funnel_counts": result["diff_funnel_counts"],
+        "data_quality": result["data_quality"],
+        "quality_warnings": result["quality_warnings"],
+    }
 
 
 @router.get("/telemetry/product-funnel-history")
@@ -1697,20 +1906,45 @@ def telemetry_product_funnel_history(
             "date": key,
             **{name: by_date.get(key, {}).get(name, 0) for name in FUNNEL_EVENT_NAMES},
         })
-    return {"window_days": window_days, "history": history}
+    total_funnel_events = (
+        db.query(func.count(AuditLog.id))
+        .filter(AuditLog.created_at >= since, AuditLog.action.in_(FUNNEL_EVENT_NAMES))
+        .scalar()
+        or 0
+    )
+    missing_session_events = (
+        db.query(func.count(AuditLog.id))
+        .filter(
+            AuditLog.created_at >= since,
+            AuditLog.action.in_(FUNNEL_EVENT_NAMES),
+            AuditLog.session_id.is_(None),
+        )
+        .scalar()
+        or 0
+    )
+    session_coverage_pct = round(
+        ((total_funnel_events - missing_session_events) / total_funnel_events * 100), 1
+    ) if total_funnel_events else 100.0
+    quality_warnings = []
+    if missing_session_events > 0:
+        quality_warnings.append("История включает funnel-события без session_id (legacy период).")
+    return {
+        "window_days": window_days,
+        "history": history,
+        "data_quality": {
+            "total_funnel_events": total_funnel_events,
+            "missing_session_events": missing_session_events,
+            "funnel_session_coverage_pct": session_coverage_pct,
+        },
+        "quality_warnings": quality_warnings,
+    }
 
 
 # Max rows for path aggregation to avoid OOM/timeout on huge audit_logs (e.g. 90d × high traffic).
 _PATH_QUERY_ROW_LIMIT = 500_000
 
 
-def _path_transitions_and_sequences(
-    db: Session,
-    since: datetime,
-    window_days: int,
-    path_limit: int = 20,
-) -> tuple[list[dict], list[dict], list[dict], bool]:
-    """Load funnel events from audit_logs, group by session/user, return transitions, drop_off, path sequences, truncated."""
+def _load_path_rows(db: Session, since: datetime) -> tuple[list[Any], bool]:
     user_expr = _audit_user_id_expr()
     q = (
         db.query(
@@ -1729,10 +1963,33 @@ def _path_transitions_and_sequences(
     truncated = len(rows) > _PATH_QUERY_ROW_LIMIT
     if truncated:
         rows = rows[:_PATH_QUERY_ROW_LIMIT]
-    # Group by session (or user when no session_id). Skip rows with no session_id and no user (invalid for path).
+    return rows, truncated
+
+
+def _path_transitions_and_sequences(
+    db: Session,
+    since: datetime,
+    window_days: int,
+    path_limit: int = 20,
+    require_session: bool = False,
+    rows: list[Any] | None = None,
+    preloaded_truncated: bool | None = None,
+) -> tuple[list[dict], list[dict], list[dict], bool, int]:
+    """Load funnel events from audit_logs, return transitions/drop-off/paths plus truncated and excluded count."""
+    if rows is None:
+        rows, truncated = _load_path_rows(db, since)
+    else:
+        truncated = bool(preloaded_truncated)
+    # Group by session (legacy fallback: by user when session missing).
     sessions: dict[str, list[tuple[datetime, str]]] = {}
+    excluded_without_session = 0
     for r in rows:
-        if r.session_id:
+        if require_session:
+            if not r.session_id:
+                excluded_without_session += 1
+                continue
+            key = r.session_id
+        elif r.session_id:
             key = r.session_id
         elif r.uid:
             key = f"u:{r.uid}"
@@ -1815,7 +2072,7 @@ def _path_transitions_and_sequences(
         })
     paths_list.sort(key=lambda x: -x["sessions"])
     path_sequences = paths_list[:path_limit]
-    return transitions, drop_off, path_sequences, truncated
+    return transitions, drop_off, path_sequences, truncated, excluded_without_session
 
 
 @router.get("/telemetry/path-transitions")
@@ -1826,8 +2083,25 @@ def telemetry_path_transitions(
     """Transitions between funnel steps with session counts and median/avg time in minutes. Source: audit_logs."""
     try:
         since = datetime.now(timezone.utc) - timedelta(days=window_days)
-        transitions, drop_off, _, truncated = _path_transitions_and_sequences(db, since, window_days)
-        return {"window_days": window_days, "transitions": transitions, "drop_off": drop_off, "truncated": truncated}
+        transitions, drop_off, _, truncated, _ = _path_transitions_and_sequences(db, since, window_days)
+        shadow_transitions, shadow_drop_off, _, shadow_truncated, excluded = _path_transitions_and_sequences(
+            db, since, window_days, require_session=True
+        )
+        return {
+            "window_days": window_days,
+            "transitions": transitions,
+            "drop_off": drop_off,
+            "truncated": truncated,
+            "shadow": {
+                "transitions": shadow_transitions,
+                "drop_off": shadow_drop_off,
+                "truncated": shadow_truncated,
+            },
+            "data_quality": {
+                "excluded_without_session_events": excluded,
+                "required_session_id_for_shadow": True,
+            },
+        }
     except Exception as e:
         logger.exception("telemetry path-transitions failed: window_days=%s", window_days)
         raise HTTPException(status_code=503, detail="Path aggregation failed; try a smaller window.") from e
@@ -1842,10 +2116,23 @@ def telemetry_path_sequences(
     """Top path sequences with session count, median time to pay/last, pct reached pay. Source: audit_logs."""
     try:
         since = datetime.now(timezone.utc) - timedelta(days=window_days)
-        _, _, path_sequences, truncated = _path_transitions_and_sequences(
+        _, _, path_sequences, truncated, _ = _path_transitions_and_sequences(
             db, since, window_days, path_limit=limit
         )
-        return {"window_days": window_days, "paths": path_sequences, "truncated": truncated}
+        _, _, shadow_paths, shadow_truncated, excluded = _path_transitions_and_sequences(
+            db, since, window_days, path_limit=limit, require_session=True
+        )
+        return {
+            "window_days": window_days,
+            "paths": path_sequences,
+            "truncated": truncated,
+            "shadow_paths": shadow_paths,
+            "shadow_truncated": shadow_truncated,
+            "data_quality": {
+                "excluded_without_session_events": excluded,
+                "required_session_id_for_shadow": True,
+            },
+        }
     except Exception as e:
         logger.exception("telemetry path-sequences failed: window_days=%s", window_days)
         raise HTTPException(status_code=503, detail="Path aggregation failed; try a smaller window.") from e
@@ -1860,8 +2147,18 @@ def telemetry_path(
     """Single call returning both path-transitions and path-sequences to avoid double heavy aggregation."""
     try:
         since = datetime.now(timezone.utc) - timedelta(days=window_days)
-        transitions, drop_off, path_sequences, truncated = _path_transitions_and_sequences(
-            db, since, window_days, path_limit=limit
+        rows, truncated = _load_path_rows(db, since)
+        transitions, drop_off, path_sequences, truncated, _ = _path_transitions_and_sequences(
+            db, since, window_days, path_limit=limit, rows=rows, preloaded_truncated=truncated
+        )
+        shadow_transitions, shadow_drop_off, shadow_paths, shadow_truncated, excluded = _path_transitions_and_sequences(
+            db,
+            since,
+            window_days,
+            path_limit=limit,
+            require_session=True,
+            rows=rows,
+            preloaded_truncated=truncated,
         )
         return {
             "window_days": window_days,
@@ -1869,6 +2166,16 @@ def telemetry_path(
             "drop_off": drop_off,
             "paths": path_sequences,
             "truncated": truncated,
+            "shadow": {
+                "transitions": shadow_transitions,
+                "drop_off": shadow_drop_off,
+                "paths": shadow_paths,
+                "truncated": shadow_truncated,
+            },
+            "data_quality": {
+                "excluded_without_session_events": excluded,
+                "required_session_id_for_shadow": True,
+            },
         }
     except Exception as e:
         logger.exception("telemetry path failed: window_days=%s", window_days)
@@ -1893,14 +2200,249 @@ def telemetry_button_clicks(
         .all()
     )
     by_button_id = {r.button_id: r.count for r in rows if r.button_id}
-    return {"window_days": window_days, "by_button_id": by_button_id}
+    total_button_events = int(sum(int(r.count or 0) for r in rows))
+    missing_button_id_events = int(sum(int(r.count or 0) for r in rows if not r.button_id))
+    unknown_by_button_id = {
+        bid: int(cnt)
+        for bid, cnt in by_button_id.items()
+        if not is_known_button_id(bid)
+    }
+    unknown_button_id_events = int(sum(unknown_by_button_id.values()))
+    known_button_id_events = max(0, total_button_events - missing_button_id_events - unknown_button_id_events)
+    coverage_pct = round((known_button_id_events / total_button_events * 100), 1) if total_button_events else 100.0
+    quality_warnings: list[str] = []
+    if missing_button_id_events > 0:
+        quality_warnings.append("Есть button_click без button_id.")
+    if unknown_button_id_events > 0:
+        quality_warnings.append("Есть button_click с неизвестными button_id (не в registry).")
+    return {
+        "window_days": window_days,
+        "by_button_id": by_button_id,
+        "unknown_by_button_id": unknown_by_button_id,
+        "data_quality": {
+            "total_button_click_events": total_button_events,
+            "missing_button_id_events": missing_button_id_events,
+            "unknown_button_id_events": unknown_button_id_events,
+            "button_id_coverage_pct": coverage_pct,
+        },
+        "quality_warnings": quality_warnings,
+    }
 
 
 def _safe_price_from_payload(props: dict | None) -> int:
+    rate = max(float(getattr(app_settings, "star_to_rub", 1.3) or 1.3), 0.01)
+    stars, _rub, _valid = _extract_payment_amounts(props, rate)
+    return stars
+
+
+def _extract_payment_amounts(props: dict | None, star_to_rub: float) -> tuple[int, float, bool]:
+    p = props if isinstance(props, dict) else {}
+
+    def _to_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    stars = 0.0
+    for key in ("price", "price_stars", "stars"):
+        v = _to_float(p.get(key))
+        if v > 0:
+            stars = v
+            break
+    rub = 0.0
+    for key in ("price_rub", "amount_rub"):
+        v = _to_float(p.get(key))
+        if v > 0:
+            rub = v
+            break
+    if rub <= 0:
+        amount_kopecks = _to_float(p.get("amount_kopecks"))
+        if amount_kopecks > 0:
+            rub = amount_kopecks / 100.0
+    if stars <= 0 and rub > 0:
+        stars = rub / star_to_rub
+    if rub <= 0 and stars > 0:
+        rub = stars * star_to_rub
+    valid = stars > 0 or rub > 0
+    return int(round(stars)) if stars > 0 else 0, round(rub, 2), valid
+
+
+@router.get("/telemetry/health")
+def telemetry_health(
+    db: Session = Depends(get_db),
+    window_days: int = Query(7, ge=1, le=90),
+):
+    """Telemetry collection health for product loops (coverage + schema quality)."""
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    total_events = (
+        db.query(func.count(AuditLog.id))
+        .filter(AuditLog.actor_type == "user", AuditLog.created_at >= since)
+        .scalar()
+        or 0
+    )
+    funnel_events = (
+        db.query(func.count(AuditLog.id))
+        .filter(
+            AuditLog.actor_type == "user",
+            AuditLog.created_at >= since,
+            AuditLog.action.in_(FUNNEL_EVENT_NAMES),
+        )
+        .scalar()
+        or 0
+    )
+    funnel_missing_session = (
+        db.query(func.count(AuditLog.id))
+        .filter(
+            AuditLog.actor_type == "user",
+            AuditLog.created_at >= since,
+            AuditLog.action.in_(FUNNEL_EVENT_NAMES),
+            AuditLog.session_id.is_(None),
+        )
+        .scalar()
+        or 0
+    )
+    funnel_session_coverage_pct = round(
+        ((funnel_events - funnel_missing_session) / funnel_events * 100), 1
+    ) if funnel_events else 100.0
+
+    button_col = func.coalesce(AuditLog.payload["button_id"].astext, "")
+    button_rows = (
+        db.query(button_col.label("button_id"), func.count(AuditLog.id).label("count"))
+        .filter(
+            AuditLog.actor_type == "user",
+            AuditLog.action == "button_click",
+            AuditLog.created_at >= since,
+        )
+        .group_by(button_col)
+        .all()
+    )
+    button_events = int(sum(int(r.count or 0) for r in button_rows))
+    button_missing_id = int(sum(int(r.count or 0) for r in button_rows if not r.button_id))
+    button_unknown_id = int(
+        sum(int(r.count or 0) for r in button_rows if r.button_id and not is_known_button_id(r.button_id))
+    )
+    known_button_events = max(0, button_events - button_missing_id - button_unknown_id)
+    button_id_coverage_pct = round((known_button_events / button_events * 100), 1) if button_events else 100.0
+
+    rate = max(float(getattr(app_settings, "star_to_rub", 1.3) or 1.3), 0.01)
+    pay_success_rows = (
+        db.query(AuditLog.payload)
+        .filter(
+            AuditLog.actor_type == "user",
+            AuditLog.action == "pay_success",
+            AuditLog.created_at >= since,
+        )
+        .all()
+    )
+    pay_success_valid_price = 0
+    for (props,) in pay_success_rows:
+        _stars, _rub, valid = _extract_payment_amounts(props, rate)
+        if valid:
+            pay_success_valid_price += 1
+    pay_success_events = len(pay_success_rows)
+    pay_success_valid_price_pct = round(
+        (pay_success_valid_price / pay_success_events * 100), 1
+    ) if pay_success_events else 100.0
+
+    deprecated_schema_events = 0
+    unknown_events = 0
+    schema_col = func.coalesce(AuditLog.payload["schema_version"].astext, "").label("schema_version")
+    schema_rows = (
+        db.query(
+            AuditLog.action.label("action"),
+            schema_col,
+            func.count(AuditLog.id).label("count"),
+        )
+        .filter(AuditLog.actor_type == "user", AuditLog.created_at >= since)
+        .group_by(AuditLog.action, schema_col)
+        .all()
+    )
+    for r in schema_rows:
+        schema_raw = r.schema_version
+        try:
+            schema_version = int(schema_raw)
+        except (TypeError, ValueError):
+            schema_version = 0
+        if schema_version < PRODUCT_ANALYTICS_SCHEMA_VERSION:
+            deprecated_schema_events += int(r.count or 0)
+        if schema_version >= PRODUCT_ANALYTICS_SCHEMA_VERSION and not is_known_product_event(r.action):
+            unknown_events += int(r.count or 0)
+    deprecated_schema_pct = round(
+        (deprecated_schema_events / total_events * 100), 1
+    ) if total_events else 0.0
+    unknown_events_pct = round((unknown_events / total_events * 100), 1) if total_events else 0.0
+
+    quality_warnings: list[str] = []
+    if funnel_session_coverage_pct < 95:
+        quality_warnings.append("Низкая полнота session_id в funnel-событиях (<95%).")
+    if button_id_coverage_pct < 98:
+        quality_warnings.append("Есть заметные потери button_id в button_click (<98%).")
+    if pay_success_valid_price_pct < 98:
+        quality_warnings.append("Есть pay_success без валидной цены (<98%).")
+    if unknown_events_pct > 1:
+        quality_warnings.append("Есть события с неизвестными event_name в новой схеме (>1%).")
+    if deprecated_schema_pct > 25:
+        quality_warnings.append("Высокая доля legacy-событий без schema_version (forward-only период).")
+    status = "ok" if not quality_warnings else "degraded"
+
+    data_quality = {
+        "total_events": total_events,
+        "funnel_events": funnel_events,
+        "funnel_missing_session_events": funnel_missing_session,
+        "funnel_session_coverage_pct": funnel_session_coverage_pct,
+        "button_click_events": button_events,
+        "button_missing_id_events": button_missing_id,
+        "button_unknown_id_events": button_unknown_id,
+        "button_id_coverage_pct": button_id_coverage_pct,
+        "pay_success_events": pay_success_events,
+        "pay_success_valid_price_events": pay_success_valid_price,
+        "pay_success_valid_price_pct": pay_success_valid_price_pct,
+        "unknown_events": unknown_events,
+        "unknown_events_pct": unknown_events_pct,
+        "deprecated_schema_events": deprecated_schema_events,
+        "deprecated_schema_pct": deprecated_schema_pct,
+    }
+    return {
+        "window_days": window_days,
+        "status": status,
+        "data_quality": data_quality,
+        "metrics": data_quality,
+        "quality_warnings": quality_warnings,
+    }
+
+
+@router.get("/telemetry/overview-v3")
+def telemetry_overview_v3(
+    db: Session = Depends(get_db),
+    window: str = Query("7d", description="24h|7d|30d|90d"),
+    source: str | None = Query(None),
+    campaign: str | None = Query(None),
+    entry_type: str | None = Query(None),
+    flow_mode: str = Query("canonical_only", description="canonical_only|all_flows"),
+    trust_mode: str = Query("trusted_only", description="trusted_only|all_data"),
+):
+    if window not in {"24h", "7d", "30d", "90d"}:
+        raise HTTPException(400, "window must be one of: 24h, 7d, 30d, 90d")
+    if flow_mode not in {"canonical_only", "all_flows"}:
+        raise HTTPException(400, "flow_mode must be canonical_only|all_flows")
+    if trust_mode not in {"trusted_only", "all_data"}:
+        raise HTTPException(400, "trust_mode must be trusted_only|all_data")
     try:
-        return int(float((props or {}).get("price", 0) or 0))
-    except (TypeError, ValueError):
-        return 0
+        return build_overview_v3(
+            db=db,
+            window=window,  # type: ignore[arg-type]
+            source=source,
+            campaign=campaign,
+            entry_type=entry_type,
+            flow_mode=flow_mode,  # type: ignore[arg-type]
+            trust_mode=trust_mode,  # type: ignore[arg-type]
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        logger.exception("telemetry overview-v3 failed")
+        raise HTTPException(status_code=503, detail="overview-v3 aggregation failed; try a smaller window or fewer filters.") from e
 
 
 @router.get("/telemetry/product-metrics-v2")
@@ -1951,7 +2493,10 @@ def telemetry_product_metrics_v2(
         .filter(AuditLog.action == "pay_success", AuditLog.created_at >= since)
         .all()
     )
-    total_stars = sum(_safe_price_from_payload(p[0]) for p in pay_events)
+    rate = max(float(getattr(app_settings, "star_to_rub", 1.3) or 1.3), 0.01)
+    pay_amounts = [_extract_payment_amounts(p[0], rate) for p in pay_events]
+    total_stars = sum(a[0] for a in pay_amounts)
+    valid_price_events = sum(1 for a in pay_amounts if a[2])
     aov_stars = round(total_stars / pay_success_count, 1) if pay_success_count else 0.0
     likeness_events = (
         db.query(AuditLog.payload)
@@ -1962,7 +2507,11 @@ def telemetry_product_metrics_v2(
         .all()
     )
     total_likeness = len(likeness_events)
-    likeness_yes = sum(1 for p in likeness_events if (p[0] or {}).get("likeness") == "yes")
+    likeness_yes = sum(
+        1
+        for p in likeness_events
+        if isinstance(p[0], dict) and p[0].get("likeness") == "yes"
+    )
     likeness_score = round((likeness_yes / total_likeness * 100), 1) if total_likeness else 0.0
     pay_per_user = (
         db.query(user_expr, func.count(AuditLog.id))
@@ -2044,6 +2593,11 @@ def telemetry_product_metrics_v2(
         "users_started": users_started,
         "avg_time_start_to_result_sec": avg_time_start_to_result_sec,
         "avg_steps_start_to_result": avg_steps_start_to_result,
+        "data_quality": {
+            "pay_success_valid_price_events": valid_price_events,
+            "pay_success_events": pay_success_count,
+            "pay_success_valid_price_pct": round((valid_price_events / pay_success_count * 100), 1) if pay_success_count else 100.0,
+        },
     }
 
 
@@ -2062,21 +2616,39 @@ def telemetry_revenue(
     by_pack: dict[str, int] = {}
     by_source: dict[str, int] = {}
     total_stars = 0
+    total_rub = 0.0
+    valid_price_events = 0
+    invalid_price_events = 0
+    rate = max(float(getattr(app_settings, "star_to_rub", 1.3) or 1.3), 0.01)
     for (props,) in events:
-        p = props or {}
-        price = _safe_price_from_payload(props)
-        total_stars += price
+        p = props if isinstance(props, dict) else {}
+        stars, rub, valid = _extract_payment_amounts(props, rate)
+        total_stars += stars
+        total_rub += rub
+        if valid:
+            valid_price_events += 1
+        else:
+            invalid_price_events += 1
         pack_key = p.get("pack_id") or "unknown"
-        by_pack[pack_key] = by_pack.get(pack_key, 0) + price
+        by_pack[pack_key] = by_pack.get(pack_key, 0) + stars
         src_key = p.get("source") or "organic"
-        by_source[src_key] = by_source.get(src_key, 0) + price
-    rate = getattr(app_settings, "star_to_rub", 1.3)
+        by_source[src_key] = by_source.get(src_key, 0) + stars
+    quality_warnings = []
+    if invalid_price_events > 0:
+        quality_warnings.append("Часть pay_success без валидной цены. Revenue может быть занижен.")
     return {
         "window_days": window_days,
         "total_stars": total_stars,
-        "revenue_rub_approx": round(total_stars * rate, 2),
+        "revenue_rub_approx": round(total_rub if total_rub > 0 else total_stars * rate, 2),
         "by_pack": by_pack,
         "by_source": by_source,
+        "data_quality": {
+            "pay_success_events": len(events),
+            "valid_price_events": valid_price_events,
+            "invalid_price_events": invalid_price_events,
+            "valid_price_pct": round((valid_price_events / len(events) * 100), 1) if events else 100.0,
+        },
+        "quality_warnings": quality_warnings,
     }
 
 
@@ -2110,7 +2682,7 @@ def bank_transfer_pay_initiated(
     page_size: int = Query(50, ge=1, le=200),
     date_from: date | None = Query(None, description="Start date (UTC, inclusive)"),
     date_to: date | None = Query(None, description="End date (UTC, inclusive)"),
-    price_rub: float | None = Query(None, description="Filter by expected amount in RUB, e.g. 129 or 199"),
+    price_rub: float | None = Query(None, description="Filter by expected amount in RUB, e.g. 99 or 199"),
     telegram_user_id: str | None = Query(None, description="Filter by Telegram user ID"),
 ):
     """List pay_initiated events for bank_transfer (from audit_logs). Used to find who initiated a transfer by date/sum."""
@@ -2172,7 +2744,7 @@ def bank_transfer_receipt_logs(
     page_size: int = Query(50, ge=1, le=200),
     match_success: bool | None = None,
     telegram_user_id: str | None = None,
-    expected_rub: float | None = Query(None, description="Filter by expected amount in RUB, e.g. 129 or 199"),
+    expected_rub: float | None = Query(None, description="Filter by expected amount in RUB, e.g. 99 or 199"),
     date_from: date | None = Query(None, description="Start date (UTC, inclusive)"),
     date_to: date | None = Query(None, description="End date (UTC, inclusive)"),
 ):
@@ -2900,7 +3472,9 @@ TREND_EDIT_FIELDS = {
     "name", "emoji", "description", "system_prompt", "scene_prompt", "subject_prompt",
     "negative_prompt", "negative_scene", "composition_prompt", "subject_mode", "framing_hint", "style_preset",
     "max_images", "enabled", "order_index", "theme_id", "target_audiences",
-    "prompt_sections", "prompt_model", "prompt_size", "prompt_format", "prompt_temperature", "prompt_seed", "prompt_image_size_tier",
+    "prompt_sections", "prompt_model", "prompt_size", "prompt_format", "prompt_aspect_ratio",
+    "prompt_temperature", "prompt_seed", "prompt_image_size_tier",
+    "prompt_top_p", "prompt_candidate_count", "prompt_media_resolution", "prompt_thinking_config",
 }
 MAX_TREND_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 ALLOWED_TREND_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -2951,9 +3525,14 @@ def _trend_to_detail(t: Trend) -> dict:
         "prompt_model": t.prompt_model,
         "prompt_size": t.prompt_size,
         "prompt_format": t.prompt_format,
+        "prompt_aspect_ratio": getattr(t, "prompt_aspect_ratio", None),
         "prompt_temperature": t.prompt_temperature,
         "prompt_seed": t.prompt_seed,
         "prompt_image_size_tier": getattr(t, "prompt_image_size_tier", None),
+        "prompt_top_p": getattr(t, "prompt_top_p", None),
+        "prompt_candidate_count": getattr(t, "prompt_candidate_count", None),
+        "prompt_media_resolution": getattr(t, "prompt_media_resolution", None),
+        "prompt_thinking_config": getattr(t, "prompt_thinking_config", None),
     }
 
 

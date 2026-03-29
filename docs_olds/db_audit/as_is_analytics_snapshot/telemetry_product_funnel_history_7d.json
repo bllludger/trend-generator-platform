@@ -1,0 +1,109 @@
+{
+  "window_days": 7,
+  "history": [
+    {
+      "date": "2026-03-08",
+      "bot_started": 0,
+      "photo_uploaded": 0,
+      "take_preview_ready": 0,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 0,
+      "hd_delivered": 0
+    },
+    {
+      "date": "2026-03-09",
+      "bot_started": 0,
+      "photo_uploaded": 0,
+      "take_preview_ready": 0,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 0,
+      "hd_delivered": 0
+    },
+    {
+      "date": "2026-03-10",
+      "bot_started": 0,
+      "photo_uploaded": 0,
+      "take_preview_ready": 0,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 0,
+      "hd_delivered": 0
+    },
+    {
+      "date": "2026-03-11",
+      "bot_started": 0,
+      "photo_uploaded": 0,
+      "take_preview_ready": 0,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 0,
+      "hd_delivered": 0
+    },
+    {
+      "date": "2026-03-12",
+      "bot_started": 0,
+      "photo_uploaded": 0,
+      "take_preview_ready": 0,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 0,
+      "hd_delivered": 0
+    },
+    {
+      "date": "2026-03-13",
+      "bot_started": 0,
+      "photo_uploaded": 0,
+      "take_preview_ready": 0,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 0,
+      "hd_delivered": 0
+    },
+    {
+      "date": "2026-03-14",
+      "bot_started": 3,
+      "photo_uploaded": 1,
+      "take_preview_ready": 1,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 0,
+      "hd_delivered": 0
+    },
+    {
+      "date": "2026-03-15",
+      "bot_started": 3,
+      "photo_uploaded": 1,
+      "take_preview_ready": 1,
+      "favorite_selected": 0,
+      "paywall_viewed": 0,
+      "pack_selected": 0,
+      "pay_initiated": 0,
+      "pay_success": 0,
+      "hd_delivered": 0
+    }
+  ],
+  "data_quality": {
+    "total_funnel_events": 25,
+    "missing_session_events": 22,
+    "funnel_session_coverage_pct": 12.0
+  },
+  "quality_warnings": [
+    "История включает funnel-события без session_id (legacy период)."
+  ]
+}

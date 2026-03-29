@@ -1,0 +1,199 @@
+{
+  "window_days": 30,
+  "jobs_failed_by_error": {
+    "provider_error": 17,
+    "trend_missing": 1
+  },
+  "takes_failed_by_error": {
+    "all_variants_failed": 10,
+    "copy_prompt_missing": 1
+  },
+  "combined": {
+    "provider_error": 17,
+    "trend_missing": 1,
+    "all_variants_failed": 10,
+    "copy_prompt_missing": 1
+  },
+  "errors_by_day": [
+    {
+      "date": "2026-02-14",
+      "jobs_failed": 10,
+      "takes_failed": 0,
+      "total": 10
+    },
+    {
+      "date": "2026-02-15",
+      "jobs_failed": 3,
+      "takes_failed": 0,
+      "total": 3
+    },
+    {
+      "date": "2026-02-16",
+      "jobs_failed": 3,
+      "takes_failed": 0,
+      "total": 3
+    },
+    {
+      "date": "2026-02-17",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-18",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-19",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-20",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-21",
+      "jobs_failed": 1,
+      "takes_failed": 0,
+      "total": 1
+    },
+    {
+      "date": "2026-02-22",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-23",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-24",
+      "jobs_failed": 0,
+      "takes_failed": 1,
+      "total": 1
+    },
+    {
+      "date": "2026-02-25",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-26",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-27",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-02-28",
+      "jobs_failed": 0,
+      "takes_failed": 2,
+      "total": 2
+    },
+    {
+      "date": "2026-03-01",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-02",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-03",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-04",
+      "jobs_failed": 0,
+      "takes_failed": 1,
+      "total": 1
+    },
+    {
+      "date": "2026-03-05",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-06",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-07",
+      "jobs_failed": 0,
+      "takes_failed": 2,
+      "total": 2
+    },
+    {
+      "date": "2026-03-08",
+      "jobs_failed": 0,
+      "takes_failed": 2,
+      "total": 2
+    },
+    {
+      "date": "2026-03-09",
+      "jobs_failed": 0,
+      "takes_failed": 1,
+      "total": 1
+    },
+    {
+      "date": "2026-03-10",
+      "jobs_failed": 0,
+      "takes_failed": 1,
+      "total": 1
+    },
+    {
+      "date": "2026-03-11",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-12",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-13",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-14",
+      "jobs_failed": 0,
+      "takes_failed": 0,
+      "total": 0
+    },
+    {
+      "date": "2026-03-15",
+      "jobs_failed": 0,
+      "takes_failed": 1,
+      "total": 1
+    }
+  ]
+}

@@ -40,6 +40,8 @@ class Take(Base):
     step_index = Column(Integer, nullable=True)
     is_reroll = Column(Boolean, nullable=False, default=False)
     is_rescue_photo_replace = Column(Boolean, nullable=False, default=False)
+    # 4K bundle charging: one HD credit per whole take (A/B/C), not per variant.
+    hd_bundle_charged = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(
         DateTime(timezone=True),

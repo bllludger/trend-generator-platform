@@ -22,6 +22,7 @@ from app.models.job import Job
 from app.models.pack import Pack
 from app.models.payment import Payment
 from app.models.session import Session as SessionModel
+from app.models.trial_bundle_order import TrialBundleOrder
 from app.models.unlock_order import UnlockOrder
 from app.models.take import Take
 from app.models.user import User
@@ -72,8 +73,72 @@ class PaymentService:
 
     def seed_default_packs(self) -> None:
         """Создать пакеты по умолчанию, если таблица пустая. Для непустой БД — добавить Plus, если отсутствует."""
+        ladder_meta = {
+            "trial": ("Trial", "🎬"),
+            "neo_start": ("Neo Start", "🚀"),
+            "neo_pro": ("Neo Pro", "⭐"),
+            "neo_unlimited": ("Neo Unlimited", "👑"),
+        }
         existing = self.db.query(Pack).count()
         if existing > 0:
+            # Нормализуем параметры продуктовой лестницы, чтобы UI и цены были консистентными.
+            ladder_defaults = {
+                "neo_start": {
+                    "name": "Neo Start",
+                    "emoji": "🚀",
+                    "stars_price": 153,
+                    "description": "15 фото + 15 4K без водяного знака",
+                    "order_index": 1,
+                    "takes_limit": 15,
+                    "hd_amount": 15,
+                    "pack_type": "session",
+                    "enabled": True,
+                },
+                "neo_pro": {
+                    "name": "Neo Pro",
+                    "emoji": "⭐",
+                    "stars_price": 384,
+                    "description": "50 фото + 50 4K без водяного знака",
+                    "order_index": 2,
+                    "takes_limit": 50,
+                    "hd_amount": 50,
+                    "pack_type": "session",
+                    "enabled": True,
+                },
+                "neo_unlimited": {
+                    "name": "Neo Unlimited",
+                    "emoji": "👑",
+                    "stars_price": 762,
+                    "description": "120 фото + 120 4K без водяного знака",
+                    "order_index": 3,
+                    "takes_limit": 120,
+                    "hd_amount": 120,
+                    "pack_type": "session",
+                    "enabled": True,
+                },
+            }
+            for pid, (pname, pemoji) in ladder_meta.items():
+                pack = self.get_pack(pid)
+                if not pack:
+                    continue
+                if pack.id in ladder_defaults:
+                    defaults = ladder_defaults[pack.id]
+                    pack.name = defaults["name"]
+                    pack.emoji = defaults["emoji"]
+                    pack.stars_price = defaults["stars_price"]
+                    pack.description = defaults["description"]
+                    pack.order_index = defaults["order_index"]
+                    pack.takes_limit = defaults["takes_limit"]
+                    pack.hd_amount = defaults["hd_amount"]
+                    pack.pack_type = defaults["pack_type"]
+                    pack.enabled = defaults["enabled"]
+                    pack.tokens = 0
+                    self.db.add(pack)
+                elif pack.name != pname or pack.emoji != pemoji:
+                    pack.name = pname
+                    pack.emoji = pemoji
+                    self.db.add(pack)
+
             # У существующих инсталляций мог не быть пакета Plus — добавить при отсутствии
             if self.get_pack("plus") is None:
                 plus = Pack(
@@ -105,9 +170,9 @@ class PaymentService:
                     self.db.flush()
                     logger.info(f"{pid}_pack_added", extra={"reason": "missing_in_existing_db"})
             for pid, pname, pemoji, pstars, pdesc, pidx, ptakes, phd in [
-                ("neo_start", "Neo Start", "🚀", 153, "10 фото + 10 4K без водяного знака", 1, 10, 10),
-                ("neo_pro", "Neo Pro", "⭐", 538, "40 фото + 40 4K без водяного знака", 2, 40, 40),
-                ("neo_unlimited", "Neo Unlimited", "👑", 1531, "120 фото + 120 4K без водяного знака", 3, 120, 120),
+                ("neo_start", "Neo Start", "🚀", 153, "15 фото + 15 4K без водяного знака", 1, 15, 15),
+                ("neo_pro", "Neo Pro", "⭐", 384, "50 фото + 50 4K без водяного знака", 2, 50, 50),
+                ("neo_unlimited", "Neo Unlimited", "👑", 762, "120 фото + 120 4K без водяного знака", 3, 120, 120),
             ]:
                 if self.get_pack(pid) is None:
                     self.db.add(Pack(
@@ -186,7 +251,13 @@ class PaymentService:
     PAYLOAD_REDIS_PREFIX = "invoice_payload:"
     PAYLOAD_REDIS_TTL = 3600  # 1 час
 
-    def build_payload(self, pack_id: str, user_id: str, job_id: str | None = None) -> str:
+    def build_payload(
+        self,
+        pack_id: str,
+        user_id: str,
+        job_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
         """
         Формирует payload для invoice (1–128 байт, лимит Telegram).
         Если строка длиннее 128 байт — сохраняем в Redis, в invoice передаём короткий токен.
@@ -195,6 +266,8 @@ class PaymentService:
         base = f"pack:{pack_id}:user:{user_id}:nonce:{nonce}"
         if job_id:
             base += f":job:{job_id}"
+        if session_id:
+            base += f":session:{session_id}"
         if len(base.encode("utf-8")) <= 128:
             return base
         token = secrets.token_hex(8)  # 16 символов
@@ -235,6 +308,8 @@ class PaymentService:
                 result["nonce"] = val
             elif key == "job":
                 result["job_id"] = val
+            elif key == "session":
+                result["session_id"] = val
             i += 2
         return result
 
@@ -254,7 +329,10 @@ class PaymentService:
         if payload.startswith("yoomoney_session:"):
             if currency is not None and currency != "RUB":
                 return False, "Неверная валюта"
-            pack_id = payload.split(":", 1)[1]
+            parts = payload.split(":")
+            if len(parts) < 2:
+                return False, "Некорректный payload"
+            pack_id = parts[1]
             user = self.db.query(User).filter(User.telegram_id == telegram_user_id).one_or_none()
             if not user:
                 return False, "Пользователь не найден"
@@ -291,7 +369,10 @@ class PaymentService:
 
             expected_amount: int | None = None
             if payload.startswith("session:"):
-                pack_id = payload.split(":", 1)[1]
+                parts = payload.split(":")
+                if len(parts) < 2:
+                    return False, "Некорректный payload"
+                pack_id = parts[1]
                 pack = self.get_pack(pack_id)
                 if not pack or not pack.enabled:
                     return False, "Пакет недоступен"
@@ -300,7 +381,7 @@ class PaymentService:
                 expected_amount = pack.stars_price
             elif payload.startswith("upgrade:"):
                 parts = payload.split(":")
-                if len(parts) != 3:
+                if len(parts) not in (3, 4):
                     return False, "Некорректный payload"
                 pack_id, old_session_id = parts[1], parts[2]
                 pack = self.get_pack(pack_id)
@@ -614,6 +695,23 @@ class PaymentService:
                 "amount_kopecks": order.amount_kopecks,
             },
         )
+        try:
+            ProductAnalyticsService(self.db).track_payment_event(
+                "pay_success",
+                user.id,
+                method="yookassa_unlock",
+                pack_id="unlock",
+                price_rub=round((order.amount_kopecks or 0) / 100, 2),
+                currency="RUB",
+                source_component="service.payments",
+                properties={
+                    "job_id": order.take_id,
+                    "flow": "unlock",
+                    "order_id": order.id,
+                },
+            )
+        except Exception as e:
+            logger.warning("product_analytics track(pay_success yookassa_unlock) failed: %s", e)
         return payment
 
     def record_unlock_tokens(
@@ -641,6 +739,62 @@ class PaymentService:
             "unlock_tokens_recorded",
             extra={"user_id": user_id, "job_id": job_id, "tokens_spent": tokens_spent},
         )
+        return payment
+
+    def record_yookassa_trial_bundle_payment(self, order: TrialBundleOrder) -> Payment | None:
+        """
+        Record successful Trial bundle (unlock all 3 variants) payment in payments.
+        Idempotent by charge_id = "yookassa_trial_bundle:{yookassa_payment_id}".
+        """
+        if not order.yookassa_payment_id:
+            return None
+        charge_id = f"yookassa_trial_bundle:{order.yookassa_payment_id}"
+        existing = (
+            self.db.query(Payment)
+            .filter(Payment.telegram_payment_charge_id == charge_id)
+            .one_or_none()
+        )
+        if existing:
+            return existing
+        user = (
+            self.db.query(User)
+            .filter(User.telegram_id == order.telegram_user_id)
+            .one_or_none()
+        )
+        if not user:
+            logger.warning(
+                "record_yookassa_trial_bundle_user_not_found",
+                extra={"order_id": order.id, "telegram_user_id": order.telegram_user_id},
+            )
+            return None
+        payment = Payment(
+            user_id=user.id,
+            telegram_payment_charge_id=charge_id,
+            provider_payment_charge_id=order.yookassa_payment_id,
+            pack_id="trial_bundle",
+            stars_amount=0,
+            amount_kopecks=order.amount_kopecks,
+            tokens_granted=0,
+            status="completed",
+            payload=f"yookassa_trial_bundle:{order.yookassa_payment_id}",
+            job_id=order.take_id,
+            session_id=None,
+        )
+        self.db.add(payment)
+        self.db.flush()
+        try:
+            ProductAnalyticsService(self.db).track_payment_event(
+                "pay_success",
+                user.id,
+                method="yookassa_trial_bundle",
+                pack_id="trial_bundle",
+                price_rub=round((order.amount_kopecks or 0) / 100, 2),
+                currency="RUB",
+                source_component="service.payments",
+                properties={"take_id": order.take_id, "order_id": order.id},
+            )
+        except Exception as e:
+            logger.warning("product_analytics track(pay_success yookassa_trial_bundle) failed: %s", e)
         return payment
 
     # ------------------------------------------------------------------
@@ -692,6 +846,7 @@ class PaymentService:
         pack_id: str,
         stars_amount: int,
         payload: str,
+        target_session_id: str | None = None,
     ) -> tuple[Payment | None, SessionModel | None, str | None, int]:
         """
         Process session pack purchase: create Session, credit HD to user, record Payment.
@@ -741,7 +896,7 @@ class PaymentService:
             if getattr(pack, "pack_subtype", "standalone") == "collection":
                 if not pack.playlist or not isinstance(pack.playlist, list) or len(pack.playlist) == 0:
                     raise ValueError(f"Collection pack {pack_id} has no playlist — cannot sell")
-                session = session_svc.create_collection_session(user.id, pack)
+                session = session_svc.create_collection_session(user.id, pack, session_id=target_session_id)
                 audit = AuditService(self.db)
                 audit.log(
                     actor_type="system",
@@ -764,7 +919,7 @@ class PaymentService:
                 except Exception as e:
                     logger.warning("product_analytics track(collection_started) failed: %s", e)
             else:
-                session = session_svc.create_session(user.id, pack_id)
+                session = session_svc.create_session(user.id, pack_id, session_id=target_session_id)
             hd_svc.credit_paid(user, pack.hd_amount or 0)
 
             # Attach free Take from pre-session
@@ -838,6 +993,7 @@ class PaymentService:
         telegram_user_id: str,
         pack_id: str,
         reference: str,
+        allow_trial_regrant: bool = False,
     ) -> tuple[Payment | None, SessionModel | None, str | None]:
         """
         Ручная выдача session-pack админом (без реального платежа).
@@ -854,7 +1010,7 @@ class PaymentService:
         pack = self.get_pack(pack_id)
         if not pack:
             return None, None, None
-        if pack.is_trial:
+        if pack.is_trial and not allow_trial_regrant:
             from sqlalchemy import update as sa_update
             res = self.db.execute(
                 sa_update(User)
@@ -900,6 +1056,7 @@ class PaymentService:
         pack_id: str,
         amount_kopecks: int,
         payload: str,
+        target_session_id: str | None = None,
     ) -> tuple[Payment | None, SessionModel | None, str | None, int]:
         """
         Обработка успешной оплаты через ЮMoney (нативная интеграция).
@@ -953,7 +1110,7 @@ class PaymentService:
             if getattr(pack, "pack_subtype", "standalone") == "collection":
                 if not pack.playlist or not isinstance(pack.playlist, list) or len(pack.playlist) == 0:
                     raise ValueError(f"Collection pack {pack_id} has no playlist — cannot sell")
-                session = session_svc.create_collection_session(user.id, pack)
+                session = session_svc.create_collection_session(user.id, pack, session_id=target_session_id)
                 audit = AuditService(self.db)
                 audit.log(
                     actor_type="system",
@@ -976,7 +1133,7 @@ class PaymentService:
                 except Exception as e:
                     logger.warning("product_analytics track(collection_started) failed: %s", e)
             else:
-                session = session_svc.create_session(user.id, pack_id)
+                session = session_svc.create_session(user.id, pack_id, session_id=target_session_id)
             hd_svc.credit_paid(user, pack.hd_amount or 0)
 
             attached_free_takes = 0
@@ -1177,6 +1334,21 @@ class PaymentService:
                     "amount_kopecks": amount_kopecks,
                 },
             )
+            try:
+                ProductAnalyticsService(self.db).track_payment_event(
+                    "pay_success",
+                    user.id,
+                    method="yoomoney_link",
+                    session_id=session.id,
+                    pack_id=pack_id,
+                    price=float(pack.stars_price or 0),
+                    price_rub=round((amount_kopecks or 0) / 100, 2),
+                    currency="RUB",
+                    source_component="service.payments",
+                    properties={"amount_kopecks": amount_kopecks},
+                )
+            except Exception as e:
+                logger.warning("product_analytics track(pay_success yoomoney_link) failed: %s", e)
             return payment, session, None, attached_free_takes
         except IntegrityError:
             self.db.rollback()
@@ -1205,6 +1377,8 @@ class PaymentService:
         pack_id: str,
         amount_rub: float,
         reference: str,
+        target_session_id: str | None = None,
+        analytics_session_id: str | None = None,
     ) -> tuple[Payment | None, SessionModel | None, str | None, int]:
         """
         Обработка успешной оплаты переводом на карту для пакетов из продуктовой лестницы.
@@ -1258,7 +1432,7 @@ class PaymentService:
             if getattr(pack, "pack_subtype", "standalone") == "collection":
                 if not pack.playlist or not isinstance(pack.playlist, list) or len(pack.playlist) == 0:
                     raise ValueError(f"Collection pack {pack_id} has no playlist — cannot sell")
-                session = session_svc.create_collection_session(user.id, pack)
+                session = session_svc.create_collection_session(user.id, pack, session_id=target_session_id)
                 audit = AuditService(self.db)
                 audit.log(
                     actor_type="system",
@@ -1281,7 +1455,7 @@ class PaymentService:
                 except Exception as e:
                     logger.warning("product_analytics track(collection_started) failed: %s", e)
             else:
-                session = session_svc.create_session(user.id, pack_id)
+                session = session_svc.create_session(user.id, pack_id, session_id=target_session_id)
             hd_svc.credit_paid(user, pack.hd_amount or 0)
 
             attached_free_takes = 0
@@ -1331,11 +1505,16 @@ class PaymentService:
                 },
             )
             try:
-                ProductAnalyticsService(self.db).track(
+                ProductAnalyticsService(self.db).track_payment_event(
                     "pay_success",
                     user.id,
+                    method="bank_transfer",
+                    session_id=analytics_session_id or session.id,
                     pack_id=pack_id,
-                    properties={"method": "bank_transfer", "price": 0, "price_rub": amount_rub},
+                    price=float(pack.stars_price or 0),
+                    price_rub=amount_rub,
+                    currency="RUB",
+                    source_component="service.payments",
                 )
             except Exception as e:
                 logger.warning("product_analytics track(pay_success bank_transfer) failed: %s", e)
@@ -1370,6 +1549,7 @@ class PaymentService:
         old_session_id: str,
         stars_amount: int,
         payload: str,
+        target_session_id: str | None = None,
     ) -> tuple[Payment | None, SessionModel | None]:
         """
         Process session upgrade: create new Session, credit HD, mark old as upgraded.
@@ -1403,7 +1583,12 @@ class PaymentService:
             session_svc = SessionService(self.db)
             hd_svc = HDBalanceService(self.db)
 
-            new_session = session_svc.upgrade_session(old_session, new_pack_id, credit_stars)
+            new_session = session_svc.upgrade_session(
+                old_session,
+                new_pack_id,
+                credit_stars,
+                new_session_id=target_session_id,
+            )
             old_hd = (old_pack.hd_amount or 0) if old_pack else 0
             delta_hd = max(0, (new_pack.hd_amount or 0) - old_hd)
             hd_svc.credit_paid(user, delta_hd)
