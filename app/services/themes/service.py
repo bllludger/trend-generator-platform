@@ -9,7 +9,15 @@ class ThemeService:
         self.db = db
 
     def list_all(self) -> list[Theme]:
-        return self.db.query(Theme).order_by(Theme.order_index.asc()).all()
+        return (
+            self.db.query(Theme)
+            .order_by(
+                Theme.order_index.asc(),
+                Theme.created_at.asc().nulls_last(),
+                Theme.id.asc(),
+            )
+            .all()
+        )
 
     def list_for_audience(self, audience: str) -> list[Theme]:
         """Тематики, у которых target_audiences содержит audience (для бота)."""

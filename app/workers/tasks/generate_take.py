@@ -11,6 +11,7 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from typing import Any
 
 from celery.exceptions import Retry
 from sqlalchemy.orm import Session
@@ -18,11 +19,21 @@ from sqlalchemy.orm import Session
 from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.db.session import SessionLocal
+from app.models.face_asset import FaceAsset
 from app.models.take import Take
 from app.models.trend import Trend
 from app.services.idempotency import IdempotencyStore
 from app.services.app_settings.settings_service import AppSettingsService
-from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
+from app.services.generation_prompt.settings_service import (
+    GenerationPromptSettingsService,
+    clamp_temperature,
+    clamp_top_p,
+    normalize_aspect_ratio,
+    normalize_media_resolution,
+    normalize_seed,
+    normalize_thinking_config,
+    size_to_aspect_ratio,
+)
 from app.services.image_generation import (
     ImageGenerationError,
     ImageGenerationRequest,
@@ -38,7 +49,6 @@ from app.services.trial_v2.service import TrialV2Service
 from app.services.telegram.client import TelegramClient
 from app.services.telegram_messages.runtime import runtime_templates
 
-from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as transfer_get_effective
 from app.services.trends.service import TrendService
 from app.utils.image_formats import aspect_ratio_to_size
 from app.services.preview import PreviewService
@@ -94,16 +104,6 @@ MAIN_MENU_REPLY = {
 }
 
 
-def _style_preset_to_text(style_preset) -> str:
-    if style_preset is None:
-        return ""
-    if isinstance(style_preset, str):
-        return (style_preset or "").strip()
-    if isinstance(style_preset, dict):
-        return " ".join(f"{k}: {v}" for k, v in sorted(style_preset.items()) if v)
-    return ""
-
-
 def _build_prompt_for_take(db: Session, take: Take, trend: Trend) -> tuple[str, str | None, str, str, str | None]:
     """Build prompt from trend + master settings. Returns (prompt, negative, model, size, image_size_tier)."""
     gs = GenerationPromptSettingsService(db)
@@ -111,77 +111,119 @@ def _build_prompt_for_take(db: Session, take: Take, trend: Trend) -> tuple[str, 
     model = effective.get("default_model", "gemini-2.5-flash-image")
     # Приоритет: выбор пользователя (take.image_size), иначе дефолт из админки (default_aspect_ratio → size)
     size = take.image_size or aspect_ratio_to_size(effective.get("default_aspect_ratio", "1:1"))
-    fmt = effective.get("default_format", "png")
     image_size_tier = (getattr(trend, "prompt_image_size_tier", None) or "").strip() or effective.get("default_image_size_tier") or "4K"
 
     sections = trend.prompt_sections if isinstance(trend.prompt_sections, list) else []
+    trend_parts: list[str] = []
     if sections:
-        label_to_tag = {"scene": "[]", "style": "[STYLE]", "avoid": "[AVOID]", "composition": "[COMPOSITION]"}
-        parts = []
         for s in sorted(sections, key=lambda x: x.get("order", 0)):
             if not s.get("enabled") or not s.get("content"):
                 continue
             content = str(s["content"]).strip()
-            if not content:
-                continue
-            label = (s.get("label") or "").strip().lower()
-            tag = label_to_tag.get(label)
-            if tag:
-                parts.append(f"{tag}\n{content}")
-            else:
-                parts.append(content)
-        prompt_text = "\n\n".join(parts) if parts else (trend.scene_prompt or trend.system_prompt or "Generate image.")
-        negative = trend.negative_prompt or None
-        if trend.prompt_model:
-            model = trend.prompt_model
-        if trend.prompt_size:
-            size = trend.prompt_size
-        tier = (getattr(trend, "prompt_image_size_tier", None) or "").strip() or image_size_tier
-        return prompt_text, negative, model, size, tier
+            if content:
+                trend_parts.append(content)
+    trend_prompt = "\n\n".join(trend_parts).strip()
+    if not trend_prompt:
+        trend_prompt = (trend.scene_prompt or trend.system_prompt or "").strip()
 
-    transfer = transfer_get_effective(db, SCOPE_TRENDS)
     blocks = []
-
     prompt_input = (effective.get("prompt_input") or "").strip()
     if prompt_input:
-        blocks.append(f"[INPUT]\n{prompt_input}")
-    prompt_task = (effective.get("prompt_task") or "").strip()
-    if prompt_task:
-        blocks.append(f"[TASK]\n{prompt_task}")
-    identity = (transfer.get("identity_rules_text") or "").strip()
-    if identity:
-        blocks.append(f"[IDENTITY TRANSFER]\n{identity}")
-    composition = (getattr(trend, "composition_prompt", None) or "").strip() or (transfer.get("composition_rules_text") or "").strip()
-    if composition:
-        blocks.append(f"[COMPOSITION]\n{composition}")
-    scene = (trend.scene_prompt or trend.system_prompt or "").strip()
-    if scene:
-        blocks.append(f"[]\n{scene}")
-    style_text = _style_preset_to_text(trend.style_preset)
-    if style_text:
-        blocks.append(f"[STYLE]\n{style_text}")
-
-    avoid_parts = []
-    avoid_default = (transfer.get("avoid_default_items") or "").strip()
-    if avoid_default:
-        for line in avoid_default.replace(";", "\n").splitlines():
-            item = line.strip()
-            if item:
-                avoid_parts.append(item)
-    negative_scene = (trend.negative_scene or "").strip()
-    if negative_scene:
-        avoid_parts.append(negative_scene)
-    if avoid_parts:
-        blocks.append(f"[AVOID]\n{'; '.join(avoid_parts)}")
-
-    safety = (effective.get("safety_constraints") or "").strip()
-    if safety:
-        blocks.append(f"[SAFETY]\n{safety}")
-    blocks.append(f"[OUTPUT]\nsize={size}, format={fmt}")
-
-    prompt_text = "\n\n".join(blocks)
-    negative = (trend.negative_prompt or "").strip() or None
+        blocks.append(prompt_input)
+    if trend_prompt:
+        blocks.append(trend_prompt)
+    prompt_text = "\n\n".join(blocks).strip()
+    if trend.prompt_model:
+        model = trend.prompt_model
+    negative = None
     return prompt_text, negative, model, size, image_size_tier
+
+
+def _resolve_generation_config(
+    *,
+    trend: Trend | None,
+    effective_release: dict[str, Any],
+    model: str,
+    size: str | None,
+    prefer_size_aspect_ratio: bool,
+) -> dict[str, Any]:
+    trend_aspect_ratio = (getattr(trend, "prompt_aspect_ratio", None) or "").strip() if trend else ""
+    trend_media_resolution = getattr(trend, "prompt_media_resolution", None) if trend else None
+    trend_thinking_config = getattr(trend, "prompt_thinking_config", None) if trend else None
+    trend_top_p = getattr(trend, "prompt_top_p", None) if trend else None
+    trend_seed = getattr(trend, "prompt_seed", None) if trend else None
+
+    aspect_ratio = ""
+    if trend_aspect_ratio:
+        aspect_ratio = normalize_aspect_ratio(trend_aspect_ratio, fallback="")
+    if not aspect_ratio and prefer_size_aspect_ratio:
+        aspect_ratio = size_to_aspect_ratio(size, fallback="1:1")
+    if not aspect_ratio:
+        aspect_ratio = normalize_aspect_ratio(effective_release.get("default_aspect_ratio"), fallback="3:4")
+    top_p = clamp_top_p(trend_top_p if trend_top_p is not None else effective_release.get("default_top_p"))
+    media_resolution = normalize_media_resolution(
+        trend_media_resolution if trend_media_resolution is not None else effective_release.get("default_media_resolution")
+    )
+    thinking_source = trend_thinking_config if trend_thinking_config is not None else effective_release.get("default_thinking_config")
+    thinking_config = normalize_thinking_config(model, thinking_source)
+    base_seed = normalize_seed(trend_seed if trend_seed is not None else effective_release.get("default_seed"))
+
+    return {
+        "aspect_ratio": aspect_ratio,
+        "top_p": top_p,
+        "candidate_count": 1,  # Production flow is always single candidate.
+        "media_resolution": media_resolution,
+        "thinking_config": thinking_config,
+        "base_seed": base_seed,
+    }
+
+
+def _build_take_variant_seeds(base_seed: int | None) -> dict[str, int]:
+    if base_seed is not None:
+        return {"A": base_seed, "B": base_seed + 1, "C": base_seed + 2}
+    return {v: random.randint(0, 2**31 - 1) for v in VARIANTS}
+
+
+def _resolve_take_variant_sampling(
+    *,
+    take_type: str | None,
+    trend: Trend | None,
+    effective_release: dict[str, Any],
+    base_temperature: float | None,
+    base_top_p: float | None,
+) -> dict[str, dict[str, float | None]]:
+    out: dict[str, dict[str, float | None]] = {
+        variant: {"temperature": base_temperature, "top_p": base_top_p}
+        for variant in VARIANTS
+    }
+
+    if take_type == "COPY":
+        for variant in VARIANTS:
+            out[variant]["temperature"] = COPY_VARIANT_TEMPERATURES.get(variant, base_temperature)
+        return out
+
+    if take_type != "TREND":
+        return out
+
+    trend_temperature = getattr(trend, "prompt_temperature", None) if trend is not None else None
+    trend_top_p = getattr(trend, "prompt_top_p", None) if trend is not None else None
+
+    if trend_temperature is None:
+        for variant in VARIANTS:
+            key = f"default_temperature_{variant.lower()}"
+            specific = effective_release.get(key)
+            out[variant]["temperature"] = (
+                clamp_temperature(specific, default=0.7) if specific not in (None, "") else base_temperature
+            )
+
+    if trend_top_p is None:
+        for variant in VARIANTS:
+            key = f"default_top_p_{variant.lower()}"
+            specific = effective_release.get(key)
+            clamped = clamp_top_p(specific)
+            out[variant]["top_p"] = clamped if clamped is not None else base_top_p
+
+    return out
 
 
 def _generate_one_variant(
@@ -199,6 +241,11 @@ def _generate_one_variant(
     input_image_path: str | None,
     temperature: float | None,
     image_size_tier: str,
+    aspect_ratio: str | None,
+    top_p: float | None,
+    candidate_count: int,
+    media_resolution: str | None,
+    thinking_config: dict[str, Any] | None,
 ) -> tuple[str, int, dict | None]:
     """
     Сгенерировать один вариант (A/B/C) в потоке. Возвращает (variant, seed, result_dict) или (variant, seed, None) при ошибке.
@@ -221,6 +268,11 @@ def _generate_one_variant(
                 temperature=temperature,
                 seed=seed,
                 image_size_tier=image_size_tier,
+                aspect_ratio=aspect_ratio,
+                top_p=top_p,
+                candidate_count=candidate_count,
+                media_resolution=media_resolution,
+                thinking_config=thinking_config,
             )
             result = generate_with_retry(
                 provider,
@@ -349,6 +401,9 @@ def generate_take(
         trend_svc = TrendService(db)
         trend = trend_svc.get(take.trend_id) if take.trend_id else None
 
+        gs_release = GenerationPromptSettingsService(db)
+        effective_release = gs_release.get_effective(profile="release")
+
         if take.take_type == "COPY":
             if not (take.custom_prompt or "").strip():
                 logger.error("generate_take_copy_no_prompt", extra={"take_id": take_id})
@@ -368,21 +423,17 @@ def generate_take(
                 if status_chat_id and status_message_id:
                     telegram.edit_message(status_chat_id, status_message_id, "❌ Не получен промпт от анализа. Начните заново: «🔄 Сделать такую же».")
                 return {"ok": False, "error": "copy_prompt_missing"}
-            gs_custom = GenerationPromptSettingsService(db)
-            effective_custom = gs_custom.get_effective(profile="release")
             prompt_text = take.custom_prompt.strip()
             negative_prompt = None
-            model = effective_custom.get("default_model", "gemini-2.5-flash-image")
-            size = take.image_size or aspect_ratio_to_size(effective_custom.get("default_aspect_ratio", "1:1"))
-            image_size_tier = effective_custom.get("default_image_size_tier") or "4K"
+            model = effective_release.get("default_model", "gemini-2.5-flash-image")
+            size = take.image_size or aspect_ratio_to_size(effective_release.get("default_aspect_ratio", "1:1"))
+            image_size_tier = effective_release.get("default_image_size_tier") or "4K"
         elif take.take_type == "CUSTOM" and take.custom_prompt:
-            gs_custom = GenerationPromptSettingsService(db)
-            effective_custom = gs_custom.get_effective(profile="release")
             prompt_text = take.custom_prompt
             negative_prompt = None
-            model = effective_custom.get("default_model", "gemini-2.5-flash-image")
-            size = take.image_size or aspect_ratio_to_size(effective_custom.get("default_aspect_ratio", "1:1"))
-            image_size_tier = effective_custom.get("default_image_size_tier") or "4K"
+            model = effective_release.get("default_model", "gemini-2.5-flash-image")
+            size = take.image_size or aspect_ratio_to_size(effective_release.get("default_aspect_ratio", "1:1"))
+            image_size_tier = effective_release.get("default_image_size_tier") or "4K"
         elif trend:
             prompt_text, negative_prompt, model, size, image_size_tier = _build_prompt_for_take(db, take, trend)
         else:
@@ -416,7 +467,30 @@ def generate_take(
             )
 
         input_image_path = None
-        if take.session_id:
+        face_asset = None
+        if getattr(take, "face_asset_id", None):
+            face_asset = db.query(FaceAsset).filter(FaceAsset.id == take.face_asset_id).one_or_none()
+            if face_asset and face_asset.status == "failed_multi_face":
+                logger.error("generate_take_face_asset_multi_face", extra={"take_id": take_id, "face_asset_id": face_asset.id})
+                take_svc.set_status(take, "failed", error_code="face_asset_multi_face")
+                _refund_free_take_on_failure(db, take, "face_asset_multi_face")
+                takes_failed_total.inc()
+                generation_failed_total.labels(error_code="face_asset_multi_face", source="take").inc()
+                ProductAnalyticsService(db).track(
+                    "generation_failed",
+                    take.user_id,
+                    take_id=take_id,
+                    session_id=take.session_id,
+                    trend_id=take.trend_id,
+                    properties={"error_code": "face_asset_multi_face", "latency_ms": int((time.time() - started_at) * 1000)},
+                )
+                db.commit()
+                if status_chat_id and status_message_id:
+                    telegram.edit_message(status_chat_id, status_message_id, "❌ На фото несколько лиц. Загрузите селфи с одним человеком.")
+                return {"ok": False, "error": "face_asset_multi_face"}
+            if face_asset and face_asset.selected_path and os.path.isfile(face_asset.selected_path):
+                input_image_path = face_asset.selected_path
+        if (not input_image_path) and take.session_id:
             from app.models.session import Session as SessionModel
             sess = db.query(SessionModel).filter(SessionModel.id == take.session_id).one_or_none()
             if sess and sess.input_photo_path and os.path.isfile(sess.input_photo_path):
@@ -464,9 +538,26 @@ def generate_take(
                 telegram.edit_message(status_chat_id, status_message_id, "❌ Исходное фото недоступно. Начните заново с «Создать фото».")
             return {"ok": False, "error": "input_image_missing"}
 
-        temperature = None
-        if trend and trend.prompt_temperature is not None:
-            temperature = trend.prompt_temperature
+        temperature = trend.prompt_temperature if (trend and trend.prompt_temperature is not None) else effective_release.get("default_temperature")
+
+        # Aspect ratio source of truth for production:
+        # 1) trend.prompt_aspect_ratio, 2) user-selected take.image_size, 3) master default_aspect_ratio.
+        prefer_size_aspect_ratio = bool((take.image_size or "").strip())
+        resolved_generation_cfg = _resolve_generation_config(
+            trend=trend,
+            effective_release=effective_release,
+            model=model,
+            size=size,
+            prefer_size_aspect_ratio=prefer_size_aspect_ratio,
+        )
+        base_seed = resolved_generation_cfg["base_seed"]
+        variant_sampling = _resolve_take_variant_sampling(
+            take_type=take.take_type,
+            trend=trend,
+            effective_release=effective_release,
+            base_temperature=temperature,
+            base_top_p=resolved_generation_cfg["top_p"],
+        )
 
         app_svc = AppSettingsService(db)
         provider_override = app_svc.get_effective_provider(settings)
@@ -485,7 +576,7 @@ def generate_take(
         os.makedirs(out_dir, exist_ok=True)
 
         results = {}
-        seeds = {}
+        seeds = _build_take_variant_seeds(base_seed)
         failed_variants = []
 
         parallel_workers = getattr(settings, "take_generation_parallel_workers", 1)
@@ -512,15 +603,7 @@ def generate_take(
                 except Exception as e:
                     logger.debug("generate_take_progress_edit_skip", extra={"error": str(e)})
 
-            for v in VARIANTS:
-                seeds[v] = random.randint(0, 2**31 - 1)
-
             done_count = 0
-            variant_temperature = (
-                (lambda v: COPY_VARIANT_TEMPERATURES.get(v, temperature))
-                if take.take_type == "COPY"
-                else (lambda v: temperature)
-            )
             with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
                 futures = {
                     pool.submit(
@@ -536,8 +619,13 @@ def generate_take(
                         size=size,
                         negative_prompt=negative_prompt,
                         input_image_path=input_image_path,
-                        temperature=variant_temperature(v),
+                        temperature=variant_sampling[v]["temperature"],
                         image_size_tier=image_size_tier,
+                        aspect_ratio=resolved_generation_cfg["aspect_ratio"],
+                        top_p=variant_sampling[v]["top_p"],
+                        candidate_count=resolved_generation_cfg["candidate_count"],
+                        media_resolution=resolved_generation_cfg["media_resolution"],
+                        thinking_config=resolved_generation_cfg["thinking_config"],
                     ): v
                     for v in VARIANTS
                 }
@@ -589,14 +677,11 @@ def generate_take(
                     except Exception as e:
                         logger.debug("generate_take_progress_edit_skip", extra={"step": i + 1, "error": str(e)})
 
-                seed = random.randint(0, 2**31 - 1)
+                seed = seeds[variant]
                 seeds[variant] = seed
 
-                req_temperature = (
-                    COPY_VARIANT_TEMPERATURES.get(variant, temperature)
-                    if take.take_type == "COPY"
-                    else temperature
-                )
+                req_temperature = variant_sampling[variant]["temperature"]
+                req_top_p = variant_sampling[variant]["top_p"]
                 success = False
                 for attempt in range(MAX_VARIANT_RETRIES + 1):
                     if attempt > 0:
@@ -612,6 +697,11 @@ def generate_take(
                             temperature=req_temperature,
                             seed=seed,
                             image_size_tier=image_size_tier,
+                            aspect_ratio=resolved_generation_cfg["aspect_ratio"],
+                            top_p=req_top_p,
+                            candidate_count=resolved_generation_cfg["candidate_count"],
+                            media_resolution=resolved_generation_cfg["media_resolution"],
+                            thinking_config=resolved_generation_cfg["thinking_config"],
                         )
                         result = generate_with_retry(
                             provider,

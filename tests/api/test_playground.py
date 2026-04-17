@@ -24,6 +24,11 @@ def _make_client(monkeypatch, result: ImageGenerationResponse | None = None, err
 
     monkeypatch.setattr(playground_route, "_build_full_prompt_for_playground", lambda _db, _cfg: "Prompt body")
     monkeypatch.setattr(playground_route.ImageProviderFactory, "create_from_settings", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        playground_route,
+        "GenerationPromptSettingsService",
+        lambda _db: type("GS", (), {"get_effective": lambda self, profile="preview": {"prompt_input": ""}})(),
+    )
 
     if error is not None:
         def _raise(*_args, **_kwargs):
@@ -349,3 +354,69 @@ def test_playground_batch_test_partial_generation_error_still_streams(monkeypatc
     assert resp.status_code == 200
     assert '"status": "error"' in resp.text or '"status":"error"' in resp.text.replace(" ", "")
     assert '"done": true' in resp.text or '"done":true' in resp.text.replace(" ", "")
+
+
+def test_playground_multi_test_requires_prompts(monkeypatch):
+    app = FastAPI()
+    app.include_router(playground_route.router)
+    app.dependency_overrides[playground_route.get_current_user] = lambda: {"username": "tester"}
+    app.dependency_overrides[playground_route.get_db] = lambda: MagicMock()
+    monkeypatch.setattr(playground_route, "_ensure_playground_schema", lambda _db: None)
+    client = TestClient(app)
+    resp = client.post(
+        "/admin/playground/multi-test",
+        files=[
+            ("config_base", (None, json.dumps(_config("gemini-2.5-flash-image")))),
+            ("images", ("a.jpg", b"x", "image/jpeg")),
+        ],
+    )
+    assert resp.status_code == 400
+
+
+def test_playground_multi_test_rejects_too_many_prompts(monkeypatch):
+    client = _make_client(
+        monkeypatch,
+        result=ImageGenerationResponse(
+            image_content=SAMPLE_PNG_BYTES,
+            image_contents=[SAMPLE_PNG_BYTES],
+            model="gemini-2.5-flash-image",
+            provider="gemini",
+        ),
+    )
+    prompts = [f"p{i}" for i in range(6)]
+    resp = client.post(
+        "/admin/playground/multi-test",
+        files=[
+            ("prompts", (None, json.dumps(prompts))),
+            ("config_base", (None, json.dumps(_config("gemini-2.5-flash-image")))),
+            ("images", ("a.jpg", b"x", "image/jpeg")),
+        ],
+    )
+    assert resp.status_code == 400
+    assert "Too many prompts" in (resp.json().get("detail") or "")
+
+
+def test_playground_multi_test_streams_sse_and_done(monkeypatch):
+    client = _make_client(
+        monkeypatch,
+        result=ImageGenerationResponse(
+            image_content=SAMPLE_PNG_BYTES,
+            image_contents=[SAMPLE_PNG_BYTES],
+            model="gemini-2.5-flash-image",
+            provider="gemini",
+        ),
+    )
+    resp = client.post(
+        "/admin/playground/multi-test",
+        files=[
+            ("prompts", (None, json.dumps(["prompt one", "prompt two"]))),
+            ("config_base", (None, json.dumps(_config("gemini-2.5-flash-image")))),
+            ("concurrency", (None, "2")),
+            ("images", ("a.jpg", b"x", "image/jpeg")),
+        ],
+    )
+    assert resp.status_code == 200
+    text = resp.text
+    assert "data:" in text
+    assert "variant_0" in text
+    assert '"done": true' in text or '"done":true' in text.replace(" ", "")

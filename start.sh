@@ -53,7 +53,10 @@ done
 check_already_running() {
     # Count running containers
     local running=$($COMPOSE_CMD ps -q 2>/dev/null | wc -l)
-    local total=7  # Total expected services
+    local total=$($COMPOSE_CMD config --services 2>/dev/null | wc -l)
+    if [ -z "$total" ] || [ "$total" -le 0 ]; then
+        total=7
+    fi
     
     if [ "$running" -ge "$total" ]; then
         # Check if all are healthy/running
@@ -182,7 +185,7 @@ free_port() {
 }
 
 # Free ports that might be in use
-for port in 3000 8000 8001 5432 6379; do
+for port in 3000 8000 8001 8010 5432 6379; do
     free_port $port
 done
 echo -e "${GREEN}  ✓  Проверка портов завершена${NC}"
@@ -323,6 +326,12 @@ fi
 if [ -f migrations/028_telegram_message_templates.sql ]; then
     $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/028_telegram_message_templates.sql 2>/dev/null || true
 fi
+if [ -f migrations/029_plus_pack_if_missing.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/029_plus_pack_if_missing.sql 2>/dev/null || {
+        echo -e "${RED}  ✗ Ошибка применения migrations/029_plus_pack_if_missing.sql${NC}"
+        exit 1
+    }
+fi
 if [ -f migrations/030_bank_transfer_settings.sql ]; then
     $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/030_bank_transfer_settings.sql 2>/dev/null || true
 fi
@@ -448,6 +457,48 @@ if [ -f migrations/070_take_hd_bundle_charged.sql ]; then
 fi
 if [ -f migrations/071_trial_v2_referral_unlock.sql ]; then
     $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/071_trial_v2_referral_unlock.sql 2>/dev/null || true
+fi
+if [ -f migrations/072_default_aspect_ratio_3_4.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/072_default_aspect_ratio_3_4.sql 2>/dev/null || {
+        echo -e "${RED}  ✗ Ошибка применения migrations/072_default_aspect_ratio_3_4.sql${NC}"
+        exit 1
+    }
+fi
+if [ -f migrations/073_master_prompt_gemini_advanced_defaults.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/073_master_prompt_gemini_advanced_defaults.sql 2>/dev/null || {
+        echo -e "${RED}  ✗ Ошибка применения migrations/073_master_prompt_gemini_advanced_defaults.sql${NC}"
+        exit 1
+    }
+fi
+if [ -f migrations/074_master_prompt_legacy_cleanup.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/074_master_prompt_legacy_cleanup.sql 2>/dev/null || {
+        echo -e "${RED}  ✗ Ошибка применения migrations/074_master_prompt_legacy_cleanup.sql${NC}"
+        exit 1
+    }
+fi
+if [ -f migrations/075_master_prompt_variant_sampling_defaults.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/075_master_prompt_variant_sampling_defaults.sql 2>/dev/null || {
+        echo -e "${RED}  ✗ Ошибка применения migrations/075_master_prompt_variant_sampling_defaults.sql${NC}"
+        exit 1
+    }
+fi
+if [ -f migrations/076_face_id_v1.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/076_face_id_v1.sql 2>/dev/null || {
+        echo -e "${RED}  ✗ Ошибка применения migrations/076_face_id_v1.sql${NC}"
+        exit 1
+    }
+fi
+if [ -f migrations/077_master_prompt_unified.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/077_master_prompt_unified.sql 2>/dev/null || {
+        echo -e "${RED}  ✗ Ошибка применения migrations/077_master_prompt_unified.sql${NC}"
+        exit 1
+    }
+fi
+if [ -f migrations/078_clear_legacy_master_prompt_text.sql ]; then
+    $COMPOSE_CMD exec -T db psql -U trends -d trends -f /dev/stdin < migrations/078_clear_legacy_master_prompt_text.sql 2>/dev/null || {
+        echo -e "${RED}  ✗ Ошибка применения migrations/078_clear_legacy_master_prompt_text.sql${NC}"
+        exit 1
+    }
 fi
 # Роль postgres: создать или обновить пароль (внешние клиенты/IDE часто подключаются как postgres → убираем FATAL в логах)
 if ! $COMPOSE_CMD exec -T db psql -U trends -d trends -c "

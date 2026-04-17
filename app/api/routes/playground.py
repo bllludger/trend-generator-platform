@@ -31,6 +31,7 @@ from app.services.image_generation import (
     ImageProviderFactory,
     generate_with_retry,
 )
+from app.utils.image_formats import aspect_ratio_to_size
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,9 @@ _PLAYGROUND_SCHEMA_CHECK_OK: bool | None = None
 PLAYGROUND_BATCH_MAX_TRENDS = 200
 PLAYGROUND_BATCH_MAX_CONCURRENCY = 20
 PLAYGROUND_BATCH_DEFAULT_CONCURRENCY = 10
+PLAYGROUND_MULTI_MAX_PROMPTS = 5
+PLAYGROUND_MULTI_MAX_CONCURRENCY = 5
+PLAYGROUND_MULTI_DEFAULT_CONCURRENCY = 3
 _PLAYGROUND_BATCH_OVERLAY_KEYS = (
     "model",
     "temperature",
@@ -186,7 +190,7 @@ def _style_preset_content_to_text(content: str) -> str:
 
 
 def _build_prompt_from_config(config: PlaygroundPromptConfig) -> str:
-    """Build single prompt string from enabled sections; add []/[STYLE]/[AVOID] to match worker."""
+    """Build single prompt string from enabled sections without legacy section tags."""
     parts = []
     for s in sorted(config.sections, key=lambda x: x.order):
         if not s.enabled or not s.content.strip():
@@ -194,42 +198,22 @@ def _build_prompt_from_config(config: PlaygroundPromptConfig) -> str:
         text = s.content.strip()
         for k, v in (config.variables or {}).items():
             text = text.replace("{{" + k + "}}", str(v))
-        label = (s.label or "").strip().lower()
-        if label == "scene":
-            parts.append("[]\n" + text)
-        elif label == "style":
-            style_text = _style_preset_content_to_text(text)
-            if style_text:
-                parts.append("[STYLE]\n" + style_text)
-        elif label == "avoid":
-            parts.append("[AVOID]\n" + text)
-        elif label == "composition":
-            parts.append("[COMPOSITION]\n" + text)
-        else:
-            parts.append(text)
-    return "\n\n".join(parts) if parts else "Generate an image."
+        # Playground uses plain prompt input; legacy tags are intentionally not injected.
+        parts.append(text)
+    return "\n\n".join(parts) if parts else ""
 
 
 def _build_full_prompt_for_playground(db: Session, config: PlaygroundPromptConfig) -> str:
-    """Build prompt with master blocks ([INPUT], [TASK], [IDENTITY TRANSFER]) + sections + [SAFETY] for Playground test."""
+    """Build prompt with master prompt_input + trend prompt for Playground test."""
     svc = GenerationPromptSettingsService(db)
     effective = svc.get_effective(profile="preview")
     blocks = []
     prompt_input = (effective.get("prompt_input") or "").strip()
     if prompt_input:
-        blocks.append("[INPUT]\n" + prompt_input)
-    prompt_task = (effective.get("prompt_task") or "").strip()
-    if prompt_task:
-        blocks.append("[TASK]\n" + prompt_task)
-    identity = (effective.get("prompt_identity_transfer") or "").strip()
-    if identity:
-        blocks.append("[IDENTITY TRANSFER]\n" + identity)
+        blocks.append(prompt_input)
     sections_text = _build_prompt_from_config(config)
     if sections_text:
         blocks.append(sections_text)
-    safety = (effective.get("safety_constraints") or "").strip()
-    if safety:
-        blocks.append("[SAFETY]\n" + safety)
     return "\n\n".join(blocks)
 
 
@@ -517,6 +501,13 @@ def trend_to_playground_config(
     default_temperature: float = 0.4,
     default_format: str = "png",
     default_size: str = "1024x1024",
+    default_aspect_ratio: str = "3:4",
+    default_top_p: float | None = None,
+    default_candidate_count: int = 1,
+    default_media_resolution: str | None = None,
+    default_thinking_config: dict[str, Any] | None = None,
+    default_seed: int | None = None,
+    default_image_size_tier: str | None = None,
 ) -> PlaygroundPromptConfig:
     """Build PlaygroundPromptConfig from trend (single source of truth for load)."""
     sections_raw = trend.prompt_sections if isinstance(trend.prompt_sections, list) else []
@@ -538,20 +529,28 @@ def trend_to_playground_config(
         return PlaygroundPromptConfig(
             model=trend.prompt_model or default_model,
             temperature=float(trend.prompt_temperature) if trend.prompt_temperature is not None else default_temperature,
-            top_p=_safe_top_p(getattr(trend, "prompt_top_p", None)),
-            candidate_count=_safe_candidate_count(getattr(trend, "prompt_candidate_count", 1)),
-            media_resolution=getattr(trend, "prompt_media_resolution", None),
+            top_p=_safe_top_p(
+                getattr(trend, "prompt_top_p", None)
+                if getattr(trend, "prompt_top_p", None) is not None
+                else default_top_p
+            ),
+            candidate_count=_safe_candidate_count(
+                getattr(trend, "prompt_candidate_count", None)
+                if getattr(trend, "prompt_candidate_count", None) is not None
+                else default_candidate_count
+            ),
+            media_resolution=getattr(trend, "prompt_media_resolution", None) or default_media_resolution,
             thinking_config=_effective_playground_thinking_config(
                 trend.prompt_model or default_model,
-                getattr(trend, "prompt_thinking_config", None),
+                getattr(trend, "prompt_thinking_config", None) or default_thinking_config,
             ),
             format=trend.prompt_format or default_format,
             size=trend.prompt_size or default_size,
-            aspect_ratio=getattr(trend, "prompt_aspect_ratio", None) or _playground_size_to_aspect_ratio(trend.prompt_size or default_size),
+            aspect_ratio=getattr(trend, "prompt_aspect_ratio", None) or default_aspect_ratio,
             sections=sections,
             variables={},
-            seed=trend.prompt_seed if getattr(trend, "prompt_seed", None) is not None else None,
-            image_size_tier=getattr(trend, "prompt_image_size_tier", None) or None,
+            seed=trend.prompt_seed if getattr(trend, "prompt_seed", None) is not None else default_seed,
+            image_size_tier=getattr(trend, "prompt_image_size_tier", None) or default_image_size_tier,
         )
     scene_content = (trend.scene_prompt or trend.system_prompt or "").strip()
     style_preset = trend.style_preset
@@ -572,20 +571,28 @@ def trend_to_playground_config(
     return PlaygroundPromptConfig(
         model=trend.prompt_model or default_model,
         temperature=float(trend.prompt_temperature) if trend.prompt_temperature is not None else default_temperature,
-        top_p=_safe_top_p(getattr(trend, "prompt_top_p", None)),
-        candidate_count=_safe_candidate_count(getattr(trend, "prompt_candidate_count", 1)),
-        media_resolution=getattr(trend, "prompt_media_resolution", None),
+        top_p=_safe_top_p(
+            getattr(trend, "prompt_top_p", None)
+            if getattr(trend, "prompt_top_p", None) is not None
+            else default_top_p
+        ),
+        candidate_count=_safe_candidate_count(
+            getattr(trend, "prompt_candidate_count", None)
+            if getattr(trend, "prompt_candidate_count", None) is not None
+            else default_candidate_count
+        ),
+        media_resolution=getattr(trend, "prompt_media_resolution", None) or default_media_resolution,
         thinking_config=_effective_playground_thinking_config(
             trend.prompt_model or default_model,
-            getattr(trend, "prompt_thinking_config", None),
+            getattr(trend, "prompt_thinking_config", None) or default_thinking_config,
         ),
         format=trend.prompt_format or default_format,
         size=trend.prompt_size or default_size,
-        aspect_ratio=getattr(trend, "prompt_aspect_ratio", None) or _playground_size_to_aspect_ratio(trend.prompt_size or default_size),
+        aspect_ratio=getattr(trend, "prompt_aspect_ratio", None) or default_aspect_ratio,
         sections=sections,
         variables={},
-        seed=trend.prompt_seed if getattr(trend, "prompt_seed", None) is not None else None,
-        image_size_tier=getattr(trend, "prompt_image_size_tier", None) or None,
+        seed=trend.prompt_seed if getattr(trend, "prompt_seed", None) is not None else default_seed,
+        image_size_tier=getattr(trend, "prompt_image_size_tier", None) or default_image_size_tier,
     )
 
 
@@ -599,6 +606,7 @@ async def get_playground_config(
     _ensure_playground_schema(db)
     svc = GenerationPromptSettingsService(db)
     effective = svc.get_effective(profile="preview")
+    default_aspect_ratio = effective.get("default_aspect_ratio") or "3:4"
     sections = [
         PlaygroundSection(id="1", label="Scene", content="", enabled=True, order=0),
         PlaygroundSection(id="2", label="Style", content="", enabled=True, order=1),
@@ -608,15 +616,20 @@ async def get_playground_config(
     return PlaygroundPromptConfig(
         model=effective.get("default_model", "gemini-2.5-flash-image"),
         temperature=effective.get("default_temperature", 0.4),
-        top_p=None,
-        candidate_count=1,
-        media_resolution=None,
-        thinking_config=None,
+        top_p=_safe_top_p(effective.get("default_top_p")),
+        candidate_count=_safe_candidate_count(effective.get("default_candidate_count", 1)),
+        media_resolution=effective.get("default_media_resolution"),
+        thinking_config=_effective_playground_thinking_config(
+            effective.get("default_model", "gemini-2.5-flash-image"),
+            effective.get("default_thinking_config"),
+        ),
         format=effective.get("default_format", "png"),
-        size=effective.get("default_size") or "1024x1024",
-        aspect_ratio=_playground_size_to_aspect_ratio(effective.get("default_size") or "1024x1024"),
+        size=aspect_ratio_to_size(default_aspect_ratio),
+        aspect_ratio=default_aspect_ratio,
         sections=sections,
         variables={},
+        seed=effective.get("default_seed"),
+        image_size_tier=effective.get("default_image_size_tier"),
     )
 
 
@@ -897,6 +910,260 @@ async def test_prompt(
         _unlink_playground_temp_paths(temp_paths)
 
 
+# ---------- POST /admin/playground/multi-test (SSE stream) ----------
+@router.post("/multi-test")
+async def playground_multi_test(
+    request: Request,
+    db: Session = Depends(get_db),
+    _current_user: dict = Depends(get_current_user),
+):
+    """
+    Multipart: prompts (JSON array of strings), config_base (JSON object), images[], concurrency (1..5).
+    Streams Server-Sent Events: variant payloads and final {"done": true, ...}.
+    """
+    _ensure_playground_schema(db)
+    form = await request.form()
+
+    prompts_raw = form.get("prompts")
+    if not prompts_raw:
+        raise HTTPException(status_code=400, detail="Missing prompts")
+    if hasattr(prompts_raw, "read"):
+        maybe_data = prompts_raw.read()
+        if asyncio.iscoroutine(maybe_data):
+            maybe_data = await maybe_data
+        if isinstance(maybe_data, bytes):
+            prompts_raw = maybe_data.decode("utf-8")
+        else:
+            prompts_raw = str(maybe_data or "")
+    try:
+        prompts_data: list[Any] = json.loads(prompts_raw)
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid prompts JSON")
+    if not isinstance(prompts_data, list):
+        raise HTTPException(status_code=400, detail="prompts must be a JSON array")
+    if len(prompts_data) == 0:
+        raise HTTPException(status_code=400, detail="prompts is empty")
+    if len(prompts_data) > PLAYGROUND_MULTI_MAX_PROMPTS:
+        raise HTTPException(status_code=400, detail=f"Too many prompts: max {PLAYGROUND_MULTI_MAX_PROMPTS}")
+    prompts_cleaned: list[str] = []
+    for item in prompts_data:
+        text_prompt = str(item or "").strip()
+        if not text_prompt:
+            continue
+        prompts_cleaned.append(text_prompt)
+    if len(prompts_cleaned) == 0:
+        raise HTTPException(status_code=400, detail="No non-empty prompts")
+
+    config_raw = form.get("config_base")
+    if config_raw is None:
+        config_raw = "{}"
+    if hasattr(config_raw, "read"):
+        maybe_data = config_raw.read()
+        if asyncio.iscoroutine(maybe_data):
+            maybe_data = await maybe_data
+        if isinstance(maybe_data, bytes):
+            config_raw = maybe_data.decode("utf-8")
+        else:
+            config_raw = str(maybe_data or "")
+    try:
+        config_base = PlaygroundPromptConfig.model_validate(
+            json.loads(config_raw) if str(config_raw).strip() else {}
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid config_base JSON")
+
+    conc_field = form.get("concurrency")
+    conc_str = ""
+    if conc_field is not None and not hasattr(conc_field, "read"):
+        conc_str = str(conc_field).strip()
+    try:
+        concurrency = int(conc_str) if conc_str else PLAYGROUND_MULTI_DEFAULT_CONCURRENCY
+    except ValueError:
+        concurrency = PLAYGROUND_MULTI_DEFAULT_CONCURRENCY
+    concurrency = max(1, min(PLAYGROUND_MULTI_MAX_CONCURRENCY, concurrency))
+
+    raw_images = list(form.getlist("images") or [])
+    if not raw_images:
+        image1 = form.get("image1")
+        if image1 is not None:
+            raw_images = [image1]
+    files = [item for item in raw_images if hasattr(item, "read")]
+    if len(files) == 0:
+        raise HTTPException(status_code=400, detail="Missing images")
+
+    model_name = config_base.model or "gemini-2.5-flash-image"
+    max_images = _playground_max_input_images(model_name)
+    if len(files) > max_images:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many input files: got {len(files)}, max {max_images} for model {model_name}",
+        )
+
+    temp_paths, input_files, _, upload_err = await _multipart_upload_items_to_temp_files(files)
+    if upload_err:
+        raise HTTPException(status_code=400, detail=upload_err)
+
+    gs = GenerationPromptSettingsService(db)
+    effective = gs.get_effective(profile="preview")
+    master_prompt_input = (effective.get("prompt_input") or "").strip()
+
+    work_items: list[tuple[int, str, str, PlaygroundPromptConfig]] = []
+    try:
+        for idx, raw_prompt in enumerate(prompts_cleaned):
+            label = f"Prompt {chr(ord('A') + idx)}"
+            full_prompt = "\n\n".join([x for x in [master_prompt_input, raw_prompt] if x]).strip()
+            merged = PlaygroundPromptConfig.model_validate(config_base.model_dump())
+            work_items.append((idx, label, full_prompt, merged))
+    except Exception:
+        _unlink_playground_temp_paths(temp_paths)
+        raise
+
+    async def event_stream():
+        success_count = 0
+        error_count = 0
+        started_at = time.perf_counter()
+        sem = asyncio.Semaphore(concurrency)
+
+        async def run_item(item: tuple[int, str, str, PlaygroundPromptConfig]) -> dict[str, Any]:
+            variant_idx, label, prompt_text, merged = item
+            variant_id = f"variant_{variant_idx}"
+            if not prompt_text:
+                return {
+                    "variant_id": variant_id,
+                    "prompt_label": label,
+                    "status": "error",
+                    "duration": 0.0,
+                    "error": "Prompt is empty",
+                }
+            local_model_name = merged.model or "gemini-2.5-flash-image"
+            eff_thinking = _effective_playground_thinking_config(local_model_name, merged.thinking_config)
+            async with sem:
+                t0 = time.perf_counter()
+                try:
+                    provider = ImageProviderFactory.create_from_settings(settings, "gemini")
+                    req = ImageGenerationRequest(
+                        prompt=prompt_text,
+                        model=merged.model or None,
+                        size=merged.size or "1024x1024",
+                        negative_prompt=None,
+                        input_files=input_files,
+                        extra_params=None,
+                        temperature=merged.temperature,
+                        top_p=merged.top_p,
+                        candidate_count=max(
+                            1,
+                            min(
+                                _playground_max_candidate_count(local_model_name),
+                                int(merged.candidate_count or 1),
+                            ),
+                        ),
+                        media_resolution=merged.media_resolution
+                        if _playground_supports_media_resolution(local_model_name)
+                        else None,
+                        thinking_config=eff_thinking,
+                        seed=merged.seed,
+                        image_size_tier=merged.image_size_tier,
+                        aspect_ratio=_playground_effective_aspect_ratio(merged),
+                        allow_high_temperature=True,
+                    )
+                    result = await run_in_threadpool(
+                        generate_with_retry,
+                        provider,
+                        req,
+                        settings,
+                        model_version=merged.model or None,
+                        safety_settings_snapshot=getattr(settings, "gemini_safety_settings", None),
+                        streaming_enabled=False,
+                    )
+                    elapsed = time.perf_counter() - t0
+                    contents = result.image_contents if result.image_contents else [result.image_content]
+                    fmt = (merged.format or "png").lower()
+                    image_urls: list[str] = []
+                    for idx, img_bytes in enumerate(contents):
+                        try:
+                            mime, converted = _convert_output_image_bytes(img_bytes, fmt)
+                        except Exception as e:
+                            return {
+                                "variant_id": variant_id,
+                                "prompt_label": label,
+                                "status": "error",
+                                "duration": round(elapsed, 3),
+                                "error": f"Output conversion failed for image #{idx + 1}: {e}",
+                            }
+                        image_urls.append(f"data:{mime};base64,{base64.standard_b64encode(converted).decode('ascii')}")
+                    if not image_urls:
+                        return {
+                            "variant_id": variant_id,
+                            "prompt_label": label,
+                            "status": "error",
+                            "duration": round(elapsed, 3),
+                            "error": "No image in response",
+                        }
+                    return {
+                        "variant_id": variant_id,
+                        "prompt_label": label,
+                        "status": "success",
+                        "duration": round(elapsed, 3),
+                        "image_urls": image_urls,
+                    }
+                except ImageGenerationError as e:
+                    elapsed = time.perf_counter() - t0
+                    err_msg = str(e) or (e.detail.get("finish_message") if e.detail else "Generation failed")
+                    return {
+                        "variant_id": variant_id,
+                        "prompt_label": label,
+                        "status": "error",
+                        "duration": round(elapsed, 3),
+                        "error": err_msg,
+                    }
+                except Exception as e:
+                    elapsed = time.perf_counter() - t0
+                    logger.exception("Playground multi-test item failed")
+                    return {
+                        "variant_id": variant_id,
+                        "prompt_label": label,
+                        "status": "error",
+                        "duration": round(elapsed, 3),
+                        "error": str(e),
+                    }
+
+        try:
+            for idx, label, _, _ in work_items:
+                yield _sse_data_line({
+                    "variant_id": f"variant_{idx}",
+                    "prompt_label": label,
+                    "status": "queued",
+                })
+            tasks = [asyncio.create_task(run_item(w)) for w in work_items]
+            for fut in asyncio.as_completed(tasks):
+                payload = await fut
+                if payload.get("status") == "success":
+                    success_count += 1
+                else:
+                    error_count += 1
+                yield _sse_data_line(payload)
+            elapsed_total = time.perf_counter() - started_at
+            yield _sse_data_line({
+                "done": True,
+                "total": len(work_items),
+                "success": success_count,
+                "errors": error_count,
+                "duration": round(elapsed_total, 3),
+            })
+        finally:
+            _unlink_playground_temp_paths(temp_paths)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ---------- POST /admin/playground/batch-test (SSE stream) ----------
 @router.post("/batch-test")
 async def playground_batch_test(
@@ -976,7 +1243,14 @@ async def playground_batch_test(
     default_model = effective.get("default_model", "gemini-2.5-flash-image")
     default_temperature = float(effective.get("default_temperature", 0.4))
     default_format = effective.get("default_format", "png")
-    default_size = effective.get("default_size") or "1024x1024"
+    default_aspect_ratio = effective.get("default_aspect_ratio") or "3:4"
+    default_size = aspect_ratio_to_size(default_aspect_ratio)
+    default_top_p = _safe_top_p(effective.get("default_top_p"))
+    default_candidate_count = _safe_candidate_count(effective.get("default_candidate_count", 1))
+    default_media_resolution = _normalize_media_resolution(effective.get("default_media_resolution"))
+    default_thinking_config = _effective_playground_thinking_config(default_model, effective.get("default_thinking_config"))
+    default_seed = effective.get("default_seed")
+    default_image_size_tier = effective.get("default_image_size_tier")
 
     rows = db.query(Trend).filter(Trend.id.in_(trend_ids_str)).all()
     trend_map = {str(t.id): t for t in rows}
@@ -992,6 +1266,13 @@ async def playground_batch_test(
             default_temperature=default_temperature,
             default_format=default_format,
             default_size=default_size,
+            default_aspect_ratio=default_aspect_ratio,
+            default_top_p=default_top_p,
+            default_candidate_count=default_candidate_count,
+            default_media_resolution=default_media_resolution,
+            default_thinking_config=default_thinking_config,
+            default_seed=default_seed,
+            default_image_size_tier=default_image_size_tier,
         )
         merged_for_limits.append(_merge_playground_config_overlay(base_cfg, config_overlay))
 
@@ -1046,6 +1327,13 @@ async def playground_batch_test(
                 default_temperature=default_temperature,
                 default_format=default_format,
                 default_size=default_size,
+                default_aspect_ratio=default_aspect_ratio,
+                default_top_p=default_top_p,
+                default_candidate_count=default_candidate_count,
+                default_media_resolution=default_media_resolution,
+                default_thinking_config=default_thinking_config,
+                default_seed=default_seed,
+                default_image_size_tier=default_image_size_tier,
             )
             merged = _merge_playground_config_overlay(base_cfg, config_overlay)
             prompt = _build_full_prompt_for_playground(db, merged)

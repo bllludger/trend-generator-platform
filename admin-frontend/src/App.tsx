@@ -27,6 +27,7 @@ import PromptPlaygroundPage from '@/pages/PromptPlaygroundPage'
 import ReferralsPage from '@/pages/ReferralsPage'
 import TrafficPage from '@/pages/TrafficPage'
 import PhotoMergePage from '@/pages/PhotoMergePage'
+import FaceIdPage from '@/pages/FaceIdPage'
 
 function ProtectedLayout() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -71,6 +72,7 @@ export default function App() {
           <Route path="traffic" element={<TrafficPage />} />
           <Route path="cleanup" element={<CleanupPage />} />
           <Route path="photo-merge" element={<PhotoMergePage />} />
+          <Route path="face-id" element={<FaceIdPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

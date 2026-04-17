@@ -211,6 +211,13 @@ class Settings(BaseSettings):
     # INTERNAL SERVICES
     # ===========================================
     cleanup_api_base: str = "http://cleanup:8001"
+    face_id_api_base: str = "http://face-id-api:8010"
+    face_id_callback_url: str = "http://api:8000/internal/face-id/callback"
+    face_id_callback_secret: str = "face-id-dev-secret"
+    face_id_callback_secret_id: str = "v1"
+    face_id_request_timeout_seconds: float = 1.5
+    face_id_signature_ttl_seconds: int = 300
+    face_id_await_timeout_seconds: int = 180
     cleanup_temp_ttl_hours: int = 24
     http_client_timeout: float = 10.0
     http_client_timeout_long: float = 30.0

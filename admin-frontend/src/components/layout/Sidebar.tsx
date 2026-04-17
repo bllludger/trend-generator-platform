@@ -43,6 +43,7 @@ const nav = [
   { to: '/broadcast', label: 'Рассылка', icon: Send },
   { to: '/referrals', label: 'Рефералы', icon: Gift },
   { to: '/photo-merge', label: 'Склейка фото', icon: Layers },
+  { to: '/face-id', label: 'Face ID', icon: ImageIcon },
   { to: '/cleanup', label: 'Очистка', icon: Trash2 },
 ]
 

@@ -1,0 +1,13 @@
+{
+  "asset_id": "ac17f61f-7be9-4fbb-a0d7-fe827696ffb3",
+  "status": "ready_fallback",
+  "faces_detected": 0,
+  "selected_path": "/data/generated_images/face_id_probe/source/ac17f61f-7be9-4fbb-a0d7-fe827696ffb3.jpg",
+  "source_path": "/data/generated_images/face_id_probe/source/ac17f61f-7be9-4fbb-a0d7-fe827696ffb3.jpg",
+  "detector_meta": {
+    "latency_ms": 90,
+    "model_version": "mediapipe-face-detection-v1",
+    "reason": "no_face"
+  },
+  "event_id": "1e9152ec-b577-43ce-a8fd-e68ea6a784d5"
+}

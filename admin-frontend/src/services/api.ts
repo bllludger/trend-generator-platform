@@ -96,8 +96,23 @@ export interface MasterPromptSettings {
   default_size?: string
   default_format?: string
   default_temperature?: number
+  default_temperature_a?: number | null
+  default_temperature_b?: number | null
+  default_temperature_c?: number | null
   default_image_size_tier?: string
   default_aspect_ratio?: string
+  default_top_p?: number | null
+  default_top_p_a?: number | null
+  default_top_p_b?: number | null
+  default_top_p_c?: number | null
+  default_seed?: number | null
+  default_candidate_count?: number
+  default_media_resolution?: 'LOW' | 'MEDIUM' | 'HIGH' | null
+  default_thinking_config?: {
+    thinking_level?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH'
+    thinking_budget?: number
+    include_thoughts?: boolean
+  } | null
   updated_at?: string | null
 }
 
@@ -129,11 +144,35 @@ export type MasterPromptUpdatePayload =
     }
   | Partial<MasterPromptSettings>
 
+export interface MasterPromptPayloadPreviewResponse {
+  profile: 'preview' | 'release'
+  sent_request: Record<string, unknown>
+  diagnostics: Array<{
+    field: string
+    status: 'info' | 'omitted' | 'normalized' | 'forced'
+    reason: string
+    requested?: unknown
+    applied?: unknown
+  }>
+  effective_settings: {
+    preview: MasterPromptSettings
+    release: MasterPromptSettings
+  }
+}
+
 export const masterPromptService = {
   getSettings: () =>
     api.get<MasterPromptSettingsResponse>('/admin/settings/master-prompt').then((r) => r.data),
   updateSettings: (payload: MasterPromptUpdatePayload) =>
     api.put<MasterPromptSettingsResponse>('/admin/settings/master-prompt', payload).then((r) => r.data),
+  previewPayload: (payload: {
+    profile: 'preview' | 'release'
+    preview?: Partial<MasterPromptSettings>
+    release?: Partial<MasterPromptSettings>
+    prompt_text?: string
+    input_files?: Array<{ mime_type?: string; mimeType?: string; size_bytes?: number; sizeBytes?: number }>
+  }, signal?: AbortSignal) =>
+    api.post<MasterPromptPayloadPreviewResponse>('/admin/settings/master-prompt/payload-preview', payload, signal ? { signal } : undefined).then((r) => r.data),
 }
 
 // ─── Preview policy (единый раздел превью и вотермарка) ─────────────────────
@@ -155,6 +194,55 @@ export const previewPolicyService = {
     api.get<PreviewPolicySettings>('/admin/settings/preview-policy').then((r) => r.data),
   updateSettings: (payload: Partial<PreviewPolicySettings>) =>
     api.put<PreviewPolicySettings>('/admin/settings/preview-policy', payload).then((r) => r.data),
+}
+
+// ─── Face ID ───────────────────────────────────────────────────────────────
+export interface FaceIdSettings {
+  enabled: boolean
+  min_detection_confidence: number
+  model_selection: 0 | 1
+  crop_pad_left: number
+  crop_pad_right: number
+  crop_pad_top: number
+  crop_pad_bottom: number
+  max_faces_allowed: number
+  no_face_policy: 'fallback_original'
+  multi_face_policy: 'fail_generation' | 'fallback_original'
+  callback_timeout_seconds: number
+  callback_max_retries: number
+  callback_backoff_seconds: number
+  updated_at?: string | null
+}
+
+export interface FaceIdAsset {
+  id: string
+  user_id: string
+  session_id?: string | null
+  chat_id?: string | null
+  flow: string
+  status: 'pending' | 'ready' | 'ready_fallback' | 'failed_multi_face' | 'failed_error'
+  faces_detected?: number | null
+  reason_code?: string | null
+  source_path: string
+  processed_path?: string | null
+  selected_path?: string | null
+  request_id?: string | null
+  last_event_id?: string | null
+  latency_ms?: number | null
+  primary_face_bbox?: Record<string, unknown> | null
+  crop_bbox?: Record<string, unknown> | null
+  detector_meta?: Record<string, unknown> | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export const faceIdService = {
+  getSettings: () =>
+    api.get<FaceIdSettings>('/admin/settings/face-id').then((r) => r.data),
+  updateSettings: (payload: Partial<FaceIdSettings>) =>
+    api.put<FaceIdSettings>('/admin/settings/face-id', payload).then((r) => r.data),
+  listAssets: (params?: { limit?: number; status?: string }) =>
+    api.get<{ items: FaceIdAsset[]; limit: number; pending_takes: number }>('/admin/face-id/assets', { params }).then((r) => r.data),
 }
 
 // ─── Env / App settings ─────────────────────────────────────────────────────
@@ -288,11 +376,44 @@ export interface UserDetail {
   payments: UserDetailPayment[]
 }
 
+export interface UsersGrowthAllTimeResponse {
+  total_users: number
+  start_date: string | null
+  end_date: string
+  generated_at: string
+  series: Array<{
+    date: string
+    new_users: number
+    total_users: number
+  }>
+}
+
+export interface UsersAudienceSelectionStatsResponse {
+  window_days: number | null
+  total_clicks: number
+  generated_at: string
+  items: Array<{
+    key: 'women' | 'men' | 'couples' | 'unknown'
+    label: string
+    clicks: number
+    unique_users: number
+    pct: number
+  }>
+}
+
 export const usersService = {
   list: (params: { page?: number; page_size?: number; search?: string; [key: string]: unknown }) =>
     api.get<{ items: UserListItem[]; total: number; page: number; pages: number }>('/admin/users', { params }).then((r) => r.data),
   getAnalytics: (timeWindow?: string) =>
     api.get('/admin/users/analytics', { params: { time_window: timeWindow } }).then((r) => r.data),
+  getGrowthAllTime: () =>
+    api.get<UsersGrowthAllTimeResponse>('/admin/users/growth-all-time').then((r) => r.data),
+  getAudienceSelectionStats: (windowDays?: number) =>
+    api
+      .get<UsersAudienceSelectionStatsResponse>('/admin/users/audience-selection-stats', {
+        params: { window_days: windowDays },
+      })
+      .then((r) => r.data),
   getDetail: (userId: string) =>
     api.get<UserDetail>(`/admin/users/${encodeURIComponent(userId)}`).then((r) => r.data),
   grantPack: (
@@ -351,6 +472,7 @@ export interface TelemetryQualityMap {
 
 export interface TelemetryHealthResponse {
   window_days: number
+  all_time?: boolean
   status: 'ok' | 'degraded'
   data_quality: TelemetryQualityMap
   metrics?: TelemetryQualityMap
@@ -359,6 +481,7 @@ export interface TelemetryHealthResponse {
 
 export interface TelemetryProductFunnelResponse {
   window_days: number
+  all_time?: boolean
   funnel_counts: Record<string, number>
   shadow_funnel_counts?: Record<string, number>
   diff_funnel_counts?: Record<string, number>
@@ -368,6 +491,7 @@ export interface TelemetryProductFunnelResponse {
 
 export interface TelemetryProductFunnelDiffResponse {
   window_days: number
+  all_time?: boolean
   legacy_funnel_counts: Record<string, number>
   shadow_funnel_counts: Record<string, number>
   diff_funnel_counts: Record<string, number>
@@ -377,6 +501,7 @@ export interface TelemetryProductFunnelDiffResponse {
 
 export interface TelemetryProductFunnelHistoryResponse {
   window_days: number
+  all_time?: boolean
   history: Array<{ date: string } & Record<string, number>>
   data_quality?: TelemetryQualityMap
   quality_warnings?: string[]
@@ -384,7 +509,9 @@ export interface TelemetryProductFunnelHistoryResponse {
 
 export interface TelemetryButtonClicksResponse {
   window_days: number
+  all_time?: boolean
   by_button_id: Record<string, number>
+  by_button_id_users?: Record<string, number>
   unknown_by_button_id?: Record<string, number>
   data_quality?: TelemetryQualityMap
   quality_warnings?: string[]
@@ -392,6 +519,7 @@ export interface TelemetryButtonClicksResponse {
 
 export interface TelemetryRevenueResponse {
   window_days: number
+  all_time?: boolean
   total_stars: number
   revenue_rub_approx: number
   by_pack: Record<string, number>
@@ -410,7 +538,7 @@ export interface OverviewV3Kpi {
 }
 
 export interface TelemetryOverviewV3Response {
-  window: '24h' | '7d' | '30d' | '90d'
+  window: '24h' | '7d' | '30d' | '90d' | 'all'
   window_days: number
   source?: string | null
   campaign?: string | null
@@ -496,49 +624,92 @@ export const telemetryService = {
     api
       .get('/admin/telemetry/errors', { params: { window_days: windowDays } })
       .then((r) => r.data as TelemetryErrorsResponse),
-  getHealth: (windowDays?: number) =>
-    api.get<TelemetryHealthResponse>('/admin/telemetry/health', { params: { window_days: windowDays } }).then((r) => r.data),
-  getProductFunnel: (windowDays?: number) =>
-    api.get<TelemetryProductFunnelResponse>('/admin/telemetry/product-funnel', { params: { window_days: windowDays } }).then((r) => r.data),
-  getProductFunnelDiff: (windowDays?: number) =>
+  getHealth: (windowDays?: number, allTime = false) =>
+    api.get<TelemetryHealthResponse>('/admin/telemetry/health', {
+      params: {
+        ...(windowDays != null && { window_days: windowDays }),
+        ...(allTime ? { all_time: true } : {}),
+      },
+    }).then((r) => r.data),
+  getProductFunnel: (windowDays?: number, allTime = false) =>
+    api.get<TelemetryProductFunnelResponse>('/admin/telemetry/product-funnel', {
+      params: {
+        ...(windowDays != null && { window_days: windowDays }),
+        ...(allTime ? { all_time: true } : {}),
+      },
+    }).then((r) => r.data),
+  getProductFunnelDiff: (windowDays?: number, allTime = false) =>
     api
       .get<TelemetryProductFunnelDiffResponse>('/admin/telemetry/product-funnel-diff', {
-        params: { window_days: windowDays },
+        params: {
+          ...(windowDays != null && { window_days: windowDays }),
+          ...(allTime ? { all_time: true } : {}),
+        },
       })
       .then((r) => r.data),
-  getProductFunnelHistory: (windowDays?: number) =>
+  getProductFunnelHistory: (windowDays?: number, allTime = false) =>
     api
       .get<TelemetryProductFunnelHistoryResponse>(
         '/admin/telemetry/product-funnel-history',
-        { params: { window_days: windowDays } }
+        {
+          params: {
+            ...(windowDays != null && { window_days: windowDays }),
+            ...(allTime ? { all_time: true } : {}),
+          },
+        }
       )
       .then((r) => r.data),
-  getButtonClicks: (windowDays?: number) =>
-    api.get<TelemetryButtonClicksResponse>('/admin/telemetry/button-clicks', { params: { window_days: windowDays } }).then((r) => r.data),
-  getProductMetricsV2: (windowDays?: number) =>
-    api.get<ProductMetricsV2>('/admin/telemetry/product-metrics-v2', { params: { window_days: windowDays } }).then((r) => r.data),
-  getRevenue: (windowDays?: number) =>
-    api.get<TelemetryRevenueResponse>('/admin/telemetry/revenue', { params: { window_days: windowDays } }).then((r) => r.data),
-  getPathTransitions: (windowDays?: number) =>
+  getButtonClicks: (windowDays?: number, allTime = false) =>
+    api.get<TelemetryButtonClicksResponse>('/admin/telemetry/button-clicks', {
+      params: {
+        ...(windowDays != null && { window_days: windowDays }),
+        ...(allTime ? { all_time: true } : {}),
+      },
+    }).then((r) => r.data),
+  getProductMetricsV2: (windowDays?: number, allTime = false) =>
+    api.get<ProductMetricsV2>('/admin/telemetry/product-metrics-v2', {
+      params: {
+        ...(windowDays != null && { window_days: windowDays }),
+        ...(allTime ? { all_time: true } : {}),
+      },
+    }).then((r) => r.data),
+  getRevenue: (windowDays?: number, allTime = false) =>
+    api.get<TelemetryRevenueResponse>('/admin/telemetry/revenue', {
+      params: {
+        ...(windowDays != null && { window_days: windowDays }),
+        ...(allTime ? { all_time: true } : {}),
+      },
+    }).then((r) => r.data),
+  getPathTransitions: (windowDays?: number, allTime = false) =>
     api
-      .get<PathTransitionsResponse>('/admin/telemetry/path-transitions', { params: { window_days: windowDays } })
+      .get<PathTransitionsResponse>('/admin/telemetry/path-transitions', {
+        params: {
+          ...(windowDays != null && { window_days: windowDays }),
+          ...(allTime ? { all_time: true } : {}),
+        },
+      })
       .then((r) => r.data),
-  getPathSequences: (windowDays?: number, limit?: number) =>
+  getPathSequences: (windowDays?: number, limit?: number, allTime = false) =>
     api
       .get<PathSequencesResponse>('/admin/telemetry/path-sequences', {
-        params: { window_days: windowDays, limit },
+        params: {
+          ...(windowDays != null && { window_days: windowDays }),
+          ...(limit != null && { limit }),
+          ...(allTime ? { all_time: true } : {}),
+        },
       })
       .then((r) => r.data),
   /** Single call for Path tab: transitions + drop_off + paths (avoids double heavy aggregation). */
-  getPath: (windowDays?: number, limit?: number) =>
+  getPath: (windowDays?: number, limit?: number, allTime = false) =>
     api.get<PathTransitionsResponse & { paths: PathSequenceItem[] }>('/admin/telemetry/path', {
       params: {
         ...(windowDays != null && { window_days: windowDays }),
         ...(limit != null && { limit }),
+        ...(allTime ? { all_time: true } : {}),
       },
     }).then((r) => r.data),
   getOverviewV3: (params?: {
-    window?: '24h' | '7d' | '30d' | '90d'
+    window?: '24h' | '7d' | '30d' | '90d' | 'all'
     source?: string
     campaign?: string
     entry_type?: string
@@ -563,6 +734,7 @@ export interface PathTransitionItem {
 }
 export interface PathTransitionsResponse {
   window_days: number
+  all_time?: boolean
   transitions: PathTransitionItem[]
   drop_off: PathTransitionItem[]
   /** True if audit_logs row limit was hit; data may be partial. */
@@ -585,6 +757,7 @@ export interface PathSequenceItem {
 }
 export interface PathSequencesResponse {
   window_days: number
+  all_time?: boolean
   paths: PathSequenceItem[]
   shadow_paths?: PathSequenceItem[]
   shadow_truncated?: boolean
@@ -746,7 +919,15 @@ export const paymentsService = {
     date_from?: string
     date_to?: string
   }) => api.get('/admin/payments', { params }).then((r) => r.data),
-  getStats: (days: number) => api.get('/admin/payments/stats', { params: { days } }).then((r) => r.data),
+  getStats: (params?: { days?: number; allTime?: boolean }) =>
+    api
+      .get('/admin/payments/stats', {
+        params: {
+          ...(params?.days != null ? { days: params.days } : {}),
+          ...(params?.allTime ? { all_time: true } : {}),
+        },
+      })
+      .then((r) => r.data),
   getHistory: (params: {
     date_from?: string
     date_to?: string
@@ -800,7 +981,18 @@ export type TrendUpdatePayload = Partial<{
   prompt_model: string | null
   prompt_size: string | null
   prompt_format: string | null
+  prompt_aspect_ratio: string | null
   prompt_temperature: number | null
+  prompt_seed: number | null
+  prompt_image_size_tier: string | null
+  prompt_top_p: number | null
+  prompt_candidate_count: number | null
+  prompt_media_resolution: 'LOW' | 'MEDIUM' | 'HIGH' | null
+  prompt_thinking_config: {
+    thinking_level?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH'
+    thinking_budget?: number
+    include_thoughts?: boolean
+  } | null
   target_audiences: string[]
 }>
 
@@ -815,18 +1007,45 @@ export interface TrendAnalyticsItem {
   takes_total: number
   takes_succeeded: number
   takes_failed: number
+  generated_total?: number
+  succeeded_total?: number
+  failed_total?: number
+  success_rate_pct?: number
+  users_total?: number
   chosen_total?: number
+  chosen_users?: number
+  chosen_rate_pct?: number
 }
 
 export interface TrendAnalyticsResponse {
   window_days: number | null
+  all_time?: boolean
+  generated_at?: string
+  summary?: {
+    trends_total: number
+    trends_with_activity: number
+    generated_total: number
+    succeeded_total: number
+    failed_total: number
+    success_rate_pct: number
+    users_total: number
+    chosen_total: number
+    chosen_users: number
+  }
   items: TrendAnalyticsItem[]
 }
 
 export const trendsService = {
   list: () => api.get<Trend[]>('/admin/trends').then((r) => r.data),
-  getAnalytics: (windowDays: number = 30) =>
-    api.get<TrendAnalyticsResponse>('/admin/trends/analytics', { params: { window_days: windowDays } }).then((r) => r.data),
+  getAnalytics: (windowDays?: number, allTime = false) =>
+    api
+      .get<TrendAnalyticsResponse>('/admin/trends/analytics', {
+        params: {
+          ...(windowDays != null && { window_days: windowDays }),
+          ...(allTime ? { all_time: true } : {}),
+        },
+      })
+      .then((r) => r.data),
   get: (id: string) => api.get<Trend>(`/admin/trends/${id}`).then((r) => r.data),
   update: (id: string, data: TrendUpdatePayload) =>
     api.put<Trend>(`/admin/trends/${id}`, data).then((r) => r.data),
@@ -981,6 +1200,35 @@ export interface JobsListParams {
   hours?: number
 }
 
+export interface JobsListItem {
+  job_id: string
+  task_type?: 'job' | 'take'
+  telegram_id?: string
+  user_display_name?: string
+  trend_id?: string | null
+  trend_name?: string
+  trend_emoji?: string
+  status: string
+  is_preview?: boolean
+  reserved_tokens: number
+  error_code?: string
+  input_photo_url?: string | null
+  has_three_variants?: boolean | null
+  variants_ready_count?: number | null
+  variant_photo_urls?: Array<string | null> | null
+  started_at?: string | null
+  received_at?: string | null
+  time_to_receive_sec?: number | null
+  created_at: string
+}
+
+export interface JobsListResponse {
+  items: JobsListItem[]
+  total: number
+  page: number
+  pages: number
+}
+
 export interface JobsStats {
   total: number
   succeeded: number
@@ -998,7 +1246,7 @@ export interface JobsAnalytics {
 
 export const jobsService = {
   list: (params: JobsListParams) =>
-    api.get('/admin/jobs', { params }).then((r) => r.data),
+    api.get<JobsListResponse>('/admin/jobs', { params }).then((r) => r.data),
   stats: (hours: number) =>
     api.get<JobsStats>('/admin/jobs/stats', { params: { hours } }).then((r) => r.data),
   getAnalytics: (params: { hours?: number; date_from?: string; date_to?: string; trend_id?: string; status?: string }) =>

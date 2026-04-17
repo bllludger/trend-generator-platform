@@ -290,19 +290,32 @@ export function TrendsPage() {
   })
 
   const groupedByTheme = useMemo(() => {
+    const sortedThemes = [...themes].sort((a, b) => {
+      if (a.order_index !== b.order_index) return a.order_index - b.order_index
+      return a.name.localeCompare(b.name, 'ru')
+    })
+    const sortedTrends = [...trends].sort((a, b) => {
+      if (a.order_index !== b.order_index) return a.order_index - b.order_index
+      return a.name.localeCompare(b.name, 'ru')
+    })
     const groups: Array<{ theme: Theme | null; trends: Trend[] }> = []
-    for (const theme of themes) {
+    for (const theme of sortedThemes) {
       groups.push({
         theme,
-        trends: trends.filter((t) => t.theme_id === theme.id),
+        trends: sortedTrends.filter((t) => t.theme_id === theme.id),
       })
     }
     groups.push({
       theme: null,
-      trends: trends.filter((t) => t.theme_id == null || t.theme_id === ''),
+      trends: sortedTrends.filter((t) => t.theme_id == null || t.theme_id === ''),
     })
     return groups
   }, [themes, trends])
+
+  const orderedThemeIds = useMemo(
+    () => groupedByTheme.map((g) => g.theme?.id).filter((id): id is string => Boolean(id)),
+    [groupedByTheme]
+  )
 
   const isLoading = themesLoading || trendsLoading
 
@@ -351,6 +364,30 @@ export function TrendsPage() {
     },
     onError: () => {
       toast.error('Ошибка при изменении порядка')
+    },
+  })
+
+  const themeSetOrderMutation = useMutation({
+    mutationFn: ({ id, order_index }: { id: string; order_index: number }) =>
+      themesService.update(id, { order_index }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['themes'] })
+      toast.success('Приоритет тематики обновлён')
+    },
+    onError: () => {
+      toast.error('Ошибка при обновлении приоритета тематики')
+    },
+  })
+
+  const trendSetOrderMutation = useMutation({
+    mutationFn: ({ id, order_index }: { id: string; order_index: number }) =>
+      trendsService.update(id, { order_index }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['trends'] })
+      toast.success('Приоритет тренда обновлён')
+    },
+    onError: () => {
+      toast.error('Ошибка при обновлении приоритета тренда')
     },
   })
 
@@ -557,6 +594,26 @@ export function TrendsPage() {
 
   const handleToggle = (id: string, currentEnabled: boolean) => {
     toggleMutation.mutate({ id, enabled: !currentEnabled })
+  }
+
+  const handleThemeOrderCommit = (themeId: string, currentOrder: number, rawValue: string) => {
+    const nextOrder = Number.parseInt(rawValue, 10)
+    if (Number.isNaN(nextOrder)) {
+      toast.error('Введите числовой приоритет тематики')
+      return
+    }
+    if (nextOrder === currentOrder) return
+    themeSetOrderMutation.mutate({ id: themeId, order_index: nextOrder })
+  }
+
+  const handleTrendOrderCommit = (trendId: string, currentOrder: number, rawValue: string) => {
+    const nextOrder = Number.parseInt(rawValue, 10)
+    if (Number.isNaN(nextOrder)) {
+      toast.error('Введите числовой приоритет тренда')
+      return
+    }
+    if (nextOrder === currentOrder) return
+    trendSetOrderMutation.mutate({ id: trendId, order_index: nextOrder })
   }
 
   const handleEdit = (trend: Trend, buttonRef?: HTMLButtonElement | null) => {
@@ -844,9 +901,9 @@ export function TrendsPage() {
             {groupedByTheme.map(({ theme, trends: groupTrends }) => {
               const themeLabel = theme ? `${theme.emoji || ''} ${theme.name}`.trim() || theme.name : 'Без тематики'
               const themeAudienceLabel = theme ? formatAudienceLabel(theme.target_audiences) : null
-              const themeIndex = theme ? themes.findIndex((t) => t.id === theme.id) : -1
+              const themeIndex = theme ? orderedThemeIds.findIndex((id) => id === theme.id) : -1
               const canThemeMoveUp = theme != null && themeIndex > 0
-              const canThemeMoveDown = theme != null && themeIndex >= 0 && themeIndex < themes.length - 1
+              const canThemeMoveDown = theme != null && themeIndex >= 0 && themeIndex < orderedThemeIds.length - 1
               const droppableId = theme?.id ?? DROPPABLE_ID_NONE
               return (
                 <DroppableSection key={droppableId} id={droppableId} className="space-y-3">
@@ -882,6 +939,27 @@ export function TrendsPage() {
                           >
                             <ChevronDown className="h-4 w-4" />
                           </Button>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Label htmlFor={`theme-order-${theme.id}`} className="text-xs text-muted-foreground whitespace-nowrap">
+                            Приоритет
+                          </Label>
+                          <Input
+                            id={`theme-order-${theme.id}`}
+                            type="number"
+                            defaultValue={theme.order_index}
+                            className="h-8 w-24"
+                            disabled={themeSetOrderMutation.isPending}
+                            onBlur={(e) => handleThemeOrderCommit(theme.id, theme.order_index, e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault()
+                                handleThemeOrderCommit(theme.id, theme.order_index, (e.target as HTMLInputElement).value)
+                                ;(e.target as HTMLInputElement).blur()
+                              }
+                            }}
+                            aria-label="Числовой приоритет тематики"
+                          />
                         </div>
                         <Badge variant={theme.enabled ? 'default' : 'secondary'}>
                           {theme.enabled ? 'Вкл.' : 'Выкл.'}
@@ -1009,6 +1087,27 @@ export function TrendsPage() {
                                   >
                                     <ChevronDown className="h-4 w-4" />
                                   </Button>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <Label htmlFor={`trend-order-${trend.id}`} className="text-xs text-muted-foreground whitespace-nowrap">
+                                    Приоритет
+                                  </Label>
+                                  <Input
+                                    id={`trend-order-${trend.id}`}
+                                    type="number"
+                                    defaultValue={trend.order_index}
+                                    className="h-8 w-24"
+                                    disabled={trendSetOrderMutation.isPending}
+                                    onBlur={(e) => handleTrendOrderCommit(trend.id, trend.order_index, e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault()
+                                        handleTrendOrderCommit(trend.id, trend.order_index, (e.target as HTMLInputElement).value)
+                                        ;(e.target as HTMLInputElement).blur()
+                                      }
+                                    }}
+                                    aria-label="Числовой приоритет тренда"
+                                  />
                                 </div>
                                 <Button
                                   variant="outline"

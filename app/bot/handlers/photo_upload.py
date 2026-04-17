@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+from uuid import uuid4
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
@@ -31,7 +32,10 @@ from app.services.sessions.service import SessionService
 from app.services.audit.service import AuditService
 from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.input_photo_analyzer import analyze_input_photo
-from app.utils.metrics import photo_uploaded_total
+from app.services.face_id.asset_service import FaceAssetService
+from app.services.face_id.client import enqueue_face_id_processing
+from app.services.face_id.settings_service import FaceIdSettingsService
+from app.utils.metrics import photo_uploaded_total, face_id_fallback_total, face_id_requests_total
 from app.utils.telegram_photo import path_for_telegram_photo
 from app.bot.handlers.generation import _create_job_and_start_generation
 
@@ -48,6 +52,88 @@ def _is_new_user_for_limited_menu(user) -> bool:
         and (getattr(user, "token_balance", 0) or 0) == 0
         and (getattr(user, "copy_generations_used", 0) or 0) == 0
     )
+
+
+async def _prepare_face_asset_for_trend_flow(
+    *,
+    user_id: str,
+    session_id: str | None,
+    chat_id: int,
+    source_path: str,
+) -> str | None:
+    """
+    Создать face_asset и отправить задачу в face-id сервис.
+    При недоступности face-id сразу переводим в ready_fallback (оригинал).
+    """
+    request_id = str(uuid4())
+    with get_db_session() as db:
+        settings_svc = FaceIdSettingsService(db)
+        asset_svc = FaceAssetService(db)
+        face_cfg = settings_svc.as_dict()
+        asset = asset_svc.create_pending(
+            user_id=user_id,
+            session_id=session_id,
+            chat_id=str(chat_id),
+            flow="trend",
+            source_path=source_path,
+            request_id=request_id,
+        )
+        if not bool(face_cfg.get("enabled", True)):
+            asset_svc.apply_callback(
+                asset=asset,
+                event_id=f"local-disabled-{uuid4()}",
+                status="ready_fallback",
+                faces_detected=0,
+                selected_path=source_path,
+                source_path=source_path,
+                detector_meta={"reason": "face_id_disabled"},
+            )
+            face_id_requests_total.labels(status="fallback").inc()
+            face_id_fallback_total.labels(reason="disabled").inc()
+            db.commit()
+            return asset.id
+
+        detector_config = {
+            "min_detection_confidence": face_cfg.get("min_detection_confidence", 0.6),
+            "model_selection": face_cfg.get("model_selection", 1),
+            "crop_pad_left": face_cfg.get("crop_pad_left", 0.55),
+            "crop_pad_right": face_cfg.get("crop_pad_right", 0.55),
+            "crop_pad_top": face_cfg.get("crop_pad_top", 0.7),
+            "crop_pad_bottom": face_cfg.get("crop_pad_bottom", 0.35),
+            "max_faces_allowed": face_cfg.get("max_faces_allowed", 1),
+            "no_face_policy": face_cfg.get("no_face_policy", "fallback_original"),
+            "multi_face_policy": face_cfg.get("multi_face_policy", "fail_generation"),
+            "callback_timeout_seconds": face_cfg.get("callback_timeout_seconds", 2.0),
+            "callback_max_retries": face_cfg.get("callback_max_retries", 3),
+            "callback_backoff_seconds": face_cfg.get("callback_backoff_seconds", 1.0),
+        }
+        enqueued = await enqueue_face_id_processing(
+            asset_id=asset.id,
+            source_path=source_path,
+            flow="trend",
+            user_id=user_id,
+            chat_id=str(chat_id),
+            request_id=request_id,
+            detector_config=detector_config,
+        )
+        if enqueued:
+            face_id_requests_total.labels(status="queued").inc()
+            db.commit()
+            return asset.id
+
+        asset_svc.apply_callback(
+            asset=asset,
+            event_id=f"local-fallback-{uuid4()}",
+            status="ready_fallback",
+            faces_detected=0,
+            selected_path=source_path,
+            source_path=source_path,
+            detector_meta={"reason": "enqueue_unavailable"},
+        )
+        face_id_requests_total.labels(status="fallback").inc()
+        face_id_fallback_total.labels(reason="enqueue_unavailable").inc()
+        db.commit()
+        return asset.id
 
 
 @photo_upload_router.message(lambda m: (m.text or "").strip() == t("menu.btn.create_photo", "🔥 Создать фото"))
@@ -284,17 +370,22 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
             await message.answer(t("flow.only_jpg_png_webp", "Поддерживаются только JPG, PNG, WEBP."))
             return
 
+        face_user_id: str | None = None
+        face_session_id: str | None = None
         with get_db_session() as db:
             user_service = UserService(db)
             theme_service = ThemeService(db)
             trend_service = TrendService(db)
             u = message.from_user
-            user_service.get_or_create_user(
+            user = user_service.get_or_create_user(
                 telegram_id,
                 telegram_username=u.username,
                 telegram_first_name=u.first_name,
                 telegram_last_name=u.last_name,
             )
+            face_user_id = user.id
+            active_session = SessionService(db).get_active_session(user.id)
+            face_session_id = active_session.id if active_session else None
             theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends(audience)
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
@@ -316,10 +407,18 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                     tr("errors.file_too_large_max", "Файл слишком большой ({size_mb:.1f} МБ). Максимум {max_mb} МБ.", size_mb=size_mb, max_mb=settings.max_file_size_mb)
                 )
                 return
-        
+        face_asset_id = None
+        if face_user_id:
+            face_asset_id = await _prepare_face_asset_for_trend_flow(
+                user_id=face_user_id,
+                session_id=face_session_id,
+                chat_id=message.chat.id,
+                source_path=local_path,
+            )
         await state.update_data(
             photo_file_id=photo.file_id,
             photo_local_path=local_path,
+            face_asset_id=face_asset_id,
         )
         data = await state.get_data()
 
@@ -328,6 +427,7 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
             user_svc = UserService(db)
             session_svc = SessionService(db)
             analytics = ProductAnalyticsService(db)
+            face_asset_svc = FaceAssetService(db)
             u = user_svc.get_or_create_user(
                 telegram_id,
                 telegram_username=message.from_user.username,
@@ -335,6 +435,8 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                 telegram_last_name=message.from_user.last_name,
             )
             session = session_svc.get_active_session(u.id)
+            face_asset_id = data.get("face_asset_id")
+            face_asset = face_asset_svc.get(face_asset_id) if isinstance(face_asset_id, str) and face_asset_id else None
             if session and session_svc.is_collection(session) and not session.input_photo_path:
                 session_svc.set_input_photo(session, local_path, photo.file_id)
                 trend_id = session_svc.get_next_trend_id(session)
@@ -343,15 +445,22 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                     take_svc = TakeService(db)
                     trend = trend_svc.get(trend_id)
                     trend_name = trend.name if trend else trend_id
+                    if face_asset and face_asset.status == "failed_multi_face":
+                        await message.answer("❌ На фото несколько лиц. Загрузите селфи с одним человеком.")
+                        await state.clear()
+                        return
                     take = take_svc.create_take(
                         user_id=u.id,
                         trend_id=trend_id,
                         input_file_ids=[photo.file_id],
                         input_local_paths=[local_path],
                         image_size="1024x1024",
+                        face_asset_id=face_asset.id if face_asset else None,
                     )
                     take.step_index = 0
                     take.is_reroll = False
+                    if face_asset and face_asset.status == "pending":
+                        take.status = "awaiting_face_id"
                     db.add(take)
                     session_svc.attach_take_to_session(take, session)
                     session_svc.advance_step(session)
@@ -371,16 +480,20 @@ async def handle_photo_step1(message: Message, state: FSMContext, bot: Bot):
                     except Exception as e:
                         logger.warning("input_photo_analyzed failed: %s", e)
 
-                    from app.core.celery_app import celery_app as _celery
-                    status_msg = await message.answer(f"⏳ Образ 1 из {len(session.playlist)} — {trend_name}...")
-                    _celery.send_task(
-                        "app.workers.tasks.generate_take.generate_take",
-                        args=[take_id],
-                        kwargs={
-                            "status_chat_id": str(message.chat.id),
-                            "status_message_id": status_msg.message_id,
-                        },
-                    )
+                    if face_asset and face_asset.status == "pending":
+                        await message.answer("⏳ Подготавливаем фото, стартуем автоматически…")
+                    else:
+                        from app.core.celery_app import celery_app as _celery
+
+                        status_msg = await message.answer(f"⏳ Образ 1 из {len(session.playlist)} — {trend_name}...")
+                        _celery.send_task(
+                            "app.workers.tasks.generate_take.generate_take",
+                            args=[take_id],
+                            kwargs={
+                                "status_chat_id": str(message.chat.id),
+                                "status_message_id": status_msg.message_id,
+                            },
+                        )
                     await state.set_state(BotStates.viewing_take_result)
                     return
 
@@ -520,17 +633,22 @@ async def handle_photo_as_document_step1(message: Message, state: FSMContext, bo
             )
             await state.clear()
             return
+        face_user_id: str | None = None
+        face_session_id: str | None = None
         with get_db_session() as db:
             user_service = UserService(db)
             theme_service = ThemeService(db)
             trend_service = TrendService(db)
             u = message.from_user
-            user_service.get_or_create_user(
+            user = user_service.get_or_create_user(
                 telegram_id,
                 telegram_username=u.username,
                 telegram_first_name=u.first_name,
                 telegram_last_name=u.last_name,
             )
+            face_user_id = user.id
+            active_session = SessionService(db).get_active_session(user.id)
+            face_session_id = active_session.id if active_session else None
             theme_ids_with_trends = trend_service.list_theme_ids_with_active_trends(audience)
             all_themes = theme_service.list_all()
             themes = [t for t in all_themes if t.enabled and t.id in theme_ids_with_trends]
@@ -550,9 +668,18 @@ async def handle_photo_as_document_step1(message: Message, state: FSMContext, bo
                     tr("errors.file_too_large_max", "Файл слишком большой ({size_mb:.1f} МБ). Максимум {max_mb} МБ.", size_mb=size_mb, max_mb=settings.max_file_size_mb)
                 )
                 return
+        face_asset_id = None
+        if face_user_id:
+            face_asset_id = await _prepare_face_asset_for_trend_flow(
+                user_id=face_user_id,
+                session_id=face_session_id,
+                chat_id=message.chat.id,
+                source_path=local_path,
+            )
         await state.update_data(
             photo_file_id=doc.file_id,
             photo_local_path=local_path,
+            face_asset_id=face_asset_id,
         )
         data = await state.get_data()
         pre_selected_id = data.get("selected_trend_id")

@@ -18,7 +18,14 @@ class TrendService:
                 Trend.enabled.is_(True),
                 or_(Trend.theme_id.is_(None), Theme.enabled.is_(True)),
             )
-            .order_by(Theme.order_index.asc().nulls_last(), Trend.order_index.asc())
+            .order_by(
+                Theme.order_index.asc().nulls_last(),
+                Theme.created_at.asc().nulls_last(),
+                Theme.id.asc().nulls_last(),
+                Trend.order_index.asc(),
+                Trend.created_at.asc().nulls_last(),
+                Trend.id.asc(),
+            )
             .all()
         )
 
@@ -26,7 +33,14 @@ class TrendService:
         return (
             self.db.query(Trend)
             .outerjoin(Theme, Trend.theme_id == Theme.id)
-            .order_by(Theme.order_index.asc().nulls_last(), Trend.order_index.asc())
+            .order_by(
+                Theme.order_index.asc().nulls_last(),
+                Theme.created_at.asc().nulls_last(),
+                Theme.id.asc().nulls_last(),
+                Trend.order_index.asc(),
+                Trend.created_at.asc().nulls_last(),
+                Trend.id.asc(),
+            )
             .all()
         )
 

@@ -149,7 +149,8 @@ export const playgroundApi = {
 
   testPrompt: async (
     config: PlaygroundPromptConfig,
-    images?: File[]
+    images?: File[],
+    signal?: AbortSignal
   ): Promise<{
     imageUrls?: string[]
     imageUrl?: string
@@ -164,7 +165,10 @@ export const playgroundApi = {
     }
     const r = await api.post<PlaygroundTestResponse>('/admin/playground/test', form, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 120000,
+      // Image generation + upload can legitimately exceed 2 minutes.
+      // 0 disables axios timeout for this request and prevents client-side 499 aborts.
+      timeout: 0,
+      signal,
       maxContentLength: 120 * 1024 * 1024,
       maxBodyLength: 120 * 1024 * 1024,
     })
@@ -203,6 +207,89 @@ export const playgroundApi = {
       typeof localStorage !== 'undefined' ? localStorage.getItem('access_token') : null
     const base = api.defaults.baseURL || ''
     const url = `${String(base).replace(/\/$/, '')}/admin/playground/batch-test`
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+      signal: params.signal,
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      let detail = `HTTP ${res.status}`
+      if (text) {
+        try {
+          const j = JSON.parse(text) as { detail?: unknown }
+          if (j?.detail != null) {
+            detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
+          } else {
+            detail = text.slice(0, 500)
+          }
+        } catch {
+          detail = text.slice(0, 500)
+        }
+      }
+      throw new Error(detail)
+    }
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('No response body')
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (value) {
+        buffer += decoder.decode(value, { stream: true })
+      }
+      let nl: number
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl).trimEnd()
+        buffer = buffer.slice(nl + 1)
+        if (line.startsWith('data: ')) {
+          const raw = line.slice(6)
+          try {
+            onEvent(JSON.parse(raw) as Record<string, unknown>)
+          } catch {
+            /* ignore malformed chunk */
+          }
+        }
+      }
+      if (done) {
+        const tail = buffer.trim()
+        if (tail.startsWith('data: ')) {
+          try {
+            onEvent(JSON.parse(tail.slice(6)) as Record<string, unknown>)
+          } catch {
+            /* ignore */
+          }
+        }
+        break
+      }
+    }
+  },
+
+  /**
+   * POST /admin/playground/multi-test — SSE stream for prompt variants (same photos/settings).
+   */
+  streamMultiTest: async (
+    params: {
+      prompts: string[]
+      configBase: PlaygroundPromptConfig
+      images: File[]
+      concurrency: number
+      signal?: AbortSignal
+    },
+    onEvent: (data: Record<string, unknown>) => void
+  ): Promise<void> => {
+    const form = new FormData()
+    form.append('prompts', JSON.stringify(params.prompts))
+    form.append('config_base', JSON.stringify(params.configBase))
+    form.append('concurrency', String(params.concurrency))
+    for (const img of params.images) {
+      form.append('images', img)
+    }
+    const token =
+      typeof localStorage !== 'undefined' ? localStorage.getItem('access_token') : null
+    const base = api.defaults.baseURL || ''
+    const url = `${String(base).replace(/\/$/, '')}/admin/playground/multi-test`
     const res = await fetch(url, {
       method: 'POST',
       headers: token ? { Authorization: `Bearer ${token}` } : {},

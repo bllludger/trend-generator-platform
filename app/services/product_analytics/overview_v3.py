@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
@@ -17,12 +17,12 @@ from app.models.payment import Payment
 from app.models.user import User
 from app.services.product_analytics.service import PRODUCT_ANALYTICS_SCHEMA_VERSION
 
-WindowValue = Literal["24h", "7d", "30d", "90d"]
+WindowValue = Literal["24h", "7d", "30d", "90d", "all"]
 FlowMode = Literal["canonical_only", "all_flows"]
 TrustMode = Literal["trusted_only", "all_data"]
 logger = logging.getLogger(__name__)
 
-WINDOW_TO_DAYS: dict[WindowValue, int] = {
+WINDOW_TO_DAYS: dict[Literal["24h", "7d", "30d", "90d"], int] = {
     "24h": 1,
     "7d": 7,
     "30d": 30,
@@ -344,6 +344,8 @@ def _trend_row(date_key: str) -> dict[str, Any]:
 
 
 def _window_days(window: WindowValue) -> int:
+    if window == "all":
+        raise ValueError("Window 'all' uses dynamic calculation.")
     if window not in WINDOW_TO_DAYS:
         raise ValueError(f"Unsupported window: {window}")
     return WINDOW_TO_DAYS[window]
@@ -1038,11 +1040,29 @@ def build_overview_v3(
     trust_mode: TrustMode,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
-    window_days = _window_days(window)
-    since = now - timedelta(days=window_days)
-    prev_since = since - timedelta(days=window_days)
     step_map = CANONICAL_STEP_MAP if flow_mode == "canonical_only" else ALL_FLOWS_STEP_MAP
     tracked_actions = set(step_map.keys()) | PREVIEW_STARTED_ACTIONS | PREVIEW_FAILED_ACTIONS
+
+    if window == "all":
+        min_created_at = (
+            db.query(func.min(AuditLog.created_at))
+            .filter(
+                AuditLog.actor_type == "user",
+                AuditLog.action.in_(tracked_actions),
+            )
+            .scalar()
+        )
+        if min_created_at is not None:
+            since = _to_utc(min_created_at)
+            window_days = max(1, (now.date() - since.date()).days + 1)
+        else:
+            window_days = 1
+            since = now - timedelta(days=1)
+    else:
+        window_days = _window_days(window)
+        since = now - timedelta(days=window_days)
+
+    prev_since = since - timedelta(days=window_days)
 
     query_rows = (
         db.query(

@@ -4,6 +4,7 @@ payments, packs, trends, audit, broadcast, jobs, copy style, cleanup.
 Paths match admin-frontend/src/services/api.ts. Order: /users/analytics and /users before /users/{id}.
 """
 import logging
+import mimetypes
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import and_, case, distinct, func, literal_column, or_, select
+from sqlalchemy import and_, case, distinct, func, literal_column, or_, select, union_all
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.session import get_db
@@ -34,6 +35,7 @@ FREE_PREVIEW_PACK_NAME = "Бесплатный (без 4К)"
 
 from app.models.audit_log import AuditLog
 from app.models.bank_transfer_receipt_log import BankTransferReceiptLog
+from app.models.face_asset import FaceAsset
 from app.models.job import Job
 from app.models.pack import Pack
 from app.models.take import Take
@@ -49,6 +51,7 @@ from app.services.audit.service import AuditService
 from app.services.bank_transfer.settings_service import BankTransferSettingsService
 from app.services.cleanup.service import CleanupService
 from app.services.copy_style.settings_service import CopyStyleSettingsService
+from app.services.face_id.settings_service import FaceIdSettingsService
 from app.services.jobs.service import JobService
 from app.services.payments.service import PaymentService, PRODUCT_LADDER_IDS
 from app.services.security.settings_service import SecuritySettingsService
@@ -58,11 +61,19 @@ from app.services.themes.service import ThemeService
 from app.services.trends.service import TrendService
 from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
 from app.core.config import settings as app_settings
-from app.api.routes.playground import trend_to_playground_config
+from app.api.routes.playground import (
+    PlaygroundPromptConfig,
+    _build_sent_request_playground,
+    _effective_playground_thinking_config,
+    _playground_max_candidate_count,
+    _playground_supports_media_resolution,
+    trend_to_playground_config,
+)
 from app.workers.tasks.broadcast import broadcast_message
 from app.workers.tasks.send_user_message import send_telegram_to_user
 from app.services.idempotency import get_admin_grant_response, set_admin_grant_response
-from app.utils.metrics import admin_grant_pack_total, admin_reset_limits_total
+from app.utils.image_formats import aspect_ratio_to_size
+from app.utils.metrics import admin_grant_pack_total, admin_reset_limits_total, face_id_pending_takes
 from app.models.referral_bonus import ReferralBonus
 from app.referral.service import ReferralService
 from app.models.traffic_source import TrafficSource
@@ -104,6 +115,121 @@ def _admin_audit(
         )
     except Exception:
         logger.exception("admin audit log failed")
+
+
+def _master_prompt_preview_text(profile_cfg: dict[str, Any], prompt_override: str | None = None) -> str:
+    blocks: list[str] = []
+    if profile_cfg.get("prompt_input_enabled") and (profile_cfg.get("prompt_input") or "").strip():
+        blocks.append(str(profile_cfg.get("prompt_input") or "").strip())
+
+    if (prompt_override or "").strip():
+        blocks.append(str(prompt_override).strip())
+    return "\n\n".join(blocks)
+
+
+def _master_prompt_preview_input_files(raw_files: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_files, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw_files:
+        if not isinstance(item, dict):
+            continue
+        mime_type = str(item.get("mime_type") or item.get("mimeType") or "image/jpeg")
+        size_raw = item.get("size_bytes")
+        if size_raw is None:
+            size_raw = item.get("sizeBytes")
+        try:
+            size_bytes = max(0, int(size_raw or 0))
+        except (TypeError, ValueError):
+            size_bytes = 0
+        out.append({"mime_type": mime_type, "size_bytes": size_bytes})
+    return out
+
+
+def _master_prompt_preview_diagnostics(
+    *,
+    profile: str,
+    requested_profile: dict[str, Any],
+    sent_request: dict[str, Any],
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    generation_cfg = ((sent_request or {}).get("generationConfig") or {})
+    model = str((sent_request or {}).get("model") or requested_profile.get("default_model") or "")
+
+    requested_candidate = int(requested_profile.get("default_candidate_count") or 1)
+    applied_candidate = int(generation_cfg.get("candidateCount") or 1)
+    if profile == "release":
+        diagnostics.append({
+            "field": "generationConfig.candidateCount",
+            "status": "forced",
+            "requested": requested_candidate,
+            "applied": 1,
+            "reason": "Production flow always forces candidateCount=1.",
+        })
+    elif requested_candidate != applied_candidate:
+        diagnostics.append({
+            "field": "generationConfig.candidateCount",
+            "status": "normalized",
+            "requested": requested_candidate,
+            "applied": applied_candidate,
+            "reason": f"Clamped by model capability (max {_playground_max_candidate_count(model)}).",
+        })
+
+    top_p_req = requested_profile.get("default_top_p")
+    if top_p_req is None:
+        diagnostics.append({
+            "field": "generationConfig.topP",
+            "status": "omitted",
+            "reason": "default_top_p is null.",
+        })
+
+    media_resolution_req = requested_profile.get("default_media_resolution")
+    if media_resolution_req and not _playground_supports_media_resolution(model):
+        diagnostics.append({
+            "field": "generationConfig.mediaResolution",
+            "status": "omitted",
+            "requested": media_resolution_req,
+            "reason": f"Model {model} does not support mediaResolution.",
+        })
+
+    thinking_req = requested_profile.get("default_thinking_config")
+    thinking_eff = _effective_playground_thinking_config(model, thinking_req)
+    if thinking_req and not thinking_eff:
+        diagnostics.append({
+            "field": "generationConfig.thinkingConfig",
+            "status": "omitted",
+            "reason": f"Thinking config is not supported by model {model}.",
+        })
+    elif thinking_req and thinking_eff and thinking_req != thinking_eff:
+        diagnostics.append({
+            "field": "generationConfig.thinkingConfig",
+            "status": "normalized",
+            "requested": thinking_req,
+            "applied": thinking_eff,
+            "reason": "Normalized to model-supported structure.",
+        })
+
+    image_config = generation_cfg.get("imageConfig") if isinstance(generation_cfg, dict) else None
+    image_size_req = requested_profile.get("default_image_size_tier")
+    if image_size_req and isinstance(image_config, dict) and "imageSize" not in image_config:
+        diagnostics.append({
+            "field": "generationConfig.imageConfig.imageSize",
+            "status": "omitted",
+            "requested": image_size_req,
+            "reason": f"Model {model} does not support imageSize.",
+        })
+
+    if requested_profile.get("default_seed") is None:
+        reason = "Seed is null in Master Prompt. Release take flow uses runtime random A/B/C seeds."
+        if profile != "release":
+            reason = "Seed is null in Master Prompt. Preview uses provider default seed unless explicitly set."
+        diagnostics.append({
+            "field": "generationConfig.seed",
+            "status": "info",
+            "reason": reason,
+        })
+
+    return diagnostics
 
 
 # ---------- Security ----------
@@ -473,6 +599,84 @@ def master_prompt_get(db: Session = Depends(get_db)):
     return result
 
 
+@router.post("/settings/master-prompt/payload-preview")
+def master_prompt_payload_preview(
+    payload: dict | None = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    raw = payload or {}
+    profile = str(raw.get("profile") or "release").strip().lower()
+    if profile not in {"preview", "release"}:
+        profile = "release"
+
+    svc = GenerationPromptSettingsService(db)
+    current = svc.as_dict()
+    preview_cfg = {**(current.get("preview") or {})}
+    release_cfg = {**(current.get("release") or {})}
+    if isinstance(raw.get("preview"), dict):
+        preview_cfg.update(raw.get("preview") or {})
+    if isinstance(raw.get("release"), dict):
+        release_cfg.update(raw.get("release") or {})
+
+    normalized_preview = svc.normalize_profile_payload(preview_cfg)
+    normalized_release = svc.normalize_profile_payload(release_cfg)
+    selected = normalized_release if profile == "release" else normalized_preview
+
+    prompt_text = _master_prompt_preview_text(selected, prompt_override=raw.get("prompt_text"))
+    input_files = _master_prompt_preview_input_files(raw.get("input_files"))
+
+    requested_candidate = int(selected.get("default_candidate_count") or 1)
+    candidate_for_payload = 1 if profile == "release" else requested_candidate
+
+    default_temperature = selected.get("default_temperature")
+    if default_temperature is None:
+        temperature_for_preview = 0.7
+    else:
+        try:
+            temperature_for_preview = float(default_temperature)
+        except (TypeError, ValueError):
+            temperature_for_preview = 0.7
+
+    config = PlaygroundPromptConfig(
+        model=str(selected.get("default_model") or "gemini-2.5-flash-image"),
+        temperature=temperature_for_preview,
+        top_p=selected.get("default_top_p"),
+        candidate_count=candidate_for_payload,
+        media_resolution=selected.get("default_media_resolution"),
+        thinking_config=selected.get("default_thinking_config"),
+        format=str(selected.get("default_format") or "png"),
+        size=aspect_ratio_to_size(str(selected.get("default_aspect_ratio") or "3:4")),
+        aspect_ratio=str(selected.get("default_aspect_ratio") or "3:4"),
+        sections=[],
+        variables={},
+        seed=selected.get("default_seed"),
+        image_size_tier=selected.get("default_image_size_tier"),
+    )
+    sent_request = _build_sent_request_playground(config, prompt_text, input_files)
+    if selected.get("default_seed") is None:
+        generation_cfg = sent_request.get("generationConfig")
+        if isinstance(generation_cfg, dict):
+            if profile == "release":
+                generation_cfg["seed"] = "[RUNTIME_RANDOM_A_B_C_IF_TAKE_FLOW]"
+            else:
+                generation_cfg["seed"] = "[PROVIDER_DEFAULT_IF_NOT_OVERRIDDEN]"
+
+    diagnostics = _master_prompt_preview_diagnostics(
+        profile=profile,
+        requested_profile=selected,
+        sent_request=sent_request,
+    )
+    return {
+        "profile": profile,
+        "sent_request": sent_request,
+        "diagnostics": diagnostics,
+        "effective_settings": {
+            "preview": normalized_preview,
+            "release": normalized_release,
+        },
+    }
+
+
 @router.get("/settings/preview-policy")
 def preview_policy_get(db: Session = Depends(get_db)):
     """Единый раздел настроек превью и вотермарка (для страницы «Политика превью»)."""
@@ -639,13 +843,24 @@ def users_analytics(db: Session = Depends(get_db), time_window: str | None = Que
     total_users = db.query(User).count()
     active_subscribers = db.query(User).filter(User.subscription_active.is_(True)).count()
     conversion_rate = round(100.0 * active_subscribers / total_users, 1) if total_users else 0
-    window_days = 30
-    try:
-        if time_window:
-            window_days = int(time_window)
-    except (TypeError, ValueError):
-        pass
-    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    all_time = str(time_window or "").strip().lower() in ("", "all", "all_time", "все", "всё")
+    if all_time:
+        first_user_created_at = db.query(func.min(User.created_at)).scalar()
+        if first_user_created_at is not None:
+            since = first_user_created_at if first_user_created_at.tzinfo else first_user_created_at.replace(tzinfo=timezone.utc)
+        else:
+            since = datetime.now(timezone.utc) - timedelta(days=1)
+        window_days = max(1, (datetime.now(timezone.utc).date() - since.date()).days + 1)
+        time_window_label = "all"
+    else:
+        window_days = 30
+        try:
+            if time_window:
+                window_days = int(time_window)
+        except (TypeError, ValueError):
+            pass
+        since = datetime.now(timezone.utc) - timedelta(days=window_days)
+        time_window_label = str(window_days)
     users_with_jobs, total_jobs, growth_list, top_users = _users_analytics_since(db, since)
     avg_jobs_per_user = round(total_jobs / users_with_jobs, 1) if users_with_jobs else 0
     # Cohorts: new users by month (last 12 months)
@@ -657,30 +872,61 @@ def users_analytics(db: Session = Depends(get_db), time_window: str | None = Que
         .order_by(func.date_trunc("month", User.created_at))
     )
     cohorts = [{"month": (row.month.strftime("%Y-%m") if hasattr(row.month, "strftime") else str(row.month)[:7]), "count": row.count} for row in cohort_rows]
-    # Activity segments: users with 0, 1-5, 6-20, 21+ jobs in window
-    job_counts_subq = (
-        db.query(Job.user_id, func.count(Job.job_id).label("cnt"))
-        .filter(Job.created_at >= since)
-        .group_by(Job.user_id)
-        .subquery()
+    # Event-based user segments for product flow quality.
+    # 1) Got 3 variants (preview ready)
+    # 2) Clicked pay button
+    # 3) Stuck after photo upload (uploaded but no preview ready)
+    user_expr = _audit_user_id_expr()
+    preview_actions = ("take_preview_ready", "take_previews_ready", "trend_preview_ready")
+    upload_actions = ("photo_uploaded", "take_started")
+    pay_button_ids = ("pay_yoomoney", "pay_yoomoney_link", "pay_stars", "pay_other", "bank_transfer")
+    button_id_col = func.coalesce(AuditLog.payload["button_id"].astext, "")
+
+    preview_user_rows = (
+        db.query(func.distinct(user_expr).label("uid"))
+        .filter(
+            AuditLog.created_at >= since,
+            AuditLog.action.in_(preview_actions),
+            user_expr.isnot(None),
+        )
+        .all()
     )
-    bucket_case = case(
-        (func.coalesce(job_counts_subq.c.cnt, 0) == 0, "0"),
-        (func.coalesce(job_counts_subq.c.cnt, 0) <= 5, "1_5"),
-        (func.coalesce(job_counts_subq.c.cnt, 0) <= 20, "6_20"),
-        else_="21",
+    preview_users = {str(r.uid) for r in preview_user_rows if r.uid}
+
+    upload_user_rows = (
+        db.query(func.distinct(user_expr).label("uid"))
+        .filter(
+            AuditLog.created_at >= since,
+            AuditLog.action.in_(upload_actions),
+            user_expr.isnot(None),
+        )
+        .all()
     )
-    seg_q = (
-        db.query(bucket_case.label("bucket"), func.count(User.id).label("users"))
-        .outerjoin(job_counts_subq, User.id == job_counts_subq.c.user_id)
-        .group_by(bucket_case)
+    upload_users = {str(r.uid) for r in upload_user_rows if r.uid}
+
+    pay_click_user_rows = (
+        db.query(func.distinct(user_expr).label("uid"))
+        .filter(
+            AuditLog.created_at >= since,
+            AuditLog.action == "button_click",
+            user_expr.isnot(None),
+            or_(
+                button_id_col.in_(pay_button_ids),
+                button_id_col.like("pack_%"),
+                button_id_col.like("bank_pack_%"),
+            ),
+        )
+        .all()
     )
-    seg_map = {row.bucket: row.users for row in seg_q}
+    pay_click_users = {str(r.uid) for r in pay_click_user_rows if r.uid}
+
+    stuck_after_photo_users = upload_users - preview_users
+    preview_without_pay_users = preview_users - pay_click_users
+
     activity_segments = [
-        {"segment": "Без задач", "users": seg_map.get("0", 0)},
-        {"segment": "1–5 задач", "users": seg_map.get("1_5", 0)},
-        {"segment": "6–20 задач", "users": seg_map.get("6_20", 0)},
-        {"segment": "21+ задач", "users": seg_map.get("21", 0)},
+        {"segment": "Не дошли после фото", "users": len(stuck_after_photo_users)},
+        {"segment": "Получили 3 варианта", "users": len(preview_without_pay_users)},
+        {"segment": "Нажали оплату", "users": len(pay_click_users)},
     ]
     # Token distribution: 0, 1-100, 101-500, 501-1000, 1001+
     tok_0 = db.query(User).filter(User.token_balance == 0).count()
@@ -696,19 +942,122 @@ def users_analytics(db: Session = Depends(get_db), time_window: str | None = Que
         {"range": "1001+", "count": tok_1001},
     ]
     return {
-        "time_window": str(window_days),
+        "time_window": time_window_label,
         "overview": {
             "total_users": total_users,
             "active_subscribers": active_subscribers,
             "conversion_rate": conversion_rate,
             "users_with_jobs": users_with_jobs,
             "avg_jobs_per_user": avg_jobs_per_user,
+            "users_with_three_variants": len(preview_users),
+            "users_clicked_pay_button": len(pay_click_users),
+            "users_stuck_after_photo": len(stuck_after_photo_users),
         },
         "growth": growth_list,
         "top_users": top_users,
         "cohorts": cohorts,
         "activity_segments": activity_segments,
         "token_distribution": token_distribution,
+    }
+
+
+@router.get("/users/growth-all-time")
+def users_growth_all_time(db: Session = Depends(get_db)):
+    now = datetime.now(timezone.utc)
+    total_users = db.query(User).count()
+    first_created_at = db.query(func.min(User.created_at)).scalar()
+
+    if first_created_at is None:
+        return {
+            "total_users": 0,
+            "start_date": None,
+            "end_date": str(now.date()),
+            "series": [],
+            "generated_at": now.isoformat(),
+        }
+
+    first_day = first_created_at.date() if hasattr(first_created_at, "date") else first_created_at
+    rows = (
+        db.query(func.date(User.created_at).label("day"), func.count(User.id).label("cnt"))
+        .group_by(func.date(User.created_at))
+        .order_by(func.date(User.created_at))
+        .all()
+    )
+    by_day = {str(row.day): int(row.cnt or 0) for row in rows}
+
+    series = []
+    cumulative = 0
+
+    zero_day = first_day - timedelta(days=1)
+    series.append({"date": str(zero_day), "new_users": 0, "total_users": 0})
+
+    day = first_day
+    end_day = now.date()
+    while day <= end_day:
+        new_users = by_day.get(str(day), 0)
+        cumulative += new_users
+        series.append({"date": str(day), "new_users": new_users, "total_users": cumulative})
+        day += timedelta(days=1)
+
+    return {
+        "total_users": total_users,
+        "start_date": str(first_day),
+        "end_date": str(end_day),
+        "series": series,
+        "generated_at": now.isoformat(),
+    }
+
+
+@router.get("/users/audience-selection-stats")
+def users_audience_selection_stats(
+    db: Session = Depends(get_db),
+    window_days: int | None = Query(None, ge=1, le=3650),
+):
+    now = datetime.now(timezone.utc)
+    q = db.query(
+        func.coalesce(AuditLog.payload["audience"].astext, "").label("audience"),
+        func.count(AuditLog.id).label("clicks"),
+        func.count(distinct(AuditLog.actor_id)).label("unique_users"),
+    ).filter(AuditLog.action == "audience_selected")
+    if window_days is not None:
+        q = q.filter(AuditLog.created_at >= now - timedelta(days=window_days))
+    rows = q.group_by(func.coalesce(AuditLog.payload["audience"].astext, "")).all()
+
+    labels = {
+        "women": "Женщины",
+        "men": "Мужчины",
+        "couples": "Пары",
+    }
+    normalized = {"women": 0, "men": 0, "couples": 0, "unknown": 0}
+    unique_normalized = {"women": 0, "men": 0, "couples": 0, "unknown": 0}
+
+    for row in rows:
+        key_raw = str(row.audience or "").strip().lower()
+        key = key_raw if key_raw in ("women", "men", "couples") else "unknown"
+        normalized[key] += int(row.clicks or 0)
+        unique_normalized[key] += int(row.unique_users or 0)
+
+    total_clicks = int(sum(normalized.values()))
+    items = []
+    for key in ("women", "men", "couples", "unknown"):
+        clicks = int(normalized[key])
+        unique_users = int(unique_normalized[key])
+        pct = round((clicks / total_clicks * 100), 1) if total_clicks else 0.0
+        items.append(
+            {
+                "key": key,
+                "label": labels.get(key, "Другое"),
+                "clicks": clicks,
+                "unique_users": unique_users,
+                "pct": pct,
+            }
+        )
+
+    return {
+        "window_days": window_days,
+        "total_clicks": total_clicks,
+        "items": items,
+        "generated_at": now.isoformat(),
     }
 
 
@@ -1780,13 +2129,34 @@ def _utc_date_audit_log():
     return literal_column("(audit_logs.created_at AT TIME ZONE 'UTC')::date")
 
 
+def _resolve_audit_window(
+    db: Session,
+    *,
+    window_days: int | None,
+    all_time: bool,
+    default_days: int,
+) -> tuple[datetime, int]:
+    now = datetime.now(timezone.utc)
+    if all_time:
+        first_event_at = db.query(func.min(AuditLog.created_at)).scalar()
+        since = _as_utc(first_event_at) if first_event_at else (now - timedelta(days=default_days))
+    else:
+        effective_days = int(window_days or default_days)
+        since = now - timedelta(days=effective_days)
+    effective_window_days = max(1, (now.date() - since.date()).days + 1)
+    return since, effective_window_days
+
+
 @router.get("/telemetry/product-funnel")
 def telemetry_product_funnel(
     db: Session = Depends(get_db),
-    window_days: int = Query(7, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
 ):
     """Funnel from audit_logs. Keeps legacy counts and adds session-only shadow + quality block."""
-    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    since, effective_window_days = _resolve_audit_window(
+        db, window_days=window_days, all_time=all_time, default_days=7
+    )
     user_expr = _audit_user_id_expr()
     legacy_rows = (
         db.query(AuditLog.action, func.count(func.distinct(user_expr)).label("users"))
@@ -1837,7 +2207,8 @@ def telemetry_product_funnel(
             "Часть funnel-событий без session_id. Path/shadow-метрики могут быть ниже legacy."
         )
     return {
-        "window_days": window_days,
+        "window_days": effective_window_days if all_time else int(window_days or 7),
+        "all_time": all_time,
         "funnel_counts": funnel_counts,
         "shadow_funnel_counts": shadow_funnel_counts,
         "diff_funnel_counts": diff_funnel_counts,
@@ -1855,12 +2226,14 @@ def telemetry_product_funnel(
 @router.get("/telemetry/product-funnel-diff")
 def telemetry_product_funnel_diff(
     db: Session = Depends(get_db),
-    window_days: int = Query(7, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
 ):
     """Compatibility endpoint for explicit legacy-vs-shadow funnel comparison."""
-    result = telemetry_product_funnel(db=db, window_days=window_days)
+    result = telemetry_product_funnel(db=db, window_days=window_days, all_time=all_time)
     return {
         "window_days": result["window_days"],
+        "all_time": all_time,
         "legacy_funnel_counts": result["funnel_counts"],
         "shadow_funnel_counts": result["shadow_funnel_counts"],
         "diff_funnel_counts": result["diff_funnel_counts"],
@@ -1872,11 +2245,14 @@ def telemetry_product_funnel_diff(
 @router.get("/telemetry/product-funnel-history")
 def telemetry_product_funnel_history(
     db: Session = Depends(get_db),
-    window_days: int = Query(30, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
 ):
     """Funnel event counts per day (from audit_logs) for historical chart."""
     now = datetime.now(timezone.utc)
-    since = now - timedelta(days=window_days)
+    since, effective_window_days = _resolve_audit_window(
+        db, window_days=window_days, all_time=all_time, default_days=30
+    )
     day_al = _utc_date_audit_log()
     user_expr = _audit_user_id_expr()
     rows = (
@@ -1899,8 +2275,8 @@ def telemetry_product_funnel_history(
             by_date[key] = {name: 0 for name in FUNNEL_EVENT_NAMES}
         by_date[key][action_name] = cnt
     history = []
-    for i in range(window_days + 1):
-        d = (now - timedelta(days=window_days - i)).date()
+    for i in range(effective_window_days):
+        d = (since + timedelta(days=i)).date()
         key = str(d)
         history.append({
             "date": key,
@@ -1929,7 +2305,8 @@ def telemetry_product_funnel_history(
     if missing_session_events > 0:
         quality_warnings.append("История включает funnel-события без session_id (legacy период).")
     return {
-        "window_days": window_days,
+        "window_days": effective_window_days if all_time else int(window_days or 30),
+        "all_time": all_time,
         "history": history,
         "data_quality": {
             "total_funnel_events": total_funnel_events,
@@ -2078,17 +2455,21 @@ def _path_transitions_and_sequences(
 @router.get("/telemetry/path-transitions")
 def telemetry_path_transitions(
     db: Session = Depends(get_db),
-    window_days: int = Query(7, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
 ):
     """Transitions between funnel steps with session counts and median/avg time in minutes. Source: audit_logs."""
     try:
-        since = datetime.now(timezone.utc) - timedelta(days=window_days)
-        transitions, drop_off, _, truncated, _ = _path_transitions_and_sequences(db, since, window_days)
+        since, effective_window_days = _resolve_audit_window(
+            db, window_days=window_days, all_time=all_time, default_days=7
+        )
+        transitions, drop_off, _, truncated, _ = _path_transitions_and_sequences(db, since, effective_window_days)
         shadow_transitions, shadow_drop_off, _, shadow_truncated, excluded = _path_transitions_and_sequences(
-            db, since, window_days, require_session=True
+            db, since, effective_window_days, require_session=True
         )
         return {
-            "window_days": window_days,
+            "window_days": effective_window_days if all_time else int(window_days or 7),
+            "all_time": all_time,
             "transitions": transitions,
             "drop_off": drop_off,
             "truncated": truncated,
@@ -2103,27 +2484,31 @@ def telemetry_path_transitions(
             },
         }
     except Exception as e:
-        logger.exception("telemetry path-transitions failed: window_days=%s", window_days)
+        logger.exception("telemetry path-transitions failed: window_days=%s all_time=%s", window_days, all_time)
         raise HTTPException(status_code=503, detail="Path aggregation failed; try a smaller window.") from e
 
 
 @router.get("/telemetry/path-sequences")
 def telemetry_path_sequences(
     db: Session = Depends(get_db),
-    window_days: int = Query(7, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
     limit: int = Query(20, ge=1, le=50),
 ):
     """Top path sequences with session count, median time to pay/last, pct reached pay. Source: audit_logs."""
     try:
-        since = datetime.now(timezone.utc) - timedelta(days=window_days)
+        since, effective_window_days = _resolve_audit_window(
+            db, window_days=window_days, all_time=all_time, default_days=7
+        )
         _, _, path_sequences, truncated, _ = _path_transitions_and_sequences(
-            db, since, window_days, path_limit=limit
+            db, since, effective_window_days, path_limit=limit
         )
         _, _, shadow_paths, shadow_truncated, excluded = _path_transitions_and_sequences(
-            db, since, window_days, path_limit=limit, require_session=True
+            db, since, effective_window_days, path_limit=limit, require_session=True
         )
         return {
-            "window_days": window_days,
+            "window_days": effective_window_days if all_time else int(window_days or 7),
+            "all_time": all_time,
             "paths": path_sequences,
             "truncated": truncated,
             "shadow_paths": shadow_paths,
@@ -2134,34 +2519,38 @@ def telemetry_path_sequences(
             },
         }
     except Exception as e:
-        logger.exception("telemetry path-sequences failed: window_days=%s", window_days)
+        logger.exception("telemetry path-sequences failed: window_days=%s all_time=%s", window_days, all_time)
         raise HTTPException(status_code=503, detail="Path aggregation failed; try a smaller window.") from e
 
 
 @router.get("/telemetry/path")
 def telemetry_path(
     db: Session = Depends(get_db),
-    window_days: int = Query(7, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
     limit: int = Query(20, ge=1, le=50),
 ):
     """Single call returning both path-transitions and path-sequences to avoid double heavy aggregation."""
     try:
-        since = datetime.now(timezone.utc) - timedelta(days=window_days)
+        since, effective_window_days = _resolve_audit_window(
+            db, window_days=window_days, all_time=all_time, default_days=7
+        )
         rows, truncated = _load_path_rows(db, since)
         transitions, drop_off, path_sequences, truncated, _ = _path_transitions_and_sequences(
-            db, since, window_days, path_limit=limit, rows=rows, preloaded_truncated=truncated
+            db, since, effective_window_days, path_limit=limit, rows=rows, preloaded_truncated=truncated
         )
         shadow_transitions, shadow_drop_off, shadow_paths, shadow_truncated, excluded = _path_transitions_and_sequences(
             db,
             since,
-            window_days,
+            effective_window_days,
             path_limit=limit,
             require_session=True,
             rows=rows,
             preloaded_truncated=truncated,
         )
         return {
-            "window_days": window_days,
+            "window_days": effective_window_days if all_time else int(window_days or 7),
+            "all_time": all_time,
             "transitions": transitions,
             "drop_off": drop_off,
             "paths": path_sequences,
@@ -2178,18 +2567,22 @@ def telemetry_path(
             },
         }
     except Exception as e:
-        logger.exception("telemetry path failed: window_days=%s", window_days)
+        logger.exception("telemetry path failed: window_days=%s all_time=%s", window_days, all_time)
         raise HTTPException(status_code=503, detail="Path aggregation failed; try a smaller window.") from e
 
 
 @router.get("/telemetry/button-clicks")
 def telemetry_button_clicks(
     db: Session = Depends(get_db),
-    window_days: int = Query(7, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
 ):
     """Count of button_click events per button_id (from audit_logs.payload) in window."""
-    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    since, effective_window_days = _resolve_audit_window(
+        db, window_days=window_days, all_time=all_time, default_days=7
+    )
     button_col = func.coalesce(AuditLog.payload["button_id"].astext, "")
+    user_expr = _audit_user_id_expr()
     rows = (
         db.query(button_col.label("button_id"), func.count(AuditLog.id).label("count"))
         .filter(
@@ -2199,7 +2592,21 @@ def telemetry_button_clicks(
         .group_by(button_col)
         .all()
     )
+    rows_users = (
+        db.query(
+            button_col.label("button_id"),
+            func.count(func.distinct(user_expr)).label("users"),
+        )
+        .filter(
+            AuditLog.action == "button_click",
+            AuditLog.created_at >= since,
+            user_expr.isnot(None),
+        )
+        .group_by(button_col)
+        .all()
+    )
     by_button_id = {r.button_id: r.count for r in rows if r.button_id}
+    by_button_id_users = {r.button_id: int(r.users or 0) for r in rows_users if r.button_id}
     total_button_events = int(sum(int(r.count or 0) for r in rows))
     missing_button_id_events = int(sum(int(r.count or 0) for r in rows if not r.button_id))
     unknown_by_button_id = {
@@ -2216,8 +2623,10 @@ def telemetry_button_clicks(
     if unknown_button_id_events > 0:
         quality_warnings.append("Есть button_click с неизвестными button_id (не в registry).")
     return {
-        "window_days": window_days,
+        "window_days": effective_window_days if all_time else int(window_days or 7),
+        "all_time": all_time,
         "by_button_id": by_button_id,
+        "by_button_id_users": by_button_id_users,
         "unknown_by_button_id": unknown_by_button_id,
         "data_quality": {
             "total_button_click_events": total_button_events,
@@ -2271,10 +2680,13 @@ def _extract_payment_amounts(props: dict | None, star_to_rub: float) -> tuple[in
 @router.get("/telemetry/health")
 def telemetry_health(
     db: Session = Depends(get_db),
-    window_days: int = Query(7, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
 ):
     """Telemetry collection health for product loops (coverage + schema quality)."""
-    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    since, effective_window_days = _resolve_audit_window(
+        db, window_days=window_days, all_time=all_time, default_days=7
+    )
     total_events = (
         db.query(func.count(AuditLog.id))
         .filter(AuditLog.actor_type == "user", AuditLog.created_at >= since)
@@ -2404,7 +2816,8 @@ def telemetry_health(
         "deprecated_schema_pct": deprecated_schema_pct,
     }
     return {
-        "window_days": window_days,
+        "window_days": effective_window_days if all_time else int(window_days or 7),
+        "all_time": all_time,
         "status": status,
         "data_quality": data_quality,
         "metrics": data_quality,
@@ -2415,15 +2828,15 @@ def telemetry_health(
 @router.get("/telemetry/overview-v3")
 def telemetry_overview_v3(
     db: Session = Depends(get_db),
-    window: str = Query("7d", description="24h|7d|30d|90d"),
+    window: str = Query("all", description="24h|7d|30d|90d|all"),
     source: str | None = Query(None),
     campaign: str | None = Query(None),
     entry_type: str | None = Query(None),
     flow_mode: str = Query("canonical_only", description="canonical_only|all_flows"),
     trust_mode: str = Query("trusted_only", description="trusted_only|all_data"),
 ):
-    if window not in {"24h", "7d", "30d", "90d"}:
-        raise HTTPException(400, "window must be one of: 24h, 7d, 30d, 90d")
+    if window not in {"24h", "7d", "30d", "90d", "all"}:
+        raise HTTPException(400, "window must be one of: 24h, 7d, 30d, 90d, all")
     if flow_mode not in {"canonical_only", "all_flows"}:
         raise HTTPException(400, "flow_mode must be canonical_only|all_flows")
     if trust_mode not in {"trusted_only", "all_data"}:
@@ -2448,10 +2861,13 @@ def telemetry_overview_v3(
 @router.get("/telemetry/product-metrics-v2")
 def telemetry_product_metrics_v2(
     db: Session = Depends(get_db),
-    window_days: int = Query(7, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
 ):
     """Calculated product metrics from audit_logs: preview_to_pay, hit_rate, AOV, etc."""
-    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    since, effective_window_days = _resolve_audit_window(
+        db, window_days=window_days, all_time=all_time, default_days=7
+    )
     user_expr = _audit_user_id_expr()
     # Counts
     take_preview = (
@@ -2577,7 +2993,8 @@ def telemetry_product_metrics_v2(
         avg_time_start_to_result_sec = round(sum(durations) / len(durations), 1)
         avg_steps_start_to_result = round(sum(steps_list) / len(steps_list), 1)
     return {
-        "window_days": window_days,
+        "window_days": effective_window_days if all_time else int(window_days or 7),
+        "all_time": all_time,
         "preview_to_pay_pct": preview_to_pay,
         "hit_rate_pct": hit_rate,
         "aov_stars": aov_stars,
@@ -2604,10 +3021,13 @@ def telemetry_product_metrics_v2(
 @router.get("/telemetry/revenue")
 def telemetry_revenue(
     db: Session = Depends(get_db),
-    window_days: int = Query(30, ge=1, le=90),
+    window_days: int | None = Query(None, ge=1, le=36500),
+    all_time: bool = Query(False),
 ):
     """Revenue by pack and by source from audit_logs pay_success (payload.pack_id, payload.source, payload.price)."""
-    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    since, effective_window_days = _resolve_audit_window(
+        db, window_days=window_days, all_time=all_time, default_days=30
+    )
     events = (
         db.query(AuditLog.payload)
         .filter(AuditLog.action == "pay_success", AuditLog.created_at >= since)
@@ -2637,7 +3057,8 @@ def telemetry_revenue(
     if invalid_price_events > 0:
         quality_warnings.append("Часть pay_success без валидной цены. Revenue может быть занижен.")
     return {
-        "window_days": window_days,
+        "window_days": effective_window_days if all_time else int(window_days or 30),
+        "all_time": all_time,
         "total_stars": total_stars,
         "revenue_rub_approx": round(total_rub if total_rub > 0 else total_stars * rate, 2),
         "by_pack": by_pack,
@@ -2914,41 +3335,44 @@ STAR_RUB_RATE = 1.3
 
 
 @router.get("/payments/stats")
-def payments_stats(db: Session = Depends(get_db), days: int = Query(30, ge=1)):
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    base = db.query(Payment).filter(Payment.status == "completed", Payment.created_at >= since)
+def payments_stats(
+    db: Session = Depends(get_db),
+    days: int = Query(30, ge=1),
+    all_time: bool = Query(False),
+):
+    since = None if all_time else datetime.now(timezone.utc) - timedelta(days=days)
+    completed_filters = [Payment.status == "completed"]
+    if since is not None:
+        completed_filters.append(Payment.created_at >= since)
+    base = db.query(Payment).filter(*completed_filters)
     total_payments = base.count()
     total_stars = db.query(func.coalesce(func.sum(Payment.stars_amount), 0)).filter(
-        Payment.status == "completed",
-        Payment.created_at >= since,
+        *completed_filters,
         ~Payment.telegram_payment_charge_id.like("yoomoney:%"),
         ~Payment.telegram_payment_charge_id.like("yookassa_link:%"),
         ~Payment.telegram_payment_charge_id.like("yookassa_unlock:%"),
         ~Payment.payload.like("bank_transfer:%"),
     ).scalar() or 0
     total_rub_yoomoney = db.query(func.coalesce(func.sum(Payment.amount_kopecks), 0)).filter(
-        Payment.status == "completed",
-        Payment.created_at >= since,
+        *completed_filters,
         Payment.telegram_payment_charge_id.like("yoomoney:%"),
     ).scalar() or 0
     total_rub_yoomoney_rub = int(total_rub_yoomoney) / 100.0
     total_rub_all_kopecks = db.query(func.coalesce(func.sum(Payment.amount_kopecks), 0)).filter(
-        Payment.status == "completed",
-        Payment.created_at >= since,
+        *completed_filters,
     ).scalar() or 0
     total_rub_all_rub = int(total_rub_all_kopecks) / 100.0
-    refunded = db.query(func.count(Payment.id)).filter(
-        Payment.status == "refunded", Payment.created_at >= since
-    ).scalar() or 0
-    unique_buyers = db.query(func.count(func.distinct(Payment.user_id))).filter(
-        Payment.status == "completed", Payment.created_at >= since
-    ).scalar() or 0
+    refunded_filters = [Payment.status == "refunded"]
+    if since is not None:
+        refunded_filters.append(Payment.created_at >= since)
+    refunded = db.query(func.count(Payment.id)).filter(*refunded_filters).scalar() or 0
+    unique_buyers = db.query(func.count(func.distinct(Payment.user_id))).filter(*completed_filters).scalar() or 0
     revenue_usd = float(total_stars) * STAR_USD_RATE
     revenue_rub_stars = float(total_stars) * STAR_RUB_RATE
     revenue_rub_total = revenue_rub_stars + total_rub_all_rub
     by_pack_rows = (
         db.query(Payment.pack_id, func.count(Payment.id).label("cnt"), func.coalesce(func.sum(Payment.stars_amount), 0).label("stars"), func.coalesce(func.sum(Payment.amount_kopecks), 0).label("rub_kopecks"))
-        .filter(Payment.status == "completed", Payment.created_at >= since)
+        .filter(*completed_filters)
         .group_by(Payment.pack_id)
     )
     by_pack = [
@@ -2956,7 +3380,8 @@ def payments_stats(db: Session = Depends(get_db), days: int = Query(30, ge=1)):
         for r in by_pack_rows
     ]
     return {
-        "days": days,
+        "days": None if all_time else days,
+        "all_time": all_time,
         "total_stars": int(total_stars),
         "total_rub_yoomoney": round(total_rub_yoomoney_rub, 2),
         "total_payments": total_payments,
@@ -3553,15 +3978,38 @@ def admin_trends_list(db: Session = Depends(get_db)):
 @router.get("/trends/analytics")
 def admin_trends_analytics(
     db: Session = Depends(get_db),
-    window_days: int = Query(30, ge=0, le=365),
+    window_days: int = Query(30, ge=0, le=36500),
+    all_time: bool = Query(False),
 ):
-    """Аналитика по всем трендам: сколько успешно сгенерировано, сколько с ошибкой/не доставлено. window_days=0 — всё время."""
-    since = (datetime.now(timezone.utc) - timedelta(days=window_days)) if window_days else None
+    """Аналитика по всем трендам: успех/ошибки/выборы/уникальные пользователи.
+    Поддерживает all_time=true (или window_days=0 для обратной совместимости).
+    """
+    normalized_all_time = bool(all_time) or int(window_days or 0) == 0
+    effective_window_days = None if normalized_all_time else max(1, int(window_days or 30))
+    since = (
+        datetime.now(timezone.utc) - timedelta(days=effective_window_days)
+    ) if effective_window_days is not None else None
     svc = TrendService(db)
     all_trends = svc.list_all()
     trend_ids = [t.id for t in all_trends]
     if not trend_ids:
-        return {"window_days": window_days if window_days else None, "items": []}
+        return {
+            "window_days": effective_window_days,
+            "all_time": normalized_all_time,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "summary": {
+                "trends_total": 0,
+                "trends_with_activity": 0,
+                "generated_total": 0,
+                "succeeded_total": 0,
+                "failed_total": 0,
+                "success_rate_pct": 0.0,
+                "users_total": 0,
+                "chosen_total": 0,
+                "chosen_users": 0,
+            },
+            "items": [],
+        }
     job_q = (
         db.query(
             Job.trend_id,
@@ -3595,13 +4043,15 @@ def admin_trends_analytics(
         for r in take_stats
     }
     chosen_actions = ("choose_best_variant", "favorites_auto_add")
+    trend_id_expr = func.coalesce(AuditLog.payload["trend_id"].astext, "")
+    trend_col = trend_id_expr.label("trend_id")
     chosen_q = (
         db.query(
-            func.coalesce(AuditLog.payload["trend_id"].astext, "").label("trend_id"),
+            trend_col,
             func.count(AuditLog.id).label("cnt"),
         )
         .filter(AuditLog.action.in_(chosen_actions))
-        .group_by(func.coalesce(AuditLog.payload["trend_id"].astext, ""))
+        .group_by(trend_col)
     )
     if since is not None:
         chosen_q = chosen_q.filter(AuditLog.created_at >= since)
@@ -3609,10 +4059,83 @@ def admin_trends_analytics(
         r.trend_id: r.cnt for r in chosen_q.all()
         if r.trend_id and str(r.trend_id).strip()
     }
+    user_expr = _audit_user_id_expr()
+    chosen_users_q = (
+        db.query(
+            trend_col,
+            func.count(func.distinct(user_expr)).label("users"),
+        )
+        .filter(
+            AuditLog.action.in_(chosen_actions),
+            user_expr.isnot(None),
+        )
+        .group_by(trend_col)
+    )
+    if since is not None:
+        chosen_users_q = chosen_users_q.filter(AuditLog.created_at >= since)
+    chosen_users_by_trend = {
+        r.trend_id: int(r.users or 0)
+        for r in chosen_users_q.all()
+        if r.trend_id and str(r.trend_id).strip()
+    }
+    chosen_users_total_q = (
+        db.query(func.count(func.distinct(user_expr)))
+        .filter(
+            AuditLog.action.in_(chosen_actions),
+            user_expr.isnot(None),
+            trend_id_expr != "",
+        )
+    )
+    if since is not None:
+        chosen_users_total_q = chosen_users_total_q.filter(AuditLog.created_at >= since)
+    chosen_users_total = int(chosen_users_total_q.scalar() or 0)
+
+    # Distinct users per trend across both flows (Job + Take).
+    job_users_stmt = (
+        select(
+            Job.trend_id.label("trend_id"),
+            Job.user_id.label("user_id"),
+        )
+        .where(
+            Job.trend_id.in_(trend_ids),
+            Job.user_id.isnot(None),
+        )
+    )
+    if since is not None:
+        job_users_stmt = job_users_stmt.where(Job.created_at >= since)
+    take_users_stmt = (
+        select(
+            Take.trend_id.label("trend_id"),
+            Take.user_id.label("user_id"),
+        )
+        .where(
+            Take.trend_id.in_(trend_ids),
+            Take.user_id.isnot(None),
+        )
+    )
+    if since is not None:
+        take_users_stmt = take_users_stmt.where(Take.created_at >= since)
+    users_union = union_all(job_users_stmt, take_users_stmt).subquery()
+    users_rows = (
+        db.query(
+            users_union.c.trend_id,
+            func.count(distinct(users_union.c.user_id)).label("users"),
+        )
+        .group_by(users_union.c.trend_id)
+        .all()
+    )
+    users_by_trend = {r.trend_id: int(r.users or 0) for r in users_rows if r.trend_id}
+
     items = []
     for t in all_trends:
         j = job_by_trend.get(t.id, {"total": 0, "succeeded": 0, "failed": 0})
         tk = take_by_trend.get(t.id, {"total": 0, "succeeded": 0, "failed": 0})
+        generated_total = int(j["total"] + tk["total"])
+        succeeded_total = int(j["succeeded"] + tk["succeeded"])
+        failed_total = int(j["failed"] + tk["failed"])
+        users_total = int(users_by_trend.get(t.id, 0))
+        chosen_total = int(chosen_by_trend.get(t.id, 0))
+        chosen_users = int(chosen_users_by_trend.get(t.id, 0))
         items.append({
             "trend_id": t.id,
             "name": t.name or t.id,
@@ -3624,9 +4147,53 @@ def admin_trends_analytics(
             "takes_total": tk["total"],
             "takes_succeeded": tk["succeeded"],
             "takes_failed": tk["failed"],
-            "chosen_total": chosen_by_trend.get(t.id, 0),
+            "generated_total": generated_total,
+            "succeeded_total": succeeded_total,
+            "failed_total": failed_total,
+            "success_rate_pct": round((succeeded_total / generated_total * 100), 1) if generated_total else 0.0,
+            "users_total": users_total,
+            "chosen_total": chosen_total,
+            "chosen_users": chosen_users,
+            "chosen_rate_pct": round((chosen_users / users_total * 100), 1) if users_total else 0.0,
         })
-    return {"window_days": window_days if window_days else None, "items": items}
+    generated_total = int(sum(int(i.get("generated_total") or 0) for i in items))
+    succeeded_total = int(sum(int(i.get("succeeded_total") or 0) for i in items))
+    failed_total = int(sum(int(i.get("failed_total") or 0) for i in items))
+    # True distinct users across all trends: use union over all user ids once.
+    all_job_users_stmt = select(Job.user_id.label("user_id")).where(
+        Job.trend_id.in_(trend_ids),
+        Job.user_id.isnot(None),
+    )
+    all_take_users_stmt = select(Take.user_id.label("user_id")).where(
+        Take.trend_id.in_(trend_ids),
+        Take.user_id.isnot(None),
+    )
+    if since is not None:
+        all_job_users_stmt = all_job_users_stmt.where(Job.created_at >= since)
+        all_take_users_stmt = all_take_users_stmt.where(Take.created_at >= since)
+    all_users_union = union_all(all_job_users_stmt, all_take_users_stmt).subquery()
+    users_total_distinct = (
+        db.query(func.count(distinct(all_users_union.c.user_id))).scalar() or 0
+    )
+    chosen_total = int(sum(int(i.get("chosen_total") or 0) for i in items))
+    trends_with_activity = int(sum(1 for i in items if int(i.get("generated_total") or 0) > 0))
+    return {
+        "window_days": effective_window_days,
+        "all_time": normalized_all_time,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "trends_total": len(items),
+            "trends_with_activity": trends_with_activity,
+            "generated_total": generated_total,
+            "succeeded_total": succeeded_total,
+            "failed_total": failed_total,
+            "success_rate_pct": round((succeeded_total / generated_total * 100), 1) if generated_total else 0.0,
+            "users_total": int(users_total_distinct),
+            "chosen_total": chosen_total,
+            "chosen_users": chosen_users_total,
+        },
+        "items": items,
+    }
 
 
 @router.get("/trends/{trend_id}")
@@ -3793,7 +4360,14 @@ def admin_trends_playground_config(trend_id: str, db: Session = Depends(get_db))
         default_model=effective.get("default_model", "gemini-2.5-flash-image"),
         default_temperature=effective.get("default_temperature", 0.4),
         default_format=effective.get("default_format", "png"),
-        default_size=effective.get("default_size") or "1024x1024",
+        default_size=aspect_ratio_to_size(effective.get("default_aspect_ratio") or "3:4"),
+        default_aspect_ratio=effective.get("default_aspect_ratio") or "3:4",
+        default_top_p=effective.get("default_top_p"),
+        default_candidate_count=effective.get("default_candidate_count", 1),
+        default_media_resolution=effective.get("default_media_resolution"),
+        default_thinking_config=effective.get("default_thinking_config"),
+        default_seed=effective.get("default_seed"),
+        default_image_size_tier=effective.get("default_image_size_tier"),
     )
     return config.model_dump()
 
@@ -4559,6 +5133,7 @@ def _job_to_item(j: Job, users: dict, trends: dict) -> dict:
         else:
             name = f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip()
             user_display_name = name or u.telegram_id
+    input_photo_path = _first_input_path(getattr(j, "input_local_paths", None))
     return {
         "job_id": j.job_id,
         "task_type": "job",
@@ -4572,6 +5147,13 @@ def _job_to_item(j: Job, users: dict, trends: dict) -> dict:
         "is_preview": getattr(j, "is_preview", False),
         "reserved_tokens": j.reserved_tokens,
         "error_code": j.error_code,
+        "input_photo_url": _build_job_input_photo_url("job", j.job_id, input_photo_path),
+        "has_three_variants": None,
+        "variants_ready_count": None,
+        "variant_photo_urls": None,
+        "started_at": None,
+        "received_at": None,
+        "time_to_receive_sec": None,
         "created_at": j.created_at.isoformat() if j.created_at else None,
     }
 
@@ -4585,6 +5167,109 @@ def _take_status_display(take_status: str) -> str:
     if take_status == "generating":
         return "RUNNING"
     return take_status.upper() if take_status else "CREATED"
+
+
+def _first_input_path(raw_paths: Any) -> str | None:
+    if not isinstance(raw_paths, list):
+        return None
+    for item in raw_paths:
+        if isinstance(item, str) and item.strip():
+            return item
+    return None
+
+
+def _take_variants_ready_count(take: Take) -> int:
+    variants_preview = (
+        take.variant_a_preview,
+        take.variant_b_preview,
+        take.variant_c_preview,
+    )
+    count = 0
+    for preview_path in variants_preview:
+        if preview_path:
+            count += 1
+    return count
+
+
+def _take_variant_paths(take: Take, variant_key: str) -> tuple[str | None, str | None]:
+    key = (variant_key or "").strip().lower()
+    if key == "a":
+        return take.variant_a_preview, take.variant_a_original
+    if key == "b":
+        return take.variant_b_preview, take.variant_b_original
+    if key == "c":
+        return take.variant_c_preview, take.variant_c_original
+    return None, None
+
+
+def _build_job_input_photo_url(task_type: str, task_id: str, input_path: str | None) -> str | None:
+    if not input_path:
+        return None
+    return f"/admin/jobs/{task_id}/input-photo?task_type={task_type}"
+
+
+def _build_take_variant_url(take_id: str, variant_key: str, kind: str = "auto") -> str:
+    return f"/admin/jobs/{take_id}/take-variant/{variant_key}?kind={kind}"
+
+
+def _storage_file_path_safe(raw_path: str | None) -> str | None:
+    base = getattr(app_settings, "storage_base_path", "") or ""
+    if not raw_path or not base:
+        return None
+    path = raw_path if os.path.isabs(raw_path) else os.path.join(base, raw_path)
+    real_path = os.path.realpath(path)
+    real_base = os.path.realpath(base)
+    if not real_path.startswith(real_base + os.sep) and real_path != real_base:
+        return None
+    if not os.path.isfile(real_path):
+        return None
+    return real_path
+
+
+def _take_timing_map(db: Session, take_ids: list[str]) -> dict[str, dict[str, Any]]:
+    ids = [str(x) for x in (take_ids or []) if x]
+    if not ids:
+        return {}
+    rows = (
+        db.query(
+            AuditLog.entity_id.label("take_id"),
+            func.min(
+                case(
+                    (AuditLog.action == "take_started", AuditLog.created_at),
+                    else_=None,
+                )
+            ).label("started_at"),
+            func.min(
+                case(
+                    (AuditLog.action == "take_previews_ready", AuditLog.created_at),
+                    else_=None,
+                )
+            ).label("received_at"),
+        )
+        .filter(
+            AuditLog.entity_type == "take",
+            AuditLog.entity_id.in_(ids),
+            AuditLog.action.in_(("take_started", "take_previews_ready")),
+        )
+        .group_by(AuditLog.entity_id)
+        .all()
+    )
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        take_id = str(row.take_id)
+        started_at = _as_utc(row.started_at)
+        received_at = _as_utc(row.received_at)
+        time_to_receive_sec = None
+        if started_at and received_at:
+            delta = int((received_at - started_at).total_seconds())
+            if delta >= 0:
+                time_to_receive_sec = delta
+        out[take_id] = {
+            "started_at": started_at.isoformat() if started_at else None,
+            "received_at": received_at.isoformat() if received_at else None,
+            "time_to_receive_sec": time_to_receive_sec,
+        }
+    return out
 
 
 @router.get("/jobs")
@@ -4673,6 +5358,7 @@ def jobs_list(
     take_ids = [tid for _, t, tid in page_slice if t == "take"]
     jobs = {j.job_id: j for j in db.query(Job).filter(Job.job_id.in_(job_ids)).all()} if job_ids else {}
     takes = {t.id: t for t in db.query(Take).filter(Take.id.in_(take_ids)).all()} if take_ids else {}
+    timing_map = _take_timing_map(db, take_ids)
 
     user_ids = [jobs[jid].user_id for jid in job_ids if jid in jobs]
     user_ids += [takes[tid].user_id for tid in take_ids if tid in takes]
@@ -4694,6 +5380,16 @@ def jobs_list(
                 user_display_name = None
                 if u:
                     user_display_name = f"@{u.telegram_username}" if u.telegram_username else (f"{u.telegram_first_name or ''} {u.telegram_last_name or ''}".strip() or u.telegram_id)
+                input_photo_path = _first_input_path(getattr(t, "input_local_paths", None))
+                variants_ready_count = _take_variants_ready_count(t)
+                variant_photo_urls = []
+                for variant_key in ("a", "b", "c"):
+                    preview_path, original_path = _take_variant_paths(t, variant_key)
+                    if preview_path:
+                        variant_photo_urls.append(_build_take_variant_url(task_id, variant_key, "preview"))
+                    else:
+                        variant_photo_urls.append(None)
+                timing = timing_map.get(str(task_id), {})
                 items.append({
                     "job_id": task_id,
                     "task_type": "take",
@@ -4707,9 +5403,79 @@ def jobs_list(
                     "is_preview": False,
                     "reserved_tokens": 0,
                     "error_code": t.error_code,
+                    "input_photo_url": _build_job_input_photo_url("take", task_id, input_photo_path),
+                    "has_three_variants": variants_ready_count == 3,
+                    "variants_ready_count": variants_ready_count,
+                    "variant_photo_urls": variant_photo_urls,
+                    "started_at": timing.get("started_at"),
+                    "received_at": timing.get("received_at"),
+                    "time_to_receive_sec": timing.get("time_to_receive_sec"),
                     "created_at": t.created_at.isoformat() if t.created_at else None,
                 })
     return {"items": items, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
+
+
+@router.get("/jobs/{task_id}/input-photo")
+def jobs_input_photo(
+    task_id: str,
+    task_type: str = Query("take"),
+    db: Session = Depends(get_db),
+):
+    task_type_norm = (task_type or "").strip().lower()
+    if task_type_norm not in {"job", "take"}:
+        raise HTTPException(400, "task_type must be job or take")
+
+    input_path = None
+    if task_type_norm == "job":
+        row = db.query(Job).filter(Job.job_id == task_id).first()
+        if not row:
+            raise HTTPException(404, "Job not found")
+        input_path = _first_input_path(getattr(row, "input_local_paths", None))
+    else:
+        row = db.query(Take).filter(Take.id == task_id).first()
+        if not row:
+            raise HTTPException(404, "Take not found")
+        input_path = _first_input_path(getattr(row, "input_local_paths", None))
+
+    safe_path = _storage_file_path_safe(input_path)
+    if not safe_path:
+        raise HTTPException(404, "Input photo not found")
+    media_type, _ = mimetypes.guess_type(safe_path)
+    return FileResponse(safe_path, media_type=media_type or "application/octet-stream")
+
+
+@router.get("/jobs/{task_id}/take-variant/{variant_key}")
+def jobs_take_variant_photo(
+    task_id: str,
+    variant_key: str,
+    kind: str = Query("auto"),
+    db: Session = Depends(get_db),
+):
+    variant_key_norm = (variant_key or "").strip().lower()
+    if variant_key_norm not in {"a", "b", "c"}:
+        raise HTTPException(400, "variant_key must be a, b or c")
+    kind_norm = (kind or "").strip().lower()
+    if kind_norm not in {"auto", "preview", "original"}:
+        raise HTTPException(400, "kind must be auto, preview or original")
+
+    take = db.query(Take).filter(Take.id == task_id).first()
+    if not take:
+        raise HTTPException(404, "Take not found")
+
+    preview_path, original_path = _take_variant_paths(take, variant_key_norm)
+    selected_path = None
+    if kind_norm == "preview":
+        selected_path = preview_path
+    elif kind_norm == "original":
+        selected_path = original_path
+    else:
+        selected_path = preview_path or original_path
+
+    safe_path = _storage_file_path_safe(selected_path)
+    if not safe_path:
+        raise HTTPException(404, "Take variant photo not found")
+    media_type, _ = mimetypes.guess_type(safe_path)
+    return FileResponse(safe_path, media_type=media_type or "application/octet-stream")
 
 
 @router.get("/jobs/analytics")
@@ -4905,6 +5671,68 @@ def copy_style_put(
     result = svc.update(payload)
     _admin_audit(db, current_user, "update", "settings", None, {"section": "copy_style"})
     return result
+
+
+# ---------- Face ID ----------
+@router.get("/settings/face-id")
+def face_id_settings_get(db: Session = Depends(get_db)):
+    svc = FaceIdSettingsService(db)
+    return svc.as_dict()
+
+
+@router.put("/settings/face-id")
+def face_id_settings_put(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    svc = FaceIdSettingsService(db)
+    result = svc.update(payload or {})
+    _admin_audit(db, current_user, "update", "settings", None, {"section": "face_id"})
+    return result
+
+
+@router.get("/face-id/assets")
+def face_id_assets_list(
+    db: Session = Depends(get_db),
+    limit: int = Query(100, ge=1, le=500),
+    status: str | None = Query(default=None),
+):
+    q = db.query(FaceAsset)
+    status_norm = (status or "").strip()
+    if status_norm:
+        q = q.filter(FaceAsset.status == status_norm)
+    items = q.order_by(FaceAsset.created_at.desc()).limit(limit).all()
+    pending_count = int(db.query(Take.id).filter(Take.status == "awaiting_face_id").count())
+    face_id_pending_takes.set(pending_count)
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "user_id": row.user_id,
+                "session_id": row.session_id,
+                "chat_id": row.chat_id,
+                "flow": row.flow,
+                "status": row.status,
+                "faces_detected": row.faces_detected,
+                "reason_code": row.reason_code,
+                "source_path": row.source_path,
+                "processed_path": row.processed_path,
+                "selected_path": row.selected_path,
+                "request_id": row.request_id,
+                "last_event_id": row.last_event_id,
+                "latency_ms": row.latency_ms,
+                "primary_face_bbox": row.primary_face_bbox,
+                "crop_bbox": row.crop_bbox,
+                "detector_meta": row.detector_meta,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in items
+        ],
+        "limit": limit,
+        "pending_takes": pending_count,
+    }
 
 
 # ---------- Cleanup ----------

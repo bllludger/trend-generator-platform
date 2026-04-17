@@ -59,6 +59,10 @@ celery_app.conf.update(
             "task": "app.workers.tasks.watchdog_rendering.detect_collection_drops",
             "schedule": crontab(hour="*/6"),
         },
+        "recover-stuck-face-id-takes": {
+            "task": "app.workers.tasks.watchdog_rendering.recover_stuck_face_id_takes",
+            "schedule": crontab(minute="*/1"),
+        },
     },
 )
 

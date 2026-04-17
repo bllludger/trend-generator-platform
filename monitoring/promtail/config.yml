@@ -1,0 +1,28 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /var/lib/promtail/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker-json
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: docker
+          __path__: /var/lib/docker/containers/*/*-json.log
+    pipeline_stages:
+      - docker: {}
+      - regex:
+          source: filename
+          expression: '.*/(?P<container_id>[a-f0-9]{64})/.*'
+      - labels:
+          container_id:
+      - drop:
+          older_than: 1h
+      - labeldrop:
+          - filename

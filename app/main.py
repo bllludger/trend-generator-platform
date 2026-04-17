@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.api.routes import health, auth, trends, playground, admin, webhooks
+from app.api.routes import health, auth, trends, playground, admin, webhooks, internal
 from app.admin.ui import router as admin_ui_router
 from app.utils.metrics import router as metrics_router
 from app.middleware.metrics_middleware import HTTPMetricsMiddleware
@@ -54,5 +54,6 @@ app.include_router(trends.router)
 app.include_router(playground.router)
 app.include_router(admin.router)
 app.include_router(webhooks.router)
+app.include_router(internal.router)
 app.include_router(admin_ui_router)
 app.include_router(metrics_router)

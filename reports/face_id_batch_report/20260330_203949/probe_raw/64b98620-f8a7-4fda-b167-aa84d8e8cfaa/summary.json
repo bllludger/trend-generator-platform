@@ -1,0 +1,30 @@
+{
+  "asset_id": "64b98620-f8a7-4fda-b167-aa84d8e8cfaa",
+  "status": "ready",
+  "faces_detected": 1,
+  "signature_ok": true,
+  "staged_source_host": "/root/ai_slop_2/data/generated_images/face_id_probe/source/64b98620-f8a7-4fda-b167-aa84d8e8cfaa.jpg",
+  "source_path_sent_to_api": "/data/generated_images/face_id_probe/source/64b98620-f8a7-4fda-b167-aa84d8e8cfaa.jpg",
+  "source_saved": false,
+  "selected_saved": true,
+  "selected_path": "/data/generated_images/face_id/64b98620-f8a7-4fda-b167-aa84d8e8cfaa.jpg",
+  "source_path": "/data/generated_images/face_id_probe/source/64b98620-f8a7-4fda-b167-aa84d8e8cfaa.jpg",
+  "detector_meta": {
+    "confidence": 0.9309488534927368,
+    "bbox": {
+      "x": 303,
+      "y": 514,
+      "w": 373,
+      "h": 373
+    },
+    "crop_bbox": {
+      "x1": 98,
+      "y1": 113,
+      "x2": 881,
+      "y2": 1157
+    },
+    "latency_ms": 112,
+    "model_version": "mediapipe-face-detection-v1"
+  },
+  "output_dir": "/root/ai_slop_2/reports/face_id_batch_report/20260330_203949/probe_raw/64b98620-f8a7-4fda-b167-aa84d8e8cfaa"
+}

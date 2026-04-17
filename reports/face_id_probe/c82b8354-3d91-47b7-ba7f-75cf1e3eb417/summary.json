@@ -1,0 +1,18 @@
+{
+  "asset_id": "c82b8354-3d91-47b7-ba7f-75cf1e3eb417",
+  "status": "failed_error",
+  "faces_detected": null,
+  "signature_ok": true,
+  "staged_source_host": "/root/ai_slop_2/data/generated_images/face_id_probe/source/c82b8354-3d91-47b7-ba7f-75cf1e3eb417.png",
+  "source_path_sent_to_api": "/data/generated_images/face_id_probe/source/c82b8354-3d91-47b7-ba7f-75cf1e3eb417.png",
+  "source_saved": false,
+  "selected_saved": false,
+  "selected_path": null,
+  "source_path": "/data/generated_images/face_id_probe/source/c82b8354-3d91-47b7-ba7f-75cf1e3eb417.png",
+  "detector_meta": {
+    "error": "OSError: libGLESv2.so.2: cannot open shared object file: No such file or directory",
+    "latency_ms": 1235,
+    "model_version": "mediapipe-face-detection-v1"
+  },
+  "output_dir": "/root/ai_slop_2/reports/face_id_probe/c82b8354-3d91-47b7-ba7f-75cf1e3eb417"
+}

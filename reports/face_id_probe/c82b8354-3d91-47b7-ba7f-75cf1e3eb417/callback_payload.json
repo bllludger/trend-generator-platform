@@ -1,0 +1,13 @@
+{
+  "asset_id": "c82b8354-3d91-47b7-ba7f-75cf1e3eb417",
+  "status": "failed_error",
+  "faces_detected": null,
+  "selected_path": null,
+  "source_path": "/data/generated_images/face_id_probe/source/c82b8354-3d91-47b7-ba7f-75cf1e3eb417.png",
+  "detector_meta": {
+    "error": "OSError: libGLESv2.so.2: cannot open shared object file: No such file or directory",
+    "latency_ms": 1235,
+    "model_version": "mediapipe-face-detection-v1"
+  },
+  "event_id": "18655ed6-feee-47d5-965b-4a0099a3f9f4"
+}

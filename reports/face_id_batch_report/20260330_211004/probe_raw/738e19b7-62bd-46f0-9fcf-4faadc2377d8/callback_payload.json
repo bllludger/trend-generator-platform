@@ -1,0 +1,25 @@
+{
+  "asset_id": "738e19b7-62bd-46f0-9fcf-4faadc2377d8",
+  "status": "ready",
+  "faces_detected": 1,
+  "selected_path": "/data/generated_images/face_id/738e19b7-62bd-46f0-9fcf-4faadc2377d8.jpg",
+  "source_path": "/data/generated_images/face_id_probe/source/738e19b7-62bd-46f0-9fcf-4faadc2377d8.jpg",
+  "detector_meta": {
+    "confidence": 0.9254035949707031,
+    "bbox": {
+      "x": 391,
+      "y": 616,
+      "w": 121,
+      "h": 121
+    },
+    "crop_bbox": {
+      "x1": 324,
+      "y1": 486,
+      "x2": 579,
+      "y2": 825
+    },
+    "latency_ms": 96,
+    "model_version": "mediapipe-face-detection-v1"
+  },
+  "event_id": "6b48d43f-7981-4842-92e8-ec3b60373f7e"
+}

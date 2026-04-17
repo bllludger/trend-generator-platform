@@ -2,6 +2,9 @@
 Events are written only to audit_logs (single event log). Telemetry metrics are built from audit.
 """
 
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import logging
 from typing import Any
 
@@ -111,6 +114,7 @@ KNOWN_BUTTON_IDS = {
     "profile_support",
     "regenerate",
     "shop_open",
+    "shop_open_tariff_better",
     "shop_how_buy_stars",
     "deletemydata",
     "paysupport",
@@ -148,6 +152,8 @@ KNOWN_BUTTON_PREFIXES = (
     "deselect_hd_",
     "hd_problem_",
 )
+
+_DEDUP_SCAN_LIMIT = 20
 
 
 def is_known_product_event(event_name: str) -> bool:
@@ -230,6 +236,76 @@ def _payload_for_audit(
 class ProductAnalyticsService:
     def __init__(self, db: Session) -> None:
         self.db = db
+
+    def _dedupe_window_seconds(self, event_name: str) -> int:
+        if event_name == "button_click":
+            return 2
+        if event_name in PAYMENT_EVENT_NAMES:
+            return 300
+        if event_name in FUNNEL_EVENT_NAMES:
+            return 30
+        return 10
+
+    def _event_signature(
+        self,
+        *,
+        event_name: str,
+        user_id: str,
+        session_id: str | None,
+        payload: dict[str, Any],
+    ) -> str:
+        signature_payload: dict[str, Any] = {
+            "event_name": event_name,
+            "user_id": user_id,
+            "session_id": session_id or "",
+        }
+        # Keep only stable, high-signal fields for dedupe; ignore volatile timestamps.
+        stable_keys = (
+            "button_id",
+            "trend_id",
+            "pack_id",
+            "take_id",
+            "job_id",
+            "method",
+            "price",
+            "price_rub",
+            "currency",
+            "flow",
+            "source_component",
+            "entry_type",
+        )
+        for key in stable_keys:
+            value = payload.get(key)
+            if value is not None:
+                signature_payload[key] = value
+        digest_source = json.dumps(signature_payload, ensure_ascii=True, sort_keys=True, default=str)
+        return hashlib.sha1(digest_source.encode("utf-8")).hexdigest()
+
+    def _is_recent_duplicate(
+        self,
+        *,
+        event_name: str,
+        user_id: str,
+        signature: str,
+    ) -> bool:
+        since = datetime.now(timezone.utc) - timedelta(seconds=self._dedupe_window_seconds(event_name))
+        rows = (
+            self.db.query(AuditLog)
+            .filter(
+                AuditLog.actor_type == "user",
+                AuditLog.user_id == user_id,
+                AuditLog.action == event_name,
+                AuditLog.created_at >= since,
+            )
+            .order_by(AuditLog.created_at.desc())
+            .limit(_DEDUP_SCAN_LIMIT)
+            .all()
+        )
+        for row in rows:
+            payload = row.payload if isinstance(row.payload, dict) else {}
+            if str(payload.get("_event_signature") or "") == signature:
+                return True
+        return False
 
     def track_funnel_step(
         self,
@@ -420,6 +496,16 @@ class ProductAnalyticsService:
                         payload["unknown_button_id"] = True
             if not is_known_product_event(event_name):
                 payload["unknown_event_name"] = True
+            signature = self._event_signature(
+                event_name=event_name,
+                user_id=user_id,
+                session_id=effective_session_id,
+                payload=payload,
+            )
+            payload["_event_signature"] = signature
+            if self._is_recent_duplicate(event_name=event_name, user_id=user_id, signature=signature):
+                product_events_track_total.labels(event_name=event_name, status="duplicate_skip").inc()
+                return None
             entry = AuditService(self.db).log(
                 actor_type="user",
                 actor_id=actor_id,

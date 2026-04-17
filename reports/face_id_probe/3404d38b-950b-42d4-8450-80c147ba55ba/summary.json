@@ -1,0 +1,18 @@
+{
+  "asset_id": "3404d38b-950b-42d4-8450-80c147ba55ba",
+  "status": "failed_error",
+  "faces_detected": null,
+  "signature_ok": true,
+  "staged_source_host": "/root/ai_slop_2/data/generated_images/face_id_probe/source/3404d38b-950b-42d4-8450-80c147ba55ba.png",
+  "source_path_sent_to_api": "/data/generated_images/face_id_probe/source/3404d38b-950b-42d4-8450-80c147ba55ba.png",
+  "source_saved": false,
+  "selected_saved": false,
+  "selected_path": null,
+  "source_path": "/data/generated_images/face_id_probe/source/3404d38b-950b-42d4-8450-80c147ba55ba.png",
+  "detector_meta": {
+    "error": "OSError: libEGL.so.1: cannot open shared object file: No such file or directory",
+    "latency_ms": 389,
+    "model_version": "mediapipe-face-detection-v1"
+  },
+  "output_dir": "/root/ai_slop_2/reports/face_id_probe/3404d38b-950b-42d4-8450-80c147ba55ba"
+}

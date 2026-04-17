@@ -33,10 +33,12 @@ import { toast } from 'sonner'
 import { useQuery } from '@tanstack/react-query'
 import { playgroundApi, type PlaygroundPromptConfig, type PlaygroundSection, type RunLogEntry } from '@/services/playgroundApi'
 import { trendsService, masterPromptService } from '@/services/api'
-import { parseFullTrendPrompt } from '@/utils/trendPromptParse'
 
 const APPLY_TO_ALL_TRENDS_LIMIT = 50
 const BATCH_TEST_TRENDS_LIMIT = 200
+const MULTI_VARIANTS_DEFAULT_COUNT = 3
+const MULTI_VARIANTS_MAX_COUNT = 5
+const MULTI_VARIANTS_DEFAULT_CONCURRENCY = 3
 const MAX_FILE_SIZE_BYTES = 7 * 1024 * 1024
 const MAX_TOTAL_INPUT_BYTES = 50 * 1024 * 1024
 /** Официальный id для Nano Banana Pro (image); старые конфиги могли хранить legacy-строку. */
@@ -76,6 +78,16 @@ export type PlaygroundTestResult = {
   error?: string
 }
 
+type PromptVariantResult = {
+  variantId: string
+  promptLabel: string
+  prompt: string
+  status: 'queued' | 'running' | 'success' | 'error'
+  duration?: number
+  imageUrls?: string[]
+  error?: string
+}
+
 const modelInputLimit = (model: string | undefined): number => {
   if (!model) return 3
   if (model === 'gemini-2.5-flash-image') return 3
@@ -90,6 +102,8 @@ const modelMaxCandidateCount = (model: string | undefined): number => {
 }
 
 const modelSupportsMediaResolution = (model: string | undefined): boolean => isGemini3ProImageModel(model)
+const modelSupportsImageSize = (model: string | undefined): boolean =>
+  isGemini3ProImageModel(model) || model === 'gemini-3.1-flash-image-preview'
 
 const modelThinkingLevelOptions = (model: string | undefined): ThinkingLevel[] => {
   if (isGemini3ProImageModel(model)) return ['LOW', 'HIGH']
@@ -174,7 +188,16 @@ export default function PromptPlaygroundPage() {
   const [batchFilterStatus, setBatchFilterStatus] = useState<'all' | 'success' | 'error'>('all')
   const [fullPromptText, setFullPromptText] = useState('')
   const [zoomImageUrl, setZoomImageUrl] = useState<string | null>(null)
+  const [promptVariants, setPromptVariants] = useState<string[]>(
+    Array.from({ length: MULTI_VARIANTS_DEFAULT_COUNT }, () => '')
+  )
+  const [multiTestRunning, setMultiTestRunning] = useState(false)
+  const [multiTestProgress, setMultiTestProgress] = useState<{ current: number; total: number } | null>(null)
+  const [multiConcurrency, setMultiConcurrency] = useState(MULTI_VARIANTS_DEFAULT_CONCURRENCY)
+  const [multiVariantResults, setMultiVariantResults] = useState<PromptVariantResult[]>([])
   const batchAbortRef = useRef<AbortController | null>(null)
+  const testAbortRef = useRef<AbortController | null>(null)
+  const multiAbortRef = useRef<AbortController | null>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
   const assetsRef = useRef<InputAsset[]>([])
 
@@ -207,19 +230,12 @@ export default function PromptPlaygroundPage() {
 
   function sectionsToFullText(sections: PlaygroundSection[]): string {
     const ordered = [...(sections || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-    const labelToTag: Record<string, string> = {
-      scene: '[]',
-      style: '[STYLE]',
-      avoid: '[AVOID]',
-      composition: '[COMPOSITION]',
-    }
     const parts: string[] = []
     for (const s of ordered) {
-      const label = (s.label || '').trim().toLowerCase()
-      const tag = labelToTag[label] || `[${(s.label || '').toUpperCase()}]`
-      parts.push(tag, (s.content || '').trim())
+      const content = (s.content || '').trim()
+      if (content) parts.push(content)
     }
-    return parts.join('\n').replace(/\n\n+/g, '\n\n').trim()
+    return parts.join('\n\n').trim()
   }
 
   const loadDefaultConfig = async () => {
@@ -551,8 +567,10 @@ export default function PromptPlaygroundPage() {
     try {
       setIsTesting(true)
       setResult(null)
+      const abort = new AbortController()
+      testAbortRef.current = abort
       const configToSend: PlaygroundPromptConfig = { ...config, sections: fullPromptTextToSections(fullPromptText) }
-      const response = await playgroundApi.testPrompt(configToSend, files)
+      const response = await playgroundApi.testPrompt(configToSend, files, abort.signal)
       setLastSentRequest(response.sent_request ?? null)
       setLastRunLog(response.run_log ?? [])
       const imageUrls = response.imageUrls && response.imageUrls.length > 0 ? response.imageUrls : (response.imageUrl ? [response.imageUrl] : [])
@@ -572,28 +590,162 @@ export default function PromptPlaygroundPage() {
         toast.error('Неожиданный ответ: нет изображения и нет ошибки.')
       }
     } catch (error: any) {
+      const canceled = error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED'
+      if (canceled) {
+        toast.info('Тест остановлен')
+        return
+      }
       console.error('Test failed:', error)
       const msg = error?.response?.data?.detail ?? error?.response?.data?.error ?? error?.message ?? String(error)
       toast.error(`Test failed: ${msg}`)
     } finally {
+      testAbortRef.current = null
       setIsTesting(false)
     }
   }
 
-  function fullPromptTextToSections(text: string): PlaygroundSection[] {
-    const parsed = parseFullTrendPrompt(text)
-    const trimmed = text.trim()
-    const hasMarkers = [parsed.scene, parsed.style, parsed.avoid, parsed.composition].some((s) => (s || '').trim().length > 0)
-    if (!hasMarkers && trimmed) {
-      return [{ id: `section_${Date.now()}_0`, label: 'prompt', content: trimmed, enabled: true, order: 0 }]
+  const stopTestPrompt = () => {
+    testAbortRef.current?.abort()
+  }
+
+  const updatePromptVariant = (idx: number, value: string) => {
+    setPromptVariants((prev) => prev.map((item, i) => (i === idx ? value : item)))
+  }
+
+  const addPromptVariant = () => {
+    setPromptVariants((prev) => {
+      if (prev.length >= MULTI_VARIANTS_MAX_COUNT) return prev
+      return [...prev, '']
+    })
+  }
+
+  const removePromptVariant = (idx: number) => {
+    setPromptVariants((prev) => {
+      if (prev.length <= 1) return prev
+      return prev.filter((_, i) => i !== idx)
+    })
+  }
+
+  const runMultiPromptTest = async () => {
+    if (!config) {
+      toast.error('Configuration not loaded')
+      return
     }
-    const ts = Date.now()
-    return [
-      { id: `section_${ts}_0`, label: 'Scene', content: parsed.scene, enabled: true, order: 0 },
-      { id: `section_${ts}_1`, label: 'Style', content: parsed.style, enabled: true, order: 1 },
-      { id: `section_${ts}_2`, label: 'Avoid', content: parsed.avoid, enabled: true, order: 2 },
-      { id: `section_${ts}_3`, label: 'Composition', content: parsed.composition, enabled: true, order: 3 },
-    ]
+    const files = inputAssets.map((x) => x.file)
+    const limit = modelInputLimit(config.model)
+    if (files.length > limit) {
+      toast.error(`Слишком много файлов: ${files.length}, максимум для модели ${config.model}: ${limit}`)
+      return
+    }
+    const totalBytes = files.reduce((acc, file) => acc + file.size, 0)
+    if (totalBytes > MAX_TOTAL_INPUT_BYTES) {
+      toast.error(`Суммарный размер файлов превышает 50 MB (${(totalBytes / 1024 / 1024).toFixed(1)} MB)`)
+      return
+    }
+    const prompts = promptVariants.map((x) => x.trim()).filter((x) => x.length > 0)
+    if (prompts.length === 0) {
+      toast.error('Добавьте хотя бы один непустой промпт')
+      return
+    }
+    if (prompts.length > MULTI_VARIANTS_MAX_COUNT) {
+      toast.error(`Максимум промптов: ${MULTI_VARIANTS_MAX_COUNT}`)
+      return
+    }
+
+    const abort = new AbortController()
+    multiAbortRef.current = abort
+    setMultiTestRunning(true)
+    setMultiTestProgress({ current: 0, total: prompts.length })
+    setMultiVariantResults(
+      prompts.map((prompt, idx) => ({
+        variantId: `variant_${idx}`,
+        promptLabel: `Prompt ${String.fromCharCode(65 + idx)}`,
+        prompt,
+        status: 'queued',
+      }))
+    )
+
+    try {
+      const configBase: PlaygroundPromptConfig = { ...config, sections: fullPromptTextToSections(fullPromptText) }
+      await playgroundApi.streamMultiTest(
+        {
+          prompts,
+          configBase,
+          images: files,
+          concurrency: clamp(multiConcurrency, 1, MULTI_VARIANTS_MAX_COUNT),
+          signal: abort.signal,
+        },
+        (data) => {
+          if (data.done === true) {
+            const s = Number(data.success ?? 0)
+            const e = Number(data.errors ?? 0)
+            const okS = Number.isFinite(s) ? s : 0
+            const okE = Number.isFinite(e) ? e : 0
+            toast.success(`Готово: ${okS} успешно, ${okE} ошибок`)
+            return
+          }
+          const variantId = String(data.variant_id ?? '')
+          const promptLabel = String(data.prompt_label ?? variantId)
+          const status = String(data.status ?? '')
+          const duration = typeof data.duration === 'number' ? data.duration : undefined
+          const error = typeof data.error === 'string' ? data.error : undefined
+          const imageUrls = Array.isArray(data.image_urls) ? data.image_urls.filter((x) => typeof x === 'string') as string[] : undefined
+          setMultiVariantResults((prev) => {
+            let found = false
+            const next = prev.map((row) => {
+              if (row.variantId !== variantId) return row
+              found = true
+              return {
+                ...row,
+                promptLabel,
+                status: (status === 'success' || status === 'error' || status === 'queued' || status === 'running')
+                  ? status
+                  : row.status,
+                duration,
+                error,
+                imageUrls,
+              }
+            })
+            if (!found && variantId) {
+              next.push({
+                variantId,
+                promptLabel,
+                prompt: '',
+                status: (status === 'success' || status === 'error' || status === 'queued' || status === 'running') ? status : 'queued',
+                duration,
+                error,
+                imageUrls,
+              })
+            }
+            const doneCount = next.filter((x) => x.status === 'success' || x.status === 'error').length
+            setMultiTestProgress({ current: doneCount, total: prompts.length })
+            return next
+          })
+        }
+      )
+    } catch (error: unknown) {
+      const name = error && typeof error === 'object' && 'name' in error ? String((error as { name?: string }).name) : ''
+      if (name === 'AbortError') {
+        toast.info('Остановлено пользователем')
+      } else {
+        const msg = error instanceof Error ? error.message : String(error)
+        toast.error(`Параллельный тест: ${msg}`)
+      }
+    } finally {
+      multiAbortRef.current = null
+      setMultiTestRunning(false)
+      setMultiTestProgress(null)
+    }
+  }
+
+  const stopMultiPromptTest = () => {
+    multiAbortRef.current?.abort()
+  }
+
+  function fullPromptTextToSections(text: string): PlaygroundSection[] {
+    const trimmed = text.trim()
+    if (!trimmed) return []
+    return [{ id: `section_${Date.now()}_0`, label: 'Prompt', content: trimmed, enabled: true, order: 0 }]
   }
 
   const buildRequestJson = () => {
@@ -601,38 +753,14 @@ export default function PromptPlaygroundPage() {
 
     const parts: any[] = []
 
-    const master = (masterSettings as { preview?: { prompt_input?: string; prompt_input_enabled?: boolean; prompt_task?: string; prompt_task_enabled?: boolean; prompt_identity_transfer?: string; prompt_identity_transfer_enabled?: boolean; safety_constraints?: string; safety_constraints_enabled?: boolean } })?.preview
+    const master = (masterSettings as { preview?: { prompt_input?: string; prompt_input_enabled?: boolean } })?.preview
     const textBlocks: string[] = []
     if (master?.prompt_input_enabled !== false && master?.prompt_input?.trim()) {
-      textBlocks.push('[INPUT]\n' + master.prompt_input.trim())
-    }
-    if (master?.prompt_task_enabled !== false && master?.prompt_task?.trim()) {
-      textBlocks.push('[TASK]\n' + master.prompt_task.trim())
-    }
-    if (master?.prompt_identity_transfer_enabled !== false && master?.prompt_identity_transfer?.trim()) {
-      textBlocks.push('[IDENTITY TRANSFER]\n' + master.prompt_identity_transfer.trim())
+      textBlocks.push(master.prompt_input.trim())
     }
 
-    const parsed = parseFullTrendPrompt(fullPromptText)
-    let scene = (parsed.scene || '').trim()
-    let style = (parsed.style || '').trim()
-    let avoid = (parsed.avoid || '').trim()
-    let composition = (parsed.composition || '').trim()
-    for (const [key, value] of Object.entries(config.variables || {})) {
-      scene = scene.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
-      style = style.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
-      avoid = avoid.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
-      composition = composition.replace(new RegExp(`{{${key}}}`, 'g'), String(value))
-    }
-    if (scene) textBlocks.push('[]\n' + scene)
-    if (style) textBlocks.push('[STYLE]\n' + style)
-    if (avoid) textBlocks.push('[AVOID]\n' + avoid)
-    if (composition) textBlocks.push('[COMPOSITION]\n' + composition)
-
-    const safetyText = (master?.safety_constraints ?? '').trim()
-    if (master?.safety_constraints_enabled !== false && safetyText) {
-      textBlocks.push('[SAFETY]\n' + safetyText)
-    }
+    const plainPrompt = fullPromptText.trim()
+    if (plainPrompt) textBlocks.push(plainPrompt)
 
     parts.push({ text: textBlocks.join('\n\n').trim() })
 
@@ -645,11 +773,10 @@ export default function PromptPlaygroundPage() {
       })
     }
 
-    const modelSupportsImageSize = (config.model || '').toLowerCase().includes('gemini-3')
     const imageConfig: Record<string, unknown> = {
       aspectRatio: config.aspect_ratio || '1:1',
     }
-    if (modelSupportsImageSize && config.image_size_tier) {
+    if (modelSupportsImageSize(config.model) && config.image_size_tier) {
       imageConfig.imageSize = config.image_size_tier
     }
 
@@ -1066,7 +1193,7 @@ export default function PromptPlaygroundPage() {
                     Полный промпт
                   </CardTitle>
                   <p className="text-xs text-muted-foreground">
-                    Можно вставить любой промпт. Маркеры [], [STYLE], [AVOID], [COMPOSITION] на отдельных строках разобьют текст на блоки.
+                    Чистый input без legacy-маркеров. Текст отправляется в Gemini как есть.
                   </p>
                 </CardHeader>
                 <CardContent>
@@ -1115,6 +1242,120 @@ export default function PromptPlaygroundPage() {
                       </>
                     )}
                   </Button>
+                  {isTesting && (
+                    <Button
+                      className="w-full mt-3"
+                      size="lg"
+                      variant="destructive"
+                      onClick={stopTestPrompt}
+                    >
+                      Остановить
+                    </Button>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Play className="w-5 h-5" />
+                    Prompt Variants (Parallel)
+                  </CardTitle>
+                  <p className="text-sm text-muted-foreground">
+                    Один набор фото + общая конфигурация + несколько промптов (до {MULTI_VARIANTS_MAX_COUNT}) в параллель.
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {promptVariants.map((prompt, idx) => (
+                    <div key={idx} className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <Label>Prompt {String.fromCharCode(65 + idx)}</Label>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => removePromptVariant(idx)}
+                          disabled={multiTestRunning || promptVariants.length <= 1}
+                        >
+                          Удалить
+                        </Button>
+                      </div>
+                      <textarea
+                        value={prompt}
+                        onChange={(e) => updatePromptVariant(idx, e.target.value)}
+                        placeholder={`Введите Prompt ${String.fromCharCode(65 + idx)}...`}
+                        className="w-full p-3 border rounded-md text-sm font-mono min-h-[90px]"
+                        rows={4}
+                        disabled={multiTestRunning}
+                      />
+                    </div>
+                  ))}
+
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      onClick={addPromptVariant}
+                      disabled={multiTestRunning || promptVariants.length >= MULTI_VARIANTS_MAX_COUNT}
+                    >
+                      Добавить промпт
+                    </Button>
+                    <div className="text-xs text-muted-foreground">
+                      {promptVariants.length} / {MULTI_VARIANTS_MAX_COUNT}
+                    </div>
+                  </div>
+
+                  <div>
+                    <Label>Параллельность (1–{MULTI_VARIANTS_MAX_COUNT})</Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={MULTI_VARIANTS_MAX_COUNT}
+                      value={multiConcurrency}
+                      onChange={(e) => {
+                        const v = parseInt(e.target.value, 10)
+                        setMultiConcurrency(Number.isFinite(v) ? clamp(Math.trunc(v), 1, MULTI_VARIANTS_MAX_COUNT) : MULTI_VARIANTS_DEFAULT_CONCURRENCY)
+                      }}
+                      disabled={multiTestRunning}
+                    />
+                  </div>
+
+                  {multiTestProgress !== null && (
+                    <div className="flex flex-col gap-1 w-full">
+                      <div className="flex justify-between text-xs text-muted-foreground">
+                        <span>Параллельный тест</span>
+                        <span>{multiTestProgress.current} из {multiTestProgress.total}</span>
+                      </div>
+                      <Progress
+                        value={multiTestProgress.total ? Math.round((multiTestProgress.current / multiTestProgress.total) * 100) : 0}
+                      />
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-2">
+                    <Button
+                      className="flex-1"
+                      onClick={runMultiPromptTest}
+                      disabled={multiTestRunning || inputAssets.length === 0}
+                    >
+                      {multiTestRunning ? (
+                        <>
+                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                          Запуск...
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-4 h-4 mr-2" />
+                          Запустить все
+                        </>
+                      )}
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      onClick={stopMultiPromptTest}
+                      disabled={!multiTestRunning}
+                    >
+                      Остановить все
+                    </Button>
+                  </div>
                 </CardContent>
               </Card>
             </div>
@@ -1222,6 +1463,69 @@ export default function PromptPlaygroundPage() {
                   </Card>
                 </TabsContent>
               </Tabs>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Parallel Prompt Results</CardTitle>
+                  <p className="text-sm text-muted-foreground">
+                    Единое окно сравнения результатов по каждому промпту.
+                  </p>
+                </CardHeader>
+                <CardContent>
+                  {multiVariantResults.length === 0 ? (
+                    <div className="text-center text-gray-500 py-8">
+                      Запустите Prompt Variants, чтобы увидеть карточки результатов.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {multiVariantResults.map((row) => (
+                        <div key={row.variantId} className="border rounded-md p-3 space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="font-semibold">{row.promptLabel}</div>
+                            <span
+                              className={`text-xs px-2 py-1 rounded ${
+                                row.status === 'success'
+                                  ? 'bg-green-100 text-green-700'
+                                  : row.status === 'error'
+                                    ? 'bg-red-100 text-red-700'
+                                    : row.status === 'running'
+                                      ? 'bg-blue-100 text-blue-700'
+                                      : 'bg-muted text-muted-foreground'
+                              }`}
+                            >
+                              {row.status}
+                            </span>
+                          </div>
+                          <div className="text-xs text-muted-foreground line-clamp-3 whitespace-pre-wrap">
+                            {row.prompt || '—'}
+                          </div>
+                          {row.duration != null && (
+                            <div className="text-xs text-muted-foreground">
+                              Длительность: {row.duration.toFixed(2)} с
+                            </div>
+                          )}
+                          {row.error && (
+                            <div className="text-xs text-destructive">{row.error}</div>
+                          )}
+                          {row.imageUrls && row.imageUrls.length > 0 && (
+                            <div className="grid grid-cols-2 gap-2">
+                              {row.imageUrls.map((url, idx) => (
+                                <img
+                                  key={`${row.variantId}_${idx}`}
+                                  src={url}
+                                  alt={`${row.promptLabel} candidate ${idx + 1}`}
+                                  className="w-full rounded border cursor-zoom-in max-h-40 object-contain bg-muted/20"
+                                  onClick={() => setZoomImageUrl(url)}
+                                />
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
             </div>
           </div>
         </TabsContent>

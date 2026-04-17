@@ -1,0 +1,18 @@
+{
+  "asset_id": "5eb33fd0-310c-43a4-8f1c-0b0112f73b99",
+  "status": "ready_fallback",
+  "faces_detected": 0,
+  "signature_ok": true,
+  "staged_source_host": "/root/ai_slop_2/data/generated_images/face_id_probe/source/5eb33fd0-310c-43a4-8f1c-0b0112f73b99.jpg",
+  "source_path_sent_to_api": "/data/generated_images/face_id_probe/source/5eb33fd0-310c-43a4-8f1c-0b0112f73b99.jpg",
+  "source_saved": false,
+  "selected_saved": false,
+  "selected_path": "/data/generated_images/face_id_probe/source/5eb33fd0-310c-43a4-8f1c-0b0112f73b99.jpg",
+  "source_path": "/data/generated_images/face_id_probe/source/5eb33fd0-310c-43a4-8f1c-0b0112f73b99.jpg",
+  "detector_meta": {
+    "latency_ms": 132,
+    "model_version": "mediapipe-face-detection-v1",
+    "reason": "no_face"
+  },
+  "output_dir": "/root/ai_slop_2/reports/face_id_batch_report/20260330_203949/probe_raw/5eb33fd0-310c-43a4-8f1c-0b0112f73b99"
+}

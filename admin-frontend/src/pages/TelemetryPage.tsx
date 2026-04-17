@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { telemetryService } from '@/services/api'
 import { TelemetryOverviewV3 } from '@/components/telemetry/TelemetryOverviewV3'
@@ -43,13 +42,6 @@ import {
 } from 'recharts'
 
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899']
-
-const WINDOW_OPTIONS = [
-  { hours: 6, label: '6ч' },
-  { hours: 24, label: '24ч' },
-  { hours: 72, label: '3д' },
-  { hours: 168, label: '7д' },
-] as const
 
 type TrendAnalyticsItem = {
   trend_id: string
@@ -134,22 +126,79 @@ const FUNNEL_LABELS: Record<string, string> = {
   hd_delivered: '4K доставлен',
 }
 
+const FUNNEL_ORDER: string[] = [
+  'bot_started',
+  'photo_uploaded',
+  'take_preview_ready',
+  'favorite_selected',
+  'paywall_viewed',
+  'pack_selected',
+  'pay_initiated',
+  'pay_success',
+  'hd_delivered',
+]
+
+const FUNNEL_HISTORY_SERIES: string[] = [
+  'bot_started',
+  'photo_uploaded',
+  'take_preview_ready',
+  'favorite_selected',
+  'pay_success',
+  'hd_delivered',
+]
+
 const BUTTON_CLICK_LABELS: Record<string, string> = {
   pay_yoomoney: 'Оплатить через ЮMoney',
   pay_yoomoney_link: 'Оплатить по ссылке (ЮMoney)',
   pay_stars: 'Купить через Stars',
   pay_other: 'Другие способы оплаты',
   bank_transfer: 'Перевод на карту',
+  bank_transfer_cancel: 'Отмена перевода на карту',
+  bank_receipt_uploaded: 'Загрузка чека перевода',
   nav_menu: 'В меню',
+  nav_themes: 'Навигация: темы',
+  nav_trends: 'Навигация: тренды',
+  nav_profile: 'Навигация: профиль',
   pack_trial: 'Пакет: Пробный',
   pack_neo_start: 'Пакет: Neo Start',
   pack_neo_pro: 'Пакет: Neo Pro',
   pack_neo_unlimited: 'Пакет: Neo Unlimited',
+  shop_open_tariff_better: 'Открыть тариф Better',
+  shop_how_buy_stars: 'Как купить Stars',
+  unlock_check: 'Проверка разблокировки',
+  pack_check: 'Проверка пакета',
+  session_status: 'Статус сессии',
   variant_a: 'Вариант A',
   variant_b: 'Вариант B',
   variant_c: 'Вариант C',
   take_more: 'Все 3 не подходят / Ещё фото',
   open_favorites: 'Избранное',
+  favorites_clear_all: 'Избранное: очистить всё',
+  remove_fav: 'Избранное: удалить вариант',
+  select_hd: 'Избранное: выбрать 4K',
+  deselect_hd: 'Избранное: снять 4K',
+  hd_problem: 'Проблема с 4K',
+  unlock_resend: 'Повтор отправки unlock',
+  menu_shop: 'Меню: магазин',
+  menu_create_photo: 'Меню: создать фото',
+  menu_copy_style: 'Меню: копировать стиль',
+  menu_merge_photos: 'Меню: merge фото',
+  menu_profile: 'Меню: профиль',
+  profile_payment: 'Профиль: оплата',
+  profile_support: 'Профиль: поддержка',
+  referral_status: 'Рефералы: статус',
+  referral_back_profile: 'Рефералы: назад в профиль',
+  theme_selected: 'Выбор темы',
+  custom_prompt_submitted: 'Своя идея: отправлен промпт',
+  format_selected: 'Выбор формата',
+  rescue_photo_uploaded: 'Rescue: фото загружено',
+  regenerate: 'Перегенерация',
+  help: 'Помощь',
+  trends: 'Тренды',
+  cancel: 'Отмена',
+  deletemydata: 'Удалить мои данные',
+  paysupport: 'Поддержка оплаты',
+  terms: 'Условия',
 }
 
 const TELEMETRY_OVERVIEW_V3_ENABLED = ['1', 'true', 'yes'].includes(
@@ -157,10 +206,11 @@ const TELEMETRY_OVERVIEW_V3_ENABLED = ['1', 'true', 'yes'].includes(
     .trim()
     .toLowerCase()
 )
+const PRODUCT_ALL_TIME = true
 
 export function TelemetryPage() {
-  const [windowHours, setWindowHours] = useState(24)
-  const [productWindowDays, setProductWindowDays] = useState(7)
+  const windowHours = 24
+  const productWindowDays = undefined
 
   const { data, isLoading, refetch, isFetching } = useQuery<TelemetryDashboardData>({
     queryKey: ['telemetry', windowHours],
@@ -180,14 +230,8 @@ export function TelemetryPage() {
   })
 
   const { data: productFunnel } = useQuery({
-    queryKey: ['telemetry-product-funnel', productWindowDays],
-    queryFn: () => telemetryService.getProductFunnel(productWindowDays),
-  })
-
-  const { data: telemetryHealth } = useQuery({
-    queryKey: ['telemetry-health', productWindowDays],
-    queryFn: () => telemetryService.getHealth(productWindowDays),
-    refetchInterval: 60000,
+    queryKey: ['telemetry-product-funnel', 'all-time'],
+    queryFn: () => telemetryService.getProductFunnel(productWindowDays, PRODUCT_ALL_TIME),
   })
 
   const {
@@ -195,23 +239,23 @@ export function TelemetryPage() {
     isError: funnelHistoryError,
     isLoading: funnelHistoryLoading,
   } = useQuery({
-    queryKey: ['telemetry-product-funnel-history', productWindowDays],
-    queryFn: () => telemetryService.getProductFunnelHistory(productWindowDays),
+    queryKey: ['telemetry-product-funnel-history', 'all-time'],
+    queryFn: () => telemetryService.getProductFunnelHistory(productWindowDays, PRODUCT_ALL_TIME),
   })
 
   const { data: buttonClicksData, isError: buttonClicksError } = useQuery({
-    queryKey: ['telemetry-button-clicks', productWindowDays],
-    queryFn: () => telemetryService.getButtonClicks(productWindowDays),
+    queryKey: ['telemetry-button-clicks', 'all-time'],
+    queryFn: () => telemetryService.getButtonClicks(productWindowDays, PRODUCT_ALL_TIME),
   })
 
   const { data: productMetricsV2 } = useQuery({
-    queryKey: ['telemetry-product-metrics-v2', productWindowDays],
-    queryFn: () => telemetryService.getProductMetricsV2(productWindowDays),
+    queryKey: ['telemetry-product-metrics-v2', 'all-time'],
+    queryFn: () => telemetryService.getProductMetricsV2(productWindowDays, PRODUCT_ALL_TIME),
   })
 
   const { data: revenueData } = useQuery({
-    queryKey: ['telemetry-revenue', productWindowDays],
-    queryFn: () => telemetryService.getRevenue(productWindowDays),
+    queryKey: ['telemetry-revenue', 'all-time'],
+    queryFn: () => telemetryService.getRevenue(productWindowDays, PRODUCT_ALL_TIME),
   })
 
   const errorsWindowDays = 30
@@ -226,8 +270,8 @@ export function TelemetryPage() {
     isLoading: pathLoading,
     isError: pathError,
   } = useQuery({
-    queryKey: ['telemetry-path', productWindowDays, 20],
-    queryFn: () => telemetryService.getPath(productWindowDays, 20),
+    queryKey: ['telemetry-path', 'all-time', 20],
+    queryFn: () => telemetryService.getPath(productWindowDays, 20, PRODUCT_ALL_TIME),
   })
   const pathTransitionsData = pathData
     ? {
@@ -269,15 +313,6 @@ export function TelemetryPage() {
       ]
     : []
 
-  const qualityWarnings = Array.from(
-    new Set([
-      ...(telemetryHealth?.quality_warnings ?? []),
-      ...(productFunnel?.quality_warnings ?? []),
-      ...(funnelHistoryData?.quality_warnings ?? []),
-      ...(buttonClicksData?.quality_warnings ?? []),
-      ...(revenueData?.quality_warnings ?? []),
-    ])
-  )
   const unknownButtonIds = new Set(
     Object.keys(buttonClicksData?.unknown_by_button_id ?? {})
   )
@@ -285,6 +320,43 @@ export function TelemetryPage() {
     ([buttonId]) => !unknownButtonIds.has(buttonId)
   )
   const hasUnknownButtons = unknownButtonIds.size > 0
+  const knownButtonRows = knownButtonEntries
+    .map(([buttonId, count]) => ({
+      buttonId,
+      label: BUTTON_CLICK_LABELS[buttonId] ?? buttonId,
+      clicks: Number(count ?? 0),
+      users: Number(buttonClicksData?.by_button_id_users?.[buttonId] ?? 0),
+    }))
+    .sort((a, b) => b.clicks - a.clicks)
+  const buttonTopRows = knownButtonRows.slice(0, 16)
+  const buttonTopChartRows = knownButtonRows.slice(0, 10).map((row) => ({
+    label: row.label.length > 28 ? `${row.label.slice(0, 28)}…` : row.label,
+    clicks: row.clicks,
+  }))
+  const totalKnownClicks = knownButtonRows.reduce((acc, row) => acc + row.clicks, 0)
+  const totalKnownUsersByButtons = knownButtonRows.reduce((acc, row) => acc + row.users, 0)
+  const unknownClicks = Object.values(buttonClicksData?.unknown_by_button_id ?? {}).reduce(
+    (acc, value) => acc + Number(value ?? 0),
+    0
+  )
+
+  const funnelCounts = productFunnel?.funnel_counts ?? {}
+  const funnelStepRows = FUNNEL_ORDER.map((stepKey, index) => {
+    const count = Number(funnelCounts[stepKey] ?? 0)
+    const prev = index > 0 ? Number(funnelCounts[FUNNEL_ORDER[index - 1]] ?? 0) : count
+    const conversion = index === 0 ? 100 : prev > 0 ? Math.round((count / prev) * 100) : 0
+    return {
+      stepKey,
+      label: FUNNEL_LABELS[stepKey] ?? stepKey,
+      count,
+      conversion,
+    }
+  })
+  const funnelStartUsers = funnelStepRows[0]?.count ?? 0
+  const funnelPhotoUsers = funnelStepRows.find((r) => r.stepKey === 'photo_uploaded')?.count ?? 0
+  const funnelPayClicked = funnelStepRows.find((r) => r.stepKey === 'pay_initiated')?.count ?? 0
+  const funnelNoPhotoUsers = Math.max(0, funnelStartUsers - funnelPhotoUsers)
+  const funnelNoPhotoPct = funnelStartUsers > 0 ? Math.round((funnelNoPhotoUsers / funnelStartUsers) * 100) : 0
 
   return (
     <div className="space-y-8 pb-8">
@@ -295,87 +367,22 @@ export function TelemetryPage() {
             Аналитика продукта
           </h1>
           <p className="text-muted-foreground mt-2">
-            Комплексная аналитика пользователей, вовлечённости и здоровья продукта
+            Ключевые метрики и воронка за всё время
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <div className="flex rounded-lg border bg-background p-1 shadow-sm">
-            {WINDOW_OPTIONS.map((opt) => (
-              <Button
-                key={opt.hours}
-                variant={windowHours === opt.hours ? 'default' : 'ghost'}
-                size="sm"
-                onClick={() => setWindowHours(opt.hours)}
-                className="text-xs"
-              >
-                {opt.label}
-              </Button>
-            ))}
-          </div>
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={() => refetch()}
-            disabled={isFetching}
-          >
-            <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
-          </Button>
-        </div>
-      </div>
-
-      {!TELEMETRY_OVERVIEW_V3_ENABLED && (
-        <>
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge
-              variant={
-                telemetryHealth == null
-                  ? 'outline'
-                  : telemetryHealth.status === 'ok'
-                  ? 'secondary'
-                  : 'destructive'
-              }
+        {!TELEMETRY_OVERVIEW_V3_ENABLED && (
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => refetch()}
+              disabled={isFetching}
             >
-              {telemetryHealth == null
-                ? 'Quality: Loading...'
-                : telemetryHealth.status === 'ok'
-                ? 'Quality: OK'
-                : 'Quality: Degraded'}
-            </Badge>
-            <Badge variant="outline">Источник: audit_logs</Badge>
-            {typeof telemetryHealth?.data_quality?.funnel_session_coverage_pct === 'number' && (
-              <Badge variant="outline">
-                Session coverage: {telemetryHealth.data_quality.funnel_session_coverage_pct}%
-              </Badge>
-            )}
-            {typeof telemetryHealth?.data_quality?.button_id_coverage_pct === 'number' && (
-              <Badge variant="outline">
-                Button coverage: {telemetryHealth.data_quality.button_id_coverage_pct}%
-              </Badge>
-            )}
+              <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+            </Button>
           </div>
-
-          {qualityWarnings.length > 0 && (
-            <Card className="border-amber-500/50 bg-amber-500/10">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <AlertCircle className="h-4 w-4" />
-                  Внимание к качеству данных
-                </CardTitle>
-                <CardDescription>
-                  Система показывает предупреждения сбора. Решения по продукту лучше принимать с учётом этих ограничений.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="pt-0">
-                <div className="space-y-1 text-sm">
-                  {qualityWarnings.map((w) => (
-                    <p key={w} className="text-amber-900 dark:text-amber-200">{w}</p>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
-          )}
-        </>
-      )}
+        )}
+      </div>
 
       <Tabs defaultValue="overview" className="space-y-6">
         <TabsList className="grid w-full grid-cols-4 lg:grid-cols-8 lg:w-auto lg:flex-wrap">
@@ -435,7 +442,7 @@ export function TelemetryPage() {
                   <MetricCard
                     title="Preview → Pay"
                     value={`${productMetricsV2.preview_to_pay_pct ?? 0}%`}
-                    subtitle={`${productWindowDays} д.`}
+                    subtitle="Все время"
                     icon={Target}
                     color="bg-cyan-500"
                   />
@@ -741,67 +748,61 @@ export function TelemetryPage() {
 
         {/* FUNNEL */}
         <TabsContent value="funnel" className="space-y-6">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-sm text-muted-foreground">Окно (сводка и история):</span>
-            {[7, 14, 30, 90].map((d) => (
-              <Button
-                key={d}
-                variant={productWindowDays === d ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setProductWindowDays(d)}
-              >
-                {d} д.
-              </Button>
-            ))}
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+            <MetricCard
+              title="Стартовали"
+              value={formatNumber(funnelStartUsers)}
+              subtitle="Уникальные пользователи"
+              icon={Users}
+              color="bg-blue-500"
+            />
+            <MetricCard
+              title="Нажали оплату"
+              value={formatNumber(funnelPayClicked)}
+              subtitle="Шаг pay_initiated"
+              icon={Target}
+              color="bg-cyan-500"
+            />
+            <MetricCard
+              title="Не дошли до фото"
+              value={formatNumber(funnelNoPhotoUsers)}
+              subtitle={`${funnelNoPhotoPct}% от старта`}
+              icon={AlertCircle}
+              color="bg-orange-500"
+            />
+            <MetricCard
+              title="4K доставлен"
+              value={formatNumber(funnelStepRows.find((r) => r.stepKey === 'hd_delivered')?.count ?? 0)}
+              subtitle="Завершённые сессии"
+              icon={CheckCircle}
+              color="bg-green-500"
+            />
           </div>
           <Card>
             <CardHeader>
               <CardTitle>Воронка продукта</CardTitle>
-              <CardDescription>
-                Уникальные пользователи по шагам (хотя бы одно событие за {productWindowDays} д.). Источник: audit_logs (action/user_id/session_id). Выбор тарифа — нажатие на любой пакет (Stars, ЮMoney, перевод на карту). Ниже — историческая динамика по дням.
-              </CardDescription>
+              <CardDescription>За всё время, без разбиений по окнам. Ключевые шаги и конверсия между шагами.</CardDescription>
             </CardHeader>
             <CardContent>
               {productFunnel?.funnel_counts ? (
-                <div className="flex flex-wrap gap-4 items-end">
-                  {Object.entries(productFunnel.funnel_counts).map(([key, count]) => (
-                    <div key={key} className="flex flex-col items-center gap-1">
-                      <div className="text-xs text-muted-foreground whitespace-nowrap">
-                        {FUNNEL_LABELS[key] ?? key}
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {funnelStepRows.map((row, idx) => (
+                    <div key={row.stepKey} className="rounded-xl border bg-background/60 p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="text-sm font-medium">{row.label}</div>
+                        <Badge variant={idx === 0 ? 'secondary' : row.conversion >= 40 ? 'secondary' : 'outline'}>
+                          {row.conversion}%
+                        </Badge>
                       </div>
-                      <div className="bg-primary/20 rounded-t px-3 py-2 min-w-[80px] text-center min-h-[40px]">
-                        <span className="font-semibold">{formatNumber(count as number)}</span>
+                      <div className="mt-3 text-2xl font-semibold">{formatNumber(row.count)}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {idx === 0 ? 'Базовый шаг' : `Конверсия от «${funnelStepRows[idx - 1]?.label ?? 'пред. шага'}»`}
                       </div>
                     </div>
                   ))}
                 </div>
               ) : (
-                <p className="text-muted-foreground">Нет данных за период.</p>
-              )}
-
-              {productFunnel?.shadow_funnel_counts && (
-                <div className="mt-6 rounded-md border">
-                  <div className="border-b bg-muted/50 px-3 py-2 text-sm font-medium">
-                    Shadow compare (legacy vs session-required)
-                  </div>
-                  <div className="p-3 space-y-2">
-                    {Object.keys(productFunnel.funnel_counts ?? {}).map((key) => {
-                      const legacy = Number(productFunnel.funnel_counts?.[key] ?? 0)
-                      const shadow = Number(productFunnel.shadow_funnel_counts?.[key] ?? 0)
-                      const diff = Number(productFunnel.diff_funnel_counts?.[key] ?? 0)
-                      return (
-                        <div key={key} className="grid grid-cols-4 gap-2 text-xs">
-                          <span>{FUNNEL_LABELS[key] ?? key}</span>
-                          <span className="text-muted-foreground">legacy: {legacy}</span>
-                          <span className="text-muted-foreground">shadow: {shadow}</span>
-                          <span className={diff < 0 ? 'text-destructive' : 'text-muted-foreground'}>
-                            Δ {diff}
-                          </span>
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
+                <p className="text-muted-foreground">Нет данных.</p>
               )}
             </CardContent>
           </Card>
@@ -817,14 +818,12 @@ export function TelemetryPage() {
           {/* Исторические данные: динамика воронки по дням (product_events) */}
           <Card>
             <CardHeader>
-              <CardTitle>Динамика воронки за {funnelHistoryData?.window_days ?? productWindowDays} д.</CardTitle>
-              <CardDescription>
-                Уникальные пользователи по шагам по дням (исторические данные из audit_logs, даты в UTC). Учитывайте историю при оценке конверсии.
-              </CardDescription>
+              <CardTitle>Динамика воронки (всё время)</CardTitle>
+              <CardDescription>История ключевых шагов: старт, фото, превью, выбор, оплата, 4K.</CardDescription>
             </CardHeader>
             <CardContent>
               {funnelHistoryError ? (
-                <p className="text-destructive">Ошибка загрузки истории. Обновите страницу или выберите другое окно.</p>
+                <p className="text-destructive">Ошибка загрузки истории. Обновите страницу и повторите запрос.</p>
               ) : funnelHistoryLoading ? (
                 <div className="h-[340px] flex items-center justify-center text-muted-foreground">
                   Загрузка истории…
@@ -847,7 +846,7 @@ export function TelemetryPage() {
                         }}
                       />
                       <Legend wrapperStyle={{ fontSize: '11px' }} />
-                      {Object.keys(FUNNEL_LABELS).map((dataKey, idx) => (
+                      {FUNNEL_HISTORY_SERIES.map((dataKey, idx) => (
                         <Line
                           key={dataKey}
                           type="monotone"
@@ -864,7 +863,7 @@ export function TelemetryPage() {
                 </div>
               ) : (
                 <p className="text-muted-foreground py-8 text-center">
-                  Нет исторических данных по дням за выбранный период. Выберите окно 30 или 90 д. или подождите накопления событий.
+                  Нет исторических данных.
                 </p>
               )}
             </CardContent>
@@ -873,23 +872,11 @@ export function TelemetryPage() {
 
         {/* PATH — переходы и типичные пути */}
         <TabsContent value="path" className="space-y-6">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-sm text-muted-foreground">Окно:</span>
-            {[7, 14, 30, 90].map((d) => (
-              <Button
-                key={d}
-                variant={productWindowDays === d ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setProductWindowDays(d)}
-              >
-                {d} д.
-              </Button>
-            ))}
-          </div>
+          <div className="text-sm text-muted-foreground">Сбор за всё время</div>
 
           {pathData?.truncated && (
             <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-2 text-sm text-amber-800 dark:text-amber-200">
-              Данные обрезаны по лимиту строк. Уменьшите окно (например 7 или 14 д.), чтобы получить полную выборку.
+              Данные обрезаны лимитом строк. Показана частичная выборка, но тренд остаётся репрезентативным.
             </div>
           )}
           {(Number(pathTransitionsData?.data_quality?.excluded_without_session_events ?? 0) > 0) && (
@@ -906,14 +893,14 @@ export function TelemetryPage() {
                 Переходы между шагами
               </CardTitle>
               <CardDescription>
-                Переходы между шагами воронки за {pathTransitionsData?.window_days ?? productWindowDays} д. Сессий на переход, медиана и среднее времени в минутах от предыдущего шага.
+                Переходы между шагами воронки за всё время. Сессий на переход, медиана и среднее времени в минутах от предыдущего шага.
               </CardDescription>
             </CardHeader>
             <CardContent>
               {pathLoading ? (
                 <div className="py-8 text-center text-muted-foreground">Загрузка…</div>
               ) : pathError ? (
-                <p className="py-8 text-center text-destructive">Ошибка загрузки. Обновите страницу или выберите другое окно.</p>
+                <p className="py-8 text-center text-destructive">Ошибка загрузки. Обновите страницу и повторите запрос.</p>
               ) : (pathTransitionsData?.transitions?.length ?? 0) > 0 ? (
                 <div className="rounded-md border">
                   <table className="w-full text-sm">
@@ -940,7 +927,7 @@ export function TelemetryPage() {
                   </table>
                 </div>
               ) : (
-                <p className="text-muted-foreground">Нет данных за период.</p>
+                <p className="text-muted-foreground">Нет данных.</p>
               )}
             </CardContent>
           </Card>
@@ -985,14 +972,14 @@ export function TelemetryPage() {
                 Типичные пути
               </CardTitle>
               <CardDescription>
-                Топ-20 последовательностей шагов за {pathSequencesData?.window_days ?? productWindowDays} д. Медиана времени до оплаты и до последнего шага (мин), доля дошедших до оплаты.
+                Топ-20 последовательностей шагов за всё время. Медиана времени до оплаты и до последнего шага (мин), доля дошедших до оплаты.
               </CardDescription>
             </CardHeader>
             <CardContent>
               {pathLoading ? (
                 <div className="py-8 text-center text-muted-foreground">Загрузка…</div>
               ) : pathError ? (
-                <p className="py-8 text-center text-destructive">Ошибка загрузки. Обновите страницу или выберите другое окно.</p>
+                <p className="py-8 text-center text-destructive">Ошибка загрузки. Обновите страницу и повторите запрос.</p>
               ) : (pathSequencesData?.paths?.length ?? 0) > 0 ? (
                 <div className="rounded-md border overflow-x-auto">
                   <table className="w-full text-sm min-w-[640px]">
@@ -1023,7 +1010,7 @@ export function TelemetryPage() {
                   </table>
                 </div>
               ) : (
-                <p className="text-muted-foreground">Нет данных за период.</p>
+                <p className="text-muted-foreground">Нет данных.</p>
               )}
             </CardContent>
           </Card>
@@ -1031,65 +1018,84 @@ export function TelemetryPage() {
 
         {/* BUTTON CLICKS */}
         <TabsContent value="buttons" className="space-y-6">
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">Окно:</span>
-            {[7, 14, 30].map((d) => (
-              <Button
-                key={d}
-                variant={productWindowDays === d ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setProductWindowDays(d)}
-              >
-                {d} д.
-              </Button>
-            ))}
-          </div>
           <Card>
             <CardHeader>
               <CardTitle>Клики по кнопкам</CardTitle>
-              <CardDescription>
-                События button_click за {buttonClicksData?.window_days ?? productWindowDays} д. Источник: audit_logs.payload.button_id.
-              </CardDescription>
+              <CardDescription>Все события button_click за всё время: какие кнопки нажимают и сколько людей их используют.</CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="mb-3 flex flex-wrap gap-2">
-                {typeof buttonClicksData?.data_quality?.button_id_coverage_pct === 'number' && (
-                  <Badge variant="outline">
-                    Coverage: {buttonClicksData.data_quality.button_id_coverage_pct}%
-                  </Badge>
-                )}
-                {typeof buttonClicksData?.data_quality?.unknown_button_id_events === 'number' && (
-                  <Badge variant="outline">
-                    Unknown IDs: {buttonClicksData.data_quality.unknown_button_id_events}
-                  </Badge>
-                )}
-              </div>
               {buttonClicksError ? (
-                <p className="text-destructive">Ошибка загрузки. Обновите страницу или выберите другое окно.</p>
-              ) : knownButtonEntries.length > 0 || hasUnknownButtons ? (
-                <div className="space-y-4">
-                  {knownButtonEntries.length > 0 && (
+                <p className="text-destructive">Ошибка загрузки. Обновите страницу и повторите запрос.</p>
+              ) : knownButtonRows.length > 0 || hasUnknownButtons ? (
+                <div className="space-y-6">
+                  <div className="grid gap-4 md:grid-cols-3">
+                    <MetricCard
+                      title="Клики по известным кнопкам"
+                      value={formatNumber(totalKnownClicks)}
+                      subtitle="Реальные клики"
+                      icon={Activity}
+                      color="bg-blue-500"
+                    />
+                    <MetricCard
+                      title="Суммарный user-touch"
+                      value={formatNumber(totalKnownUsersByButtons)}
+                      subtitle="Сумма уникальных по кнопкам"
+                      icon={Users}
+                      color="bg-cyan-500"
+                    />
+                    <MetricCard
+                      title="Неклассифицировано"
+                      value={formatNumber(unknownClicks)}
+                      subtitle="unknown button_id"
+                      icon={AlertCircle}
+                      color="bg-orange-500"
+                    />
+                  </div>
+
+                  {buttonTopChartRows.length > 0 && (
+                    <Card className="border-dashed">
+                      <CardHeader>
+                        <CardTitle className="text-base">Топ-10 кнопок</CardTitle>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="h-[300px]">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={buttonTopChartRows} layout="vertical" margin={{ top: 0, right: 16, left: 16, bottom: 0 }}>
+                              <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                              <XAxis type="number" tick={{ fontSize: 11 }} />
+                              <YAxis type="category" dataKey="label" width={180} tick={{ fontSize: 11 }} />
+                              <Tooltip />
+                              <Bar dataKey="clicks" name="Кликов" fill="#2563eb" radius={[0, 8, 8, 0]} />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )}
+
+                  {buttonTopRows.length > 0 && (
                     <div className="rounded-md border">
                       <table className="w-full text-sm">
                         <thead>
                           <tr className="border-b bg-muted/50">
                             <th className="text-left p-3 font-medium">Кнопка</th>
                             <th className="text-right p-3 font-medium">Кликов</th>
+                            <th className="text-right p-3 font-medium">Уник. пользователей</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {knownButtonEntries
-                            .sort(([, a], [, b]) => (b as number) - (a as number))
-                            .map(([buttonId, count]) => (
-                              <tr key={buttonId} className="border-b last:border-0">
-                                <td className="p-3">{BUTTON_CLICK_LABELS[buttonId] ?? buttonId}</td>
-                                <td className="p-3 text-right font-medium">{formatNumber(count as number)}</td>
-                              </tr>
-                            ))}
+                          {buttonTopRows.map((row) => (
+                            <tr key={row.buttonId} className="border-b last:border-0">
+                              <td className="p-3">{row.label}</td>
+                              <td className="p-3 text-right font-medium">{formatNumber(row.clicks)}</td>
+                              <td className="p-3 text-right">{formatNumber(row.users)}</td>
+                            </tr>
+                          ))}
                         </tbody>
                       </table>
                     </div>
                   )}
+
                   {hasUnknownButtons && buttonClicksData?.unknown_by_button_id && (
                     <div className="rounded-md border border-amber-500/50">
                       <div className="border-b bg-amber-500/10 px-3 py-2 text-sm font-medium">
@@ -1117,7 +1123,7 @@ export function TelemetryPage() {
                   )}
                 </div>
               ) : (
-                <p className="text-muted-foreground">Нет данных за период.</p>
+                <p className="text-muted-foreground">Нет данных.</p>
               )}
             </CardContent>
           </Card>
@@ -1239,43 +1245,13 @@ export function TelemetryPage() {
 
         {/* REVENUE */}
         <TabsContent value="revenue" className="space-y-6">
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">Окно:</span>
-            {[7, 14, 30].map((d) => (
-              <Button
-                key={d}
-                variant={productWindowDays === d ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setProductWindowDays(d)}
-              >
-                {d} д.
-              </Button>
-            ))}
-          </div>
+          <div className="text-sm text-muted-foreground">Сбор за всё время</div>
           {revenueData != null ? (
             <>
-              <div className="flex flex-wrap gap-2">
-                <Badge variant="outline">Источник: audit_logs.pay_success</Badge>
-                {typeof revenueData?.data_quality?.valid_price_pct === 'number' && (
-                  <Badge variant="outline">
-                    Valid price: {revenueData.data_quality.valid_price_pct}%
-                  </Badge>
-                )}
-                {typeof revenueData?.data_quality?.invalid_price_events === 'number' && (
-                  <Badge variant="outline">
-                    Invalid price events: {revenueData.data_quality.invalid_price_events}
-                  </Badge>
-                )}
-              </div>
-              {(revenueData.quality_warnings?.length ?? 0) > 0 && (
-                <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-2 text-sm text-amber-800 dark:text-amber-200">
-                  {revenueData.quality_warnings?.join(' ')}
-                </div>
-              )}
               <div className="grid gap-4 md:grid-cols-3">
-                <MetricCard title="Выручка (Stars)" value={formatNumber(revenueData.total_stars ?? 0)} subtitle={`за ${revenueData.window_days} д.`} icon={TrendingUp} color="bg-green-500" />
+                <MetricCard title="Выручка (Stars)" value={formatNumber(revenueData.total_stars ?? 0)} subtitle="Всё время" icon={TrendingUp} color="bg-green-500" />
                 <MetricCard title="Выручка (₽)" value={formatNumber(revenueData.revenue_rub_approx ?? 0)} subtitle="приблизительно" icon={Activity} color="bg-success" />
-                <MetricCard title="Окно" value={`${revenueData.window_days} д.`} subtitle="" icon={Clock} color="bg-blue-500" />
+                <MetricCard title="Оплаченных событий" value={formatNumber(Number(revenueData.data_quality?.pay_success_events ?? 0))} subtitle="pay_success" icon={CheckCircle} color="bg-blue-500" />
               </div>
               <Card>
                 <CardHeader>

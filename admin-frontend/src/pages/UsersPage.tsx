@@ -19,22 +19,12 @@ import { formatDateShort, formatNumber } from '@/lib/utils'
 import {
   Search,
   Download,
-  Users,
-  Crown,
-  BarChart3,
-  Activity,
-  Zap,
   Clock,
   Shield,
   UserCircle,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import {
-  AreaChart,
-  Area,
-  PieChart,
-  Pie,
-  Cell,
   BarChart,
   Bar,
   XAxis,
@@ -55,51 +45,6 @@ function useDebounced<T>(value: T, delay: number): T {
     return () => clearTimeout(t)
   }, [value, delay])
   return debounced
-}
-
-function MetricCard({
-  title,
-  value,
-  icon: Icon,
-  subtitle,
-  variant = 'default',
-}: {
-  title: string
-  value: string | number
-  icon: React.ComponentType<{ className?: string }>
-  subtitle?: string
-  variant?: 'default' | 'success' | 'warning' | 'info'
-}) {
-  const styles = {
-    default: 'bg-sky-500/10',
-    success: 'bg-success/10',
-    warning: 'bg-warning/10',
-    info: 'bg-violet-500/10',
-  }
-  return (
-    <Card className="overflow-hidden border-border/80 transition-shadow hover:shadow-md">
-      <CardContent className="p-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0 flex-1">
-            <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-              {title}
-            </p>
-            <p className="mt-1 text-2xl font-bold tabular-nums tracking-tight text-foreground">
-              {typeof value === 'number' ? formatNumber(value) : value}
-            </p>
-            {subtitle && (
-              <p className="mt-0.5 text-xs text-muted-foreground">{subtitle}</p>
-            )}
-          </div>
-          <div
-            className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${styles[variant]}`}
-          >
-            <Icon className="h-5 w-5 text-foreground/70" />
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  )
 }
 
 function TableRowSkeleton({ cols = 10 }: { cols?: number }) {
@@ -166,7 +111,6 @@ export function UsersPage() {
   const [paymentsCountMin, setPaymentsCountMin] = useState('')
   const [sortBy, setSortBy] = useState<string>('created_at')
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
-  const [timeWindow, setTimeWindow] = useState<number>(30)
 
   const search = useDebounced(searchInput.trim(), SEARCH_DEBOUNCE_MS)
 
@@ -200,38 +144,26 @@ export function UsersPage() {
   })
 
   const { data: analytics, isError: analyticsError } = useQuery({
-    queryKey: ['users-analytics', timeWindow],
-    queryFn: () => usersService.getAnalytics(String(timeWindow)),
+    queryKey: ['users-analytics', 'all'],
+    queryFn: () => usersService.getAnalytics('all'),
   })
 
   const handleExport = () => {
     if (data?.items?.length) exportUsersToCsv(data.items)
   }
 
-  const CHART_COLORS = [
-    'hsl(var(--primary))',
-    '#10b981',
-    '#f59e0b',
-    '#ef4444',
-    '#8b5cf6',
-    '#ec4899',
-  ]
-  const activitySegmentsRaw = analytics?.activity_segments || []
   const totalUsersForPct = analytics?.overview?.total_users ?? 0
-  const activityData = activitySegmentsRaw.map((s: any) => ({
-    name: s.segment,
-    users: s.users,
-    pct: totalUsersForPct ? Math.round((s.users / totalUsersForPct) * 100) : 0,
-  }))
+  const usersWithThreeVariants = Number(analytics?.overview?.users_with_three_variants ?? 0)
+  const usersClickedPayButton = Number(analytics?.overview?.users_clicked_pay_button ?? 0)
+  const usersStuckAfterPhoto = Number(analytics?.overview?.users_stuck_after_photo ?? 0)
+  const pct = (value: number) =>
+    totalUsersForPct ? Math.round((value / totalUsersForPct) * 100) : 0
   const tokenDistData =
     analytics?.token_distribution?.map((t: any) => ({
       name: t.range,
       count: t.count,
       pct: totalUsersForPct ? Math.round((t.count / totalUsersForPct) * 100) : 0,
     })) || []
-  const growthData = analytics?.growth ?? []
-  const cohortData = analytics?.cohorts || []
-
   const total = data?.total ?? 0
   const from = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1
   const to = Math.min(page * PAGE_SIZE, total)
@@ -249,16 +181,7 @@ export function UsersPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs text-muted-foreground">Период:</span>
-          <select
-            value={timeWindow}
-            onChange={(e) => setTimeWindow(Number(e.target.value))}
-            className="h-9 rounded-lg border border-input bg-background px-3 py-1 text-sm font-medium shadow-sm transition-colors hover:bg-muted/50"
-          >
-            <option value={7}>7 дней</option>
-            <option value={30}>30 дней</option>
-            <option value={90}>90 дней</option>
-          </select>
+          <span className="text-xs rounded-md border border-input bg-muted/30 px-2 py-1 text-muted-foreground">Период: всё время</span>
           <Button variant="outline" size="sm" asChild>
             <Link to="/security">
               <Shield className="mr-2 h-4 w-4" />
@@ -291,212 +214,12 @@ export function UsersPage() {
         </TabsList>
 
         {/* Overview */}
-        <TabsContent value="overview" className="space-y-6">
-          <p className="text-sm text-muted-foreground">
-            Сводка за последние <strong>{timeWindow}</strong> дней. Данные обновляются по запросу.
-          </p>
-          {analyticsError && (
-            <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-              Ошибка загрузки аналитики. Обновите страницу.
-            </div>
-          )}
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <MetricCard
-              title="Всего пользователей"
-              value={analytics?.overview?.total_users ?? 0}
-              icon={Users}
-              subtitle="В системе"
-              variant="default"
-            />
-            <MetricCard
-              title="Активные подписки"
-              value={analytics?.overview?.active_subscribers ?? 0}
-              icon={Crown}
-              subtitle={`Конверсия: ${analytics?.overview?.conversion_rate ?? 0}%`}
-              variant="success"
-            />
-            <MetricCard
-              title="С активностью"
-              value={analytics?.overview?.users_with_jobs ?? 0}
-              icon={Activity}
-              subtitle={`за ${timeWindow} д. (задачи/снимки)`}
-              variant="info"
-            />
-            <MetricCard
-              title="Среднее задач/юзер"
-              value={analytics?.overview?.avg_jobs_per_user ?? 0}
-              icon={BarChart3}
-              subtitle="Среди активных"
-              variant="warning"
-            />
-          </div>
-
-          <Card className="overflow-hidden border-border/80 shadow-sm">
-            <CardHeader>
-              <CardTitle className="text-base">Рост пользователей</CardTitle>
-              <p className="text-sm text-muted-foreground">
-                Новые регистрации по дням за {timeWindow} д.
-              </p>
-            </CardHeader>
-            <CardContent>
-              {growthData.length > 0 ? (
-                <div className="h-[280px] w-full">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={growthData}>
-                      <defs>
-                        <linearGradient id="colorGrowth" x1="0" y1="0" x2="0" y2="1">
-                          <stop
-                            offset="5%"
-                            stopColor="hsl(var(--primary))"
-                            stopOpacity={0.3}
-                          />
-                          <stop
-                            offset="95%"
-                            stopColor="hsl(var(--primary))"
-                            stopOpacity={0}
-                          />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid strokeDasharray="3 3" className="stroke-muted/50" vertical={false} />
-                      <XAxis
-                        dataKey="date"
-                        tick={{ fontSize: 11 }}
-                        tickFormatter={(val) =>
-                          new Date(val).toLocaleDateString('ru-RU', {
-                            month: 'short',
-                            day: 'numeric',
-                          })
-                        }
-                      />
-                      <YAxis tick={{ fontSize: 11 }} width={32} />
-                      <Tooltip
-                        contentStyle={{
-                          backgroundColor: 'hsl(var(--card))',
-                          border: '1px solid hsl(var(--border))',
-                          borderRadius: 'var(--radius)',
-                          boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
-                        }}
-                        labelFormatter={(v) => new Date(v).toLocaleDateString('ru-RU', { dateStyle: 'medium' })}
-                        formatter={(value: unknown) => [formatNumber(Number(value) || 0), 'Новые']}
-                      />
-                      <Area
-                        type="monotone"
-                        dataKey="new_users"
-                        stroke="hsl(var(--primary))"
-                        strokeWidth={2}
-                        fill="url(#colorGrowth)"
-                        name="Новые"
-                      />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </div>
-              ) : (
-                <div className="flex h-[200px] items-center justify-center text-sm text-muted-foreground">
-                  Нет данных
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {cohortData.length > 0 && (
-            <Card className="overflow-hidden border-border/80 shadow-sm">
-              <CardHeader>
-                <CardTitle className="text-base">Когорты по месяцам</CardTitle>
-                <p className="text-sm text-muted-foreground">
-                  Новые регистрации по месяцам (последние 12 мес.)
-                </p>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[240px] w-full">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={cohortData}>
-                      <CartesianGrid strokeDasharray="3 3" className="stroke-muted/50" vertical={false} />
-                      <XAxis
-                        dataKey="month"
-                        tick={{ fontSize: 11 }}
-                        tickFormatter={(val) =>
-                          new Date(val).toLocaleDateString('ru-RU', {
-                            month: 'short',
-                            year: '2-digit',
-                          })
-                        }
-                      />
-                      <YAxis tick={{ fontSize: 11 }} width={32} />
-                      <Tooltip
-                        contentStyle={{
-                          backgroundColor: 'hsl(var(--card))',
-                          border: '1px solid hsl(var(--border))',
-                          borderRadius: 'var(--radius)',
-                        }}
-                      />
-                      <Bar
-                        dataKey="count"
-                        fill="hsl(var(--primary))"
-                        radius={[4, 4, 0, 0]}
-                        name="Регистраций"
-                      />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </CardContent>
-            </Card>
-          )}
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Zap className="h-4 w-4 text-warning" />
-                Топ пользователей за {timeWindow} д.
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {analytics?.top_users?.length ? (
-                <ul className="space-y-2">
-                  {analytics.top_users.slice(0, 5).map((user: any, idx: number) => (
-                    <li
-                      key={user.telegram_id ?? idx}
-                      className="flex items-center justify-between rounded-lg border border-border-muted bg-muted/30 px-3 py-3 transition-colors hover:bg-muted/50"
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10 text-sm font-bold text-primary">
-                          {idx + 1}
-                        </div>
-                        <div className="min-w-0">
-                          <p className="truncate font-medium text-foreground">
-                            {user.user_display_name ?? user.telegram_id ?? '—'}
-                          </p>
-                          {user.telegram_id && (user.user_display_name !== user.telegram_id) && (
-                            <p className="font-mono text-xs text-muted-foreground">{user.telegram_id}</p>
-                          )}
-                          <p className="text-xs text-muted-foreground">
-                            {user.jobs_count} задач · {user.succeeded} успешно
-                            {(user.failed ?? 0) > 0 && (
-                              <span className="text-destructive"> · {user.failed} ошибок</span>
-                            )}
-                          </p>
-                        </div>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-2">
-                        <Badge variant="outline" className="text-xs">
-                          {user.token_balance ?? 0} токенов
-                        </Badge>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="py-4 text-center text-sm text-muted-foreground">
-                  Нет данных за период
-                </p>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
+        <TabsContent value="overview" />
 
         {/* Segments */}
         <TabsContent value="segments" className="space-y-6">
           <p className="text-sm text-muted-foreground">
-            Сегментация за <strong>{timeWindow}</strong> дней. Активность — по числу задач/снимков в периоде; токены — текущий баланс.
+            Сегментация за <strong>всё время</strong> по событиям воронки: получили 3 варианта, нажали оплату, застряли после загрузки фото.
           </p>
           {analyticsError && (
             <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
@@ -506,80 +229,35 @@ export function UsersPage() {
           <div className="grid gap-6 md:grid-cols-2">
             <Card className="overflow-hidden border-border/80 shadow-sm">
               <CardHeader>
-                <CardTitle className="text-base">Сегменты по активности</CardTitle>
+                <CardTitle className="text-base">Ключевые сегменты воронки</CardTitle>
                 <p className="text-sm text-muted-foreground">
-                  Распределение по количеству задач за {timeWindow} д.
+                  Подсчёт по событиям audit_logs за всё время.
                 </p>
               </CardHeader>
               <CardContent>
-                {activityData.length > 0 ? (
-                  <>
-                    <div className="h-[260px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <PieChart>
-                          <Pie
-                            data={activityData}
-                            cx="50%"
-                            cy="50%"
-                            labelLine={false}
-                            label={({ name, pct }: any) =>
-                              pct > 0 ? `${name} (${pct}%)` : ''
-                            }
-                            outerRadius={90}
-                            dataKey="users"
-                          >
-                            {activityData.map((_: any, index: number) => (
-                              <Cell
-                                key={`cell-${index}`}
-                                fill={CHART_COLORS[index % CHART_COLORS.length]}
-                              />
-                            ))}
-                          </Pie>
-                          <Tooltip
-                            contentStyle={{
-                              backgroundColor: 'hsl(var(--card))',
-                              border: '1px solid hsl(var(--border))',
-                              borderRadius: 'var(--radius)',
-                              boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
-                            }}
-                            formatter={(value: unknown, _: unknown, props: any) => [
-                              `${formatNumber(Number(value) || 0)} чел. (${props.payload?.pct ?? 0}%)`,
-                              props.payload?.name ?? '',
-                            ]}
-                          />
-                        </PieChart>
-                      </ResponsiveContainer>
-                    </div>
-                    <div className="mt-4 space-y-2 rounded-lg bg-muted/30 p-3">
-                      {activityData.map((segment: any, idx: number) => (
-                        <div
-                          key={segment.name}
-                          className="flex items-center justify-between text-sm"
-                        >
-                          <div className="flex items-center gap-2">
-                            <div
-                              className="h-3 w-3 shrink-0 rounded-full"
-                              style={{
-                                backgroundColor: CHART_COLORS[idx % CHART_COLORS.length],
-                              }}
-                            />
-                            <span>{segment.name}</span>
-                          </div>
-                          <span className="font-medium tabular-nums">
-                            {formatNumber(Number(segment.users) || 0)} чел. · {segment.pct}%
-                          </span>
-                        </div>
-                      ))}
-                      <div className="border-t border-border/60 pt-2 mt-2 text-xs text-muted-foreground">
-                        Итого: {formatNumber(activityData.reduce((s: number, x: any) => s + (Number(x.users) || 0), 0))} пользователей
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex h-[260px] items-center justify-center text-sm text-muted-foreground">
-                    Нет данных
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-border/70 bg-muted/20 px-4 py-3">
+                    <p className="text-sm text-muted-foreground">Получили 3 варианта</p>
+                    <p className="mt-1 text-2xl font-bold tabular-nums text-foreground">
+                      {formatNumber(usersWithThreeVariants)}
+                    </p>
+                    <p className="text-xs text-muted-foreground">{pct(usersWithThreeVariants)}% от всех пользователей</p>
                   </div>
-                )}
+                  <div className="rounded-lg border border-border/70 bg-muted/20 px-4 py-3">
+                    <p className="text-sm text-muted-foreground">Нажали кнопку оплаты</p>
+                    <p className="mt-1 text-2xl font-bold tabular-nums text-foreground">
+                      {formatNumber(usersClickedPayButton)}
+                    </p>
+                    <p className="text-xs text-muted-foreground">{pct(usersClickedPayButton)}% от всех пользователей</p>
+                  </div>
+                  <div className="rounded-lg border border-border/70 bg-muted/20 px-4 py-3">
+                    <p className="text-sm text-muted-foreground">Не дошли дальше загрузки фото</p>
+                    <p className="mt-1 text-2xl font-bold tabular-nums text-foreground">
+                      {formatNumber(usersStuckAfterPhoto)}
+                    </p>
+                    <p className="text-xs text-muted-foreground">{pct(usersStuckAfterPhoto)}% от всех пользователей</p>
+                  </div>
+                </div>
               </CardContent>
             </Card>
 

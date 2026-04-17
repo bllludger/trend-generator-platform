@@ -1,11 +1,12 @@
 """
 Celery task: generate image for a job (trend + user photo), save result, send to Telegram.
 Bot calls: send_task("app.workers.tasks.generation_v2.generate_image", args=[job_id], kwargs={status_chat_id, status_message_id}).
-Единый билдер: [INPUT], [TASK], [IDENTITY TRANSFER], [COMPOSITION], [], [STYLE], [AVOID], [SAFETY], [OUTPUT].
+Единый билдер: мастер prompt_input + трендовый prompt (без legacy-надстроек).
 """
 import logging
 import os
 import time
+from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.celery_app import celery_app
@@ -19,7 +20,15 @@ from app.paywall.keyboard import build_unlock_markup
 from app.paywall.models import AccessContext
 from app.services.app_settings.settings_service import AppSettingsService
 from app.services.audit.service import AuditService
-from app.services.generation_prompt.settings_service import GenerationPromptSettingsService
+from app.services.generation_prompt.settings_service import (
+    GenerationPromptSettingsService,
+    clamp_top_p,
+    normalize_aspect_ratio,
+    normalize_media_resolution,
+    normalize_seed,
+    normalize_thinking_config,
+    size_to_aspect_ratio,
+)
 from app.services.image_generation import (
     ImageGenerationError,
     ImageGenerationRequest,
@@ -30,7 +39,6 @@ from app.services.jobs.service import JobService
 from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.telegram.client import TelegramClient
 from app.services.telegram_messages.runtime import runtime_templates
-from app.services.transfer_policy.service import SCOPE_TRENDS, get_effective as transfer_get_effective
 from app.services.trends.service import TrendService
 from app.utils.image_formats import aspect_ratio_to_size
 from app.utils.metrics import (
@@ -43,20 +51,9 @@ from app.utils.metrics import (
 logger = logging.getLogger(__name__)
 
 
-def _style_preset_to_text(style_preset) -> str:
-    """Сериализовать style_preset (dict или str) в текст для блока [STYLE]."""
-    if style_preset is None:
-        return ""
-    if isinstance(style_preset, str):
-        return (style_preset or "").strip()
-    if isinstance(style_preset, dict):
-        return " ".join(f"{k}: {v}" for k, v in sorted(style_preset.items()) if v)
-    return ""
-
-
 def _build_prompt_for_job(db: Session, job: Job, trend: Trend) -> tuple[str, str | None, str, str]:
     """
-    Собрать промпт: мастер (INPUT, TASK, SAFETY) + Transfer для трендов (IDENTITY, COMPOSITION, AVOID) + тренд (SCENE, STYLE, AVOID).
+    Собрать промпт: мастер (prompt_input) + трендовый текст (секции / scene / system).
     Returns (prompt, negative_prompt, model, size).
     """
     gs = GenerationPromptSettingsService(db)
@@ -64,82 +61,72 @@ def _build_prompt_for_job(db: Session, job: Job, trend: Trend) -> tuple[str, str
     model = effective.get("default_model", "gemini-2.5-flash-image")
     # Приоритет: выбор пользователя (job.image_size), иначе дефолт из админки (default_aspect_ratio → size)
     size = job.image_size or aspect_ratio_to_size(effective.get("default_aspect_ratio", "1:1"))
-    fmt = effective.get("default_format", "png")
 
-    # Если у тренда prompt_sections (Playground) — собираем из секций с тегами [], [STYLE], [AVOID], [COMPOSITION]
     sections = trend.prompt_sections if isinstance(trend.prompt_sections, list) else []
+    trend_parts: list[str] = []
     if sections:
-        label_to_tag = {"scene": "[]", "style": "[STYLE]", "avoid": "[AVOID]", "composition": "[COMPOSITION]"}
-        parts = []
         for s in sorted(sections, key=lambda x: x.get("order", 0)):
             if not s.get("enabled") or not s.get("content"):
                 continue
             content = str(s["content"]).strip()
-            if not content:
-                continue
-            label = (s.get("label") or "").strip().lower()
-            tag = label_to_tag.get(label)
-            if tag:
-                parts.append(f"{tag}\n{content}")
-            else:
-                parts.append(content)
-        prompt_text = "\n\n".join(parts) if parts else (trend.scene_prompt or trend.system_prompt or "Generate image.")
-        negative = trend.negative_prompt or None
-        if trend.prompt_model:
-            model = trend.prompt_model
-        if trend.prompt_size:
-            size = trend.prompt_size
-        return prompt_text, negative, model, size
+            if content:
+                trend_parts.append(content)
+    trend_prompt = "\n\n".join(trend_parts).strip()
+    if not trend_prompt:
+        trend_prompt = (trend.scene_prompt or trend.system_prompt or "").strip()
 
-    # Единый порядок блоков: INPUT, TASK, IDENTITY, COMPOSITION, SCENE, STYLE, AVOID, SAFETY, OUTPUT
-    transfer = transfer_get_effective(db, SCOPE_TRENDS)
     blocks = []
 
     prompt_input = (effective.get("prompt_input") or "").strip()
     if prompt_input:
-        blocks.append(f"[INPUT]\n{prompt_input}")
+        blocks.append(prompt_input)
 
-    prompt_task = (effective.get("prompt_task") or "").strip()
-    if prompt_task:
-        blocks.append(f"[TASK]\n{prompt_task}")
-
-    identity = (transfer.get("identity_rules_text") or "").strip()
-    if identity:
-        blocks.append(f"[IDENTITY TRANSFER]\n{identity}")
-
-    composition = (getattr(trend, "composition_prompt", None) or "").strip() or (transfer.get("composition_rules_text") or "").strip()
-    if composition:
-        blocks.append(f"[COMPOSITION]\n{composition}")
-
-    scene = (trend.scene_prompt or trend.system_prompt or "").strip()
-    if scene:
-        blocks.append(f"[]\n{scene}")
-
-    style_text = _style_preset_to_text(trend.style_preset)
-    if style_text:
-        blocks.append(f"[STYLE]\n{style_text}")
-
-    avoid_parts = []
-    avoid_default = (transfer.get("avoid_default_items") or "").strip()
-    if avoid_default:
-        for line in avoid_default.replace(";", "\n").splitlines():
-            item = line.strip()
-            if item:
-                avoid_parts.append(item)
-    negative_scene = (trend.negative_scene or "").strip()
-    if negative_scene:
-        avoid_parts.append(negative_scene)
-    if avoid_parts:
-        blocks.append(f"[AVOID]\n{'; '.join(avoid_parts)}")
-
-    safety = (effective.get("safety_constraints") or "").strip()
-    if safety:
-        blocks.append(f"[SAFETY]\n{safety}")
-    blocks.append(f"[OUTPUT]\nsize={size}, format={fmt}")
-
-    prompt_text = "\n\n".join(blocks)
-    negative = (trend.negative_prompt or "").strip() or None
+    if trend_prompt:
+        blocks.append(trend_prompt)
+    prompt_text = "\n\n".join(blocks).strip()
+    negative = None
+    if trend.prompt_model:
+        model = trend.prompt_model
     return prompt_text, negative, model, size
+
+
+def _resolve_job_generation_config(
+    *,
+    trend: Trend | None,
+    effective_release: dict[str, Any],
+    model: str,
+    size: str | None,
+    prefer_size_aspect_ratio: bool,
+) -> dict[str, Any]:
+    trend_aspect_ratio = (getattr(trend, "prompt_aspect_ratio", None) or "").strip() if trend else ""
+    trend_media_resolution = getattr(trend, "prompt_media_resolution", None) if trend else None
+    trend_thinking_config = getattr(trend, "prompt_thinking_config", None) if trend else None
+    trend_top_p = getattr(trend, "prompt_top_p", None) if trend else None
+    trend_seed = getattr(trend, "prompt_seed", None) if trend else None
+
+    aspect_ratio = ""
+    if trend_aspect_ratio:
+        aspect_ratio = normalize_aspect_ratio(trend_aspect_ratio, fallback="")
+    if not aspect_ratio and prefer_size_aspect_ratio:
+        aspect_ratio = size_to_aspect_ratio(size, fallback="1:1")
+    if not aspect_ratio:
+        aspect_ratio = normalize_aspect_ratio(effective_release.get("default_aspect_ratio"), fallback="3:4")
+    top_p = clamp_top_p(trend_top_p if trend_top_p is not None else effective_release.get("default_top_p"))
+    media_resolution = normalize_media_resolution(
+        trend_media_resolution if trend_media_resolution is not None else effective_release.get("default_media_resolution")
+    )
+    thinking_source = trend_thinking_config if trend_thinking_config is not None else effective_release.get("default_thinking_config")
+    thinking_config = normalize_thinking_config(model, thinking_source)
+    seed = normalize_seed(trend_seed if trend_seed is not None else effective_release.get("default_seed"))
+
+    return {
+        "aspect_ratio": aspect_ratio,
+        "top_p": top_p,
+        "candidate_count": 1,  # Production flow is always single candidate.
+        "media_resolution": media_resolution,
+        "thinking_config": thinking_config,
+        "seed": seed,
+    }
 
 
 @celery_app.task(bind=True, name="app.workers.tasks.generation_v2.generate_image")
@@ -228,10 +215,16 @@ def generate_image(
         if not input_image_path or not os.path.isfile(input_image_path):
             input_image_path = None
 
-        temperature = trend.prompt_temperature if trend.prompt_temperature is not None else None
-        seed = int(trend.prompt_seed) if trend.prompt_seed is not None else None
         gs = GenerationPromptSettingsService(db)
         effective_job = gs.get_effective(profile="release")
+        temperature = trend.prompt_temperature if trend.prompt_temperature is not None else effective_job.get("default_temperature")
+        resolved_generation_cfg = _resolve_job_generation_config(
+            trend=trend,
+            effective_release=effective_job,
+            model=model,
+            size=size,
+            prefer_size_aspect_ratio=bool((job.image_size or "").strip()),
+        )
         image_size_tier = (getattr(trend, "prompt_image_size_tier", None) or "").strip() or effective_job.get("default_image_size_tier") or None
 
         app_svc = AppSettingsService(db)
@@ -253,8 +246,13 @@ def generate_image(
             input_image_path=input_image_path,
             extra_params=None,
             temperature=temperature,
-            seed=seed,
+            seed=resolved_generation_cfg["seed"],
             image_size_tier=image_size_tier,
+            aspect_ratio=resolved_generation_cfg["aspect_ratio"],
+            top_p=resolved_generation_cfg["top_p"],
+            candidate_count=resolved_generation_cfg["candidate_count"],
+            media_resolution=resolved_generation_cfg["media_resolution"],
+            thinking_config=resolved_generation_cfg["thinking_config"],
         )
         try:
             AuditService(db).log(

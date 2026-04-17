@@ -220,6 +220,30 @@ paywall_viewed_total = Counter(
     "Paywall shown (unlock or pack)",
 )
 
+# --- Face-ID ---
+face_id_requests_total = Counter(
+    "face_id_requests_total",
+    "Face-ID requests from monolith to face-id-api by status",
+    ["status"],  # queued, fallback
+)
+
+face_id_callback_total = Counter(
+    "face_id_callback_total",
+    "Face-ID callbacks received by monolith",
+    ["status"],  # ready, ready_fallback, failed_multi_face, failed_error, duplicate
+)
+
+face_id_pending_takes = Gauge(
+    "face_id_pending_takes",
+    "Takes waiting for face-id processing",
+)
+
+face_id_fallback_total = Counter(
+    "face_id_fallback_total",
+    "Face-ID fallbacks by reason",
+    ["reason"],  # no_face, enqueue_unavailable
+)
+
 # --- Telemetry / Admin ---
 product_events_track_total = Counter(
     "product_events_track_total",

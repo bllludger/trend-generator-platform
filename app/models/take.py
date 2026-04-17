@@ -19,6 +19,7 @@ class Take(Base):
     image_size = Column(String, nullable=True)
     input_file_ids = Column(JSONB, nullable=False, default=list)
     input_local_paths = Column(JSONB, nullable=False, default=list)
+    face_asset_id = Column(String, nullable=True, index=True)
     copy_reference_path = Column(String, nullable=True)
     status = Column(String, nullable=False, default="generating")
 

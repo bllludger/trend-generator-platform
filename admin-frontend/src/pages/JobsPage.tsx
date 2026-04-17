@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { jobsService, trendsService, type JobsAnalytics } from '@/services/api'
+import api from '@/lib/api'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -37,12 +38,9 @@ import {
   Check,
   Briefcase,
   TrendingUp,
-  AlertCircle,
-  Clock,
-  ListTodo,
   Radio,
-  User,
   BarChart3,
+  Image as ImageIcon,
 } from 'lucide-react'
 import {
   AreaChart,
@@ -55,14 +53,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts'
-import { useState } from 'react'
-
-const PERIOD_OPTIONS = [
-  { value: 'all', label: 'Все время', hours: null as number | null },
-  { value: '24', label: 'За 24 ч', hours: 24 },
-  { value: '168', label: 'За 7 д', hours: 168 },
-  { value: '720', label: 'За 30 д', hours: 720 },
-]
+import { useEffect, useState } from 'react'
 
 const PAGE_SIZES = [20, 50, 100]
 const LIVE_REFETCH_INTERVAL_MS = 15_000
@@ -79,7 +70,192 @@ type JobItem = {
   is_preview?: boolean
   reserved_tokens: number
   error_code?: string
+  input_photo_url?: string | null
+  has_three_variants?: boolean | null
+  variants_ready_count?: number | null
+  variant_photo_urls?: Array<string | null> | null
+  started_at?: string | null
+  received_at?: string | null
+  time_to_receive_sec?: number | null
   created_at: string
+}
+
+async function openAuthenticatedImageInNewTab(primaryUrl?: string | null, fallbackUrl?: string | null) {
+  const tryUrls = [primaryUrl, fallbackUrl].filter((u): u is string => Boolean(u))
+  for (const url of tryUrls) {
+    try {
+      const response = await api.get<Blob>(url, { responseType: 'blob' })
+      const blobUrl = URL.createObjectURL(response.data)
+      const opened = window.open(blobUrl, '_blank', 'noopener,noreferrer')
+      if (!opened) {
+        const link = document.createElement('a')
+        link.href = blobUrl
+        link.target = '_blank'
+        link.rel = 'noopener noreferrer'
+        link.click()
+      }
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000)
+      return
+    } catch {
+      // try next URL
+    }
+  }
+}
+
+function InputPhotoThumb({ photoUrl }: { photoUrl?: string | null }) {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let revokedUrl: string | null = null
+    let cancelled = false
+
+    const load = async () => {
+      if (!photoUrl) {
+        setBlobUrl(null)
+        setLoading(false)
+        setFailed(false)
+        return
+      }
+      setLoading(true)
+      setFailed(false)
+      try {
+        const response = await api.get<Blob>(photoUrl, { responseType: 'blob' })
+        if (cancelled) return
+        revokedUrl = URL.createObjectURL(response.data)
+        setBlobUrl(revokedUrl)
+      } catch {
+        if (!cancelled) {
+          setBlobUrl(null)
+          setFailed(true)
+        }
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+      if (revokedUrl) URL.revokeObjectURL(revokedUrl)
+    }
+  }, [photoUrl])
+
+  if (!photoUrl) {
+    return (
+      <div className="flex h-14 w-14 items-center justify-center rounded-md border border-dashed border-border bg-muted/30 text-[10px] text-muted-foreground">
+        —
+      </div>
+    )
+  }
+  if (failed) {
+    return (
+      <div className="flex h-14 w-14 items-center justify-center rounded-md border border-dashed border-destructive/40 bg-destructive/5 text-[10px] text-destructive">
+        нет
+      </div>
+    )
+  }
+  if (loading || !blobUrl) {
+    return <Skeleton className="h-14 w-14 rounded-md" />
+  }
+  return (
+    <button
+      type="button"
+      onClick={() => void openAuthenticatedImageInNewTab(photoUrl)}
+      title="Открыть оригинал входного фото"
+      className="block h-14 w-14 overflow-hidden rounded-md border border-border transition-opacity hover:opacity-85"
+    >
+      <img
+        src={blobUrl}
+        alt="Оригинал"
+        className="h-full w-full object-cover"
+        loading="lazy"
+      />
+    </button>
+  )
+}
+
+function TakeVariantsStrip({ takeId, photoUrls }: { takeId: string; photoUrls?: Array<string | null> | null }) {
+  const urls = Array.isArray(photoUrls) ? photoUrls.slice(0, 3) : []
+  const urlsKey = urls.map((u) => u ?? '').join('|')
+  const [blobUrls, setBlobUrls] = useState<Array<string | null>>([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    const revoked: string[] = []
+
+    const load = async () => {
+      if (!urls.length || urls.every((u) => !u)) {
+        setBlobUrls([])
+        setLoading(false)
+        return
+      }
+      setLoading(true)
+      try {
+        const loaded = await Promise.all(
+          urls.map(async (url) => {
+            if (!url) return null
+            try {
+              const response = await api.get<Blob>(url, { responseType: 'blob' })
+              const nextBlobUrl = URL.createObjectURL(response.data)
+              revoked.push(nextBlobUrl)
+              return nextBlobUrl
+            } catch {
+              return null
+            }
+          })
+        )
+        if (!cancelled) setBlobUrls(loaded)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+      revoked.forEach((u) => URL.revokeObjectURL(u))
+    }
+  }, [urlsKey])
+
+  if (!urls.length || urls.every((u) => !u)) {
+    return <span className="text-muted-foreground">—</span>
+  }
+
+  return (
+    <div className="flex items-center gap-1.5">
+      {(loading ? urls.map(() => null) : blobUrls).map((blobUrl, idx) => (
+        <div key={`variant-${idx}`} className="h-12 w-12 overflow-hidden rounded-md border border-border bg-muted/20">
+          {blobUrl ? (
+            <button
+              type="button"
+              onClick={() =>
+                void openAuthenticatedImageInNewTab(
+                  `/admin/jobs/${takeId}/take-variant/${['a', 'b', 'c'][idx] ?? 'a'}?kind=preview`,
+                  urls[idx]
+                )
+              }
+              title={`Вариант ${idx + 1} (preview с watermark)`}
+              className="block h-full w-full"
+            >
+              <img
+                src={blobUrl}
+                alt={`Вариант ${idx + 1}`}
+                className="h-full w-full object-cover"
+                loading="lazy"
+              />
+            </button>
+          ) : loading ? (
+            <Skeleton className="h-full w-full rounded-none" />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center text-[10px] text-muted-foreground">—</div>
+          )}
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function getStatusBadge(status: string) {
@@ -91,6 +267,17 @@ function getStatusBadge(status: string) {
     ERROR: 'error',
   }
   return variants[status] || 'default'
+}
+
+function formatDuration(sec?: number | null): string {
+  if (sec == null || !Number.isFinite(sec) || sec < 0) return '—'
+  const total = Math.floor(sec)
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  if (hours > 0) return `${hours}ч ${String(minutes).padStart(2, '0')}м`
+  if (minutes > 0) return `${minutes}м ${String(seconds).padStart(2, '0')}с`
+  return `${seconds}с`
 }
 
 function copyToClipboard(text: string, setCopied: (id: string | null) => void) {
@@ -105,16 +292,13 @@ export function JobsPage() {
   const [pageSize, setPageSize] = useState(20)
   const [status, setStatus] = useState('')
   const [search, setSearch] = useState('')
-  const [period, setPeriod] = useState('all')
   const [trendId, setTrendId] = useState('')
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [errorDetailJob, setErrorDetailJob] = useState<JobItem | null>(null)
   const [liveEnabled, setLiveEnabled] = useState(false)
 
-  const hours = PERIOD_OPTIONS.find((p) => p.value === period)?.hours ?? null
-
   const { data, isLoading, dataUpdatedAt } = useQuery({
-    queryKey: ['jobs', page, pageSize, status, search, trendId, hours],
+    queryKey: ['jobs', page, pageSize, status, search, trendId],
     queryFn: () =>
       jobsService.list({
         page,
@@ -122,15 +306,7 @@ export function JobsPage() {
         status: status || undefined,
         telegram_id: search || undefined,
         trend_id: trendId || undefined,
-        hours: hours ?? undefined,
       }),
-    refetchInterval: liveEnabled ? LIVE_REFETCH_INTERVAL_MS : false,
-  })
-
-  const { data: stats } = useQuery({
-    queryKey: ['jobs-stats', hours],
-    queryFn: () => jobsService.stats(hours ?? 24),
-    enabled: hours != null,
     refetchInterval: liveEnabled ? LIVE_REFETCH_INTERVAL_MS : false,
   })
 
@@ -139,12 +315,10 @@ export function JobsPage() {
     queryFn: () => trendsService.list(),
   })
 
-  const analyticsHours = hours ?? 720
   const { data: analytics } = useQuery<JobsAnalytics>({
-    queryKey: ['jobs-analytics', analyticsHours, trendId, status],
+    queryKey: ['jobs-analytics', trendId, status],
     queryFn: () =>
       jobsService.getAnalytics({
-        hours: analyticsHours,
         trend_id: trendId || undefined,
         status: status || undefined,
       }),
@@ -174,72 +348,9 @@ export function JobsPage() {
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Задачи</h1>
         <p className="mt-2 text-muted-foreground">
-          Мониторинг задач генерации изображений
+          Журнал генераций за всё время: входное фото, статус и результат
         </p>
       </div>
-
-      {hours != null && stats && (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <span className="text-sm font-medium text-muted-foreground">
-                Всего за период
-              </span>
-              <Briefcase className="h-4 w-4 text-muted-foreground" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats.total)}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <span className="text-sm font-medium text-muted-foreground">
-                Успешно
-              </span>
-              <TrendingUp className="h-4 w-4 text-success" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-success">
-                {formatNumber(stats.succeeded)}
-              </div>
-              <p className="text-xs text-muted-foreground">
-                {stats.total > 0
-                  ? `${Math.round((stats.succeeded / stats.total) * 100)}% от периода`
-                  : '—'}
-              </p>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <span className="text-sm font-medium text-muted-foreground">
-                Ошибки
-              </span>
-              <AlertCircle className="h-4 w-4 text-destructive" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-destructive">
-                {formatNumber(stats.failed)}
-              </div>
-              <p className="text-xs text-muted-foreground">
-                {stats.total > 0
-                  ? `${Math.round((stats.failed / stats.total) * 100)}% от периода`
-                  : '—'}
-              </p>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <span className="text-sm font-medium text-muted-foreground">
-                В очереди
-              </span>
-              <ListTodo className="h-4 w-4 text-warning" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats.in_queue)}</div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
 
       <Tabs defaultValue="journal" className="space-y-4">
         <TabsList className="grid w-full max-w-[280px] grid-cols-2">
@@ -263,20 +374,6 @@ export function JobsPage() {
                 <SelectItem value="SUCCEEDED">Успешно</SelectItem>
                 <SelectItem value="FAILED">Ошибка</SelectItem>
                 <SelectItem value="ERROR">Ошибка (ERROR)</SelectItem>
-              </SelectContent>
-            </Select>
-
-            <Select value={period} onValueChange={(v) => { setPeriod(v); setPage(1) }}>
-              <SelectTrigger className="w-36">
-                <Clock className="mr-2 h-4 w-4" />
-                <SelectValue placeholder="Период" />
-              </SelectTrigger>
-              <SelectContent>
-                {PERIOD_OPTIONS.map((p) => (
-                  <SelectItem key={p.value} value={p.value}>
-                    {p.label}
-                  </SelectItem>
-                ))}
               </SelectContent>
             </Select>
 
@@ -343,7 +440,7 @@ export function JobsPage() {
               <Briefcase className="h-12 w-12 text-muted-foreground/50" />
               <p className="mt-2 font-medium text-foreground">Нет задач</p>
               <p className="text-sm text-muted-foreground">
-                Измените фильтры или период
+                Измените фильтры
               </p>
             </div>
           ) : (
@@ -362,9 +459,18 @@ export function JobsPage() {
                       <TableHead className="w-10"> </TableHead>
                       <TableHead className="font-mono">ID</TableHead>
                       <TableHead className="whitespace-nowrap">Тип</TableHead>
+                      <TableHead className="whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1">
+                          <ImageIcon className="h-4 w-4" />
+                          Оригинал
+                        </span>
+                      </TableHead>
                       <TableHead>Пользователь</TableHead>
                       <TableHead>Тренд</TableHead>
                       <TableHead>Статус</TableHead>
+                      <TableHead className="whitespace-nowrap">3 варианта</TableHead>
+                      <TableHead className="whitespace-nowrap">3 фото результата</TableHead>
+                      <TableHead className="whitespace-nowrap">Старт → получение</TableHead>
                       <TableHead>Токены</TableHead>
                       <TableHead>Ошибка</TableHead>
                       <TableHead title="Время в вашей таймзоне">Создана</TableHead>
@@ -393,6 +499,9 @@ export function JobsPage() {
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">
                           {job.task_type === 'take' ? 'Снимок' : 'Задача'}
+                        </TableCell>
+                        <TableCell>
+                          <InputPhotoThumb photoUrl={job.input_photo_url} />
                         </TableCell>
                         <TableCell>
                           {job.user_display_name ? (
@@ -427,6 +536,47 @@ export function JobsPage() {
                               </Badge>
                             )}
                           </div>
+                        </TableCell>
+                        <TableCell>
+                          {job.task_type === 'take' ? (
+                            <Badge
+                              variant={
+                                job.has_three_variants
+                                  ? 'success'
+                                  : (job.variants_ready_count ?? 0) > 0
+                                    ? 'warning'
+                                    : 'secondary'
+                              }
+                            >
+                              {job.has_three_variants
+                                ? 'Да (3/3)'
+                                : `Нет (${job.variants_ready_count ?? 0}/3)`}
+                            </Badge>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {job.task_type === 'take' ? (
+                            <TakeVariantsStrip takeId={job.job_id} photoUrls={job.variant_photo_urls} />
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-sm">
+                          {job.task_type === 'take' ? (
+                            <span
+                              title={
+                                job.started_at && job.received_at
+                                  ? `Старт: ${formatDate(job.started_at)} | Получено: ${formatDate(job.received_at)}`
+                                  : 'Нет полного тайминга'
+                              }
+                            >
+                              {formatDuration(job.time_to_receive_sec)}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
                         </TableCell>
                         <TableCell>{job.reserved_tokens}</TableCell>
                         <TableCell className="text-muted-foreground">
@@ -470,7 +620,7 @@ export function JobsPage() {
                   <TrendingUp className="h-5 w-5" />
                   Задачи по дням
                 </CardTitle>
-                <CardDescription>Количество задач за период</CardDescription>
+                <CardDescription>Количество задач за всё время</CardDescription>
               </CardHeader>
               <CardContent>
                 <div className="h-[280px]">
@@ -506,7 +656,7 @@ export function JobsPage() {
                       </AreaChart>
                     </ResponsiveContainer>
                   ) : (
-                    <div className="flex h-full items-center justify-center text-muted-foreground">Нет данных за период</div>
+                    <div className="flex h-full items-center justify-center text-muted-foreground">Нет данных</div>
                   )}
                 </div>
               </CardContent>
@@ -518,7 +668,7 @@ export function JobsPage() {
                   <BarChart3 className="h-5 w-5" />
                   По статусам
                 </CardTitle>
-                <CardDescription>Разбивка по статусу задачи</CardDescription>
+                <CardDescription>Разбивка по статусу за всё время</CardDescription>
               </CardHeader>
               <CardContent>
                 <div className="h-[280px]">
@@ -540,7 +690,7 @@ export function JobsPage() {
                       </BarChart>
                     </ResponsiveContainer>
                   ) : (
-                    <div className="flex h-full items-center justify-center text-muted-foreground">Нет данных за период</div>
+                    <div className="flex h-full items-center justify-center text-muted-foreground">Нет данных</div>
                   )}
                 </div>
               </CardContent>
@@ -553,7 +703,7 @@ export function JobsPage() {
                 <TrendingUp className="h-5 w-5" />
                 Топ трендов по задачам
               </CardTitle>
-              <CardDescription>До 20 трендов с наибольшим числом задач</CardDescription>
+              <CardDescription>До 20 трендов с наибольшим числом задач за всё время</CardDescription>
             </CardHeader>
             <CardContent>
               {(analytics?.by_trend?.length ?? 0) > 0 ? (
@@ -578,46 +728,11 @@ export function JobsPage() {
                   </TableBody>
                 </Table>
               ) : (
-                <p className="py-8 text-center text-muted-foreground">Нет данных за период</p>
+                <p className="py-8 text-center text-muted-foreground">Нет данных</p>
               )}
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <User className="h-5 w-5" />
-                Топ пользователей по задачам
-              </CardTitle>
-              <CardDescription>До 20 пользователей с наибольшим числом задач за период</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {(analytics?.top_users?.length ?? 0) > 0 ? (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="w-12">#</TableHead>
-                      <TableHead>Пользователь</TableHead>
-                      <TableHead className="font-mono text-xs w-24">Telegram ID</TableHead>
-                      <TableHead className="text-right w-24">Задач</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {analytics!.top_users.map((u, i) => (
-                      <TableRow key={u.user_id}>
-                        <TableCell className="text-muted-foreground text-sm">{i + 1}</TableCell>
-                        <TableCell className="font-medium">{u.user_display_name || u.telegram_id || u.user_id}</TableCell>
-                        <TableCell className="font-mono text-xs text-muted-foreground">{u.telegram_id ?? '—'}</TableCell>
-                        <TableCell className="text-right">{u.count}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              ) : (
-                <p className="py-8 text-center text-muted-foreground">Нет данных за период</p>
-              )}
-            </CardContent>
-          </Card>
         </TabsContent>
       </Tabs>
 

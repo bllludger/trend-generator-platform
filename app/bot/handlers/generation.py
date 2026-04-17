@@ -26,12 +26,13 @@ from app.services.jobs.service import JobService
 from app.services.audit.service import AuditService
 from app.services.product_analytics.service import ProductAnalyticsService
 from app.services.security.settings_service import SecuritySettingsService
+from app.services.face_id.asset_service import FaceAssetService
 from app.services.idempotency import IdempotencyStore
 from app.services.trial_v2.service import TrialV2Service
 from app.services.compensations.service import CompensationService
 from app.models.user import User
 from app.models.take import Take as TakeModel
-from app.utils.metrics import jobs_created_total, balance_rejected_total
+from app.utils.metrics import jobs_created_total, balance_rejected_total, face_id_pending_takes
 from app.utils.telegram_photo import path_for_telegram_photo
 
 generation_router = Router()
@@ -74,7 +75,21 @@ async def _send_packages_upsell(bot: Bot, chat_id: int, reason_text: str | None 
     await bot.send_message(chat_id, text, reply_markup=kb)
 
 
-def _mark_take_enqueue_failed(take_id: str, *, actor_id: str | None = None) -> None:
+def _sanitize_enqueue_error_reason(err: str | None) -> str | None:
+    if not err:
+        return None
+    compact = " ".join(str(err).split())
+    if not compact:
+        return None
+    return compact[:500]
+
+
+def _mark_take_enqueue_failed(
+    take_id: str,
+    *,
+    actor_id: str | None = None,
+    reason: str | None = None,
+) -> None:
     """Mark take as failed when Celery enqueue did not happen, with compensation for free preview."""
     with get_db_session() as db:
         take_svc = TakeService(db)
@@ -82,8 +97,18 @@ def _mark_take_enqueue_failed(take_id: str, *, actor_id: str | None = None) -> N
         take = take_svc.get_take(take_id)
         if not take:
             return
-        if take.status == "generating":
-            take_svc.set_status(take, "failed", error_code="enqueue_failed")
+        error_code = "enqueue_failed"
+        reason_norm = (reason or "").strip().lower()
+        if "failed_multi_face" in reason_norm or "multi_face" in reason_norm:
+            error_code = "face_asset_multi_face"
+        elif "failed_error" in reason_norm or "face_id" in reason_norm:
+            error_code = "face_asset_failed_error"
+        if take.status in {"generating", "awaiting_face_id"}:
+            take_svc.set_status(take, "failed", error_code=error_code)
+        reason_sanitized = _sanitize_enqueue_error_reason(reason)
+        audit_payload: dict[str, Any] = {"session_id": take.session_id, "error_code": error_code}
+        if reason_sanitized:
+            audit_payload["enqueue_error"] = reason_sanitized
         try:
             AuditService(db).log(
                 actor_type="system",
@@ -91,7 +116,7 @@ def _mark_take_enqueue_failed(take_id: str, *, actor_id: str | None = None) -> N
                 action="take_enqueue_failed",
                 entity_type="take",
                 entity_id=take_id,
-                payload={"session_id": take.session_id, "error_code": "enqueue_failed"},
+                payload=audit_payload,
             )
         except Exception:
             logger.exception("take_enqueue_failed_audit_error", extra={"take_id": take_id})
@@ -121,6 +146,10 @@ def _mark_take_enqueue_failed(take_id: str, *, actor_id: str | None = None) -> N
                     session_svc.return_take(session)
                 except Exception:
                     logger.exception("take_enqueue_failed_paid_return_error", extra={"take_id": take_id, "session_id": take.session_id})
+        try:
+            face_id_pending_takes.set(int(db.query(TakeModel.id).filter(TakeModel.status == "awaiting_face_id").count()))
+        except Exception:
+            logger.exception("take_enqueue_failed_pending_gauge_error", extra={"take_id": take_id})
 
         try:
             ProductAnalyticsService(db).track(
@@ -129,7 +158,7 @@ def _mark_take_enqueue_failed(take_id: str, *, actor_id: str | None = None) -> N
                 take_id=take_id,
                 session_id=take.session_id,
                 trend_id=take.trend_id,
-                properties={"error_code": "enqueue_failed"},
+                properties={"error_code": error_code},
             )
         except Exception:
             logger.exception("take_enqueue_failed_analytics_error", extra={"take_id": take_id})
@@ -154,6 +183,7 @@ async def _create_job_and_start_generation(
     photo_local_path = data.get("photo_local_path")
     trend_id = data.get("selected_trend_id")
     custom_prompt = data.get("custom_prompt")
+    state_face_asset_id = data.get("face_asset_id")
 
     if not photo_file_id or not photo_local_path:
         await answer_alert(t("errors.session_expired_photo", "Сессия истекла. Начните заново: отправьте фото."), show_alert=True)
@@ -184,6 +214,9 @@ async def _create_job_and_start_generation(
         return False
     created_take_id: str | None = None
     enqueued = False
+    awaiting_face_asset = False
+    is_paid_active_flow = False
+    audience = (data.get("audience_type") or "").strip().lower() or AUDIENCE_WOMEN
     try:
         with get_db_session() as db:
             user_service = UserService(db)
@@ -205,9 +238,25 @@ async def _create_job_and_start_generation(
             is_copy_flow = bool(data.get("copy_flow_origin"))
             take_type = "COPY" if is_copy_flow else ("CUSTOM" if trend_id == TREND_CUSTOM_ID else "TREND")
             copy_ref = data.get("reference_path") if is_copy_flow else None
+            face_asset = None
+            if (not is_copy_flow) and isinstance(state_face_asset_id, str) and state_face_asset_id.strip():
+                face_asset = FaceAssetService(db).get(state_face_asset_id.strip())
+                if face_asset and str(face_asset.user_id) != str(user.id):
+                    face_asset = None
+                if face_asset and face_asset.status == "failed_multi_face":
+                    await answer_alert(
+                        "❌ На фото несколько лиц. Загрузите селфи с одним человеком.",
+                        show_alert=True,
+                    )
+                    return False
+                if face_asset and face_asset.status == "failed_error":
+                    await answer_alert(
+                        "⚠️ Не удалось подготовить фото. Загрузите фото ещё раз.",
+                        show_alert=True,
+                    )
+                    return False
             session = session_svc.get_active_session(user.id)
             session_id = None
-            is_paid_active_flow = False
             trial_v2_take = False
             trial_v2_used_reroll = False
             trial_trend_id = trend_id if trend_id != TREND_CUSTOM_ID else TREND_CUSTOM_ID
@@ -257,6 +306,8 @@ async def _create_job_and_start_generation(
                 await answer_alert("Бесплатное фото исчерпано. Купите пакет.", show_alert=True)
                 await _send_packages_upsell(bot, chat_id, "Бесплатное фото исчерпано.")
                 return False
+            if face_asset:
+                FaceAssetService(db).set_session_if_missing(face_asset, session_id)
             take = take_svc.create_take(
                 user_id=user.id,
                 trend_id=trend_id if trend_id != TREND_CUSTOM_ID else None,
@@ -266,8 +317,15 @@ async def _create_job_and_start_generation(
                 image_size=image_size,
                 input_file_ids=input_file_ids,
                 input_local_paths=input_local_paths,
+                face_asset_id=face_asset.id if face_asset else None,
                 copy_reference_path=copy_ref,
             )
+            if face_asset and face_asset.status == "pending":
+                take.status = "awaiting_face_id"
+                awaiting_face_asset = True
+                db.add(take)
+                db.flush()
+                face_id_pending_takes.set(int(db.query(TakeModel.id).filter(TakeModel.status == "awaiting_face_id").count()))
             if trial_v2_take:
                 ok_trial, err_trial, used_reroll = trial_v2_svc.register_take_started(
                     user_id=user.id,
@@ -308,6 +366,8 @@ async def _create_job_and_start_generation(
                     "image_size": image_size,
                     "take_type": take_type,
                     "session_id": session_id,
+                    "face_asset_id": getattr(take, "face_asset_id", None),
+                    "awaiting_face_id": awaiting_face_asset,
                     "custom": bool(custom_prompt),
                     "audience": audience,
                     "trial_v2_take": trial_v2_take,
@@ -330,10 +390,19 @@ async def _create_job_and_start_generation(
                     trend_id=_tid,
                     take_id=created_take_id,
                 )
-        from app.core.celery_app import celery_app
         ids_to_del = [message_ids_to_delete] if isinstance(message_ids_to_delete, int) else (message_ids_to_delete or [])
         valid_ids = [mid for mid in ids_to_del if mid is not None]
         await _try_delete_messages(bot, send_progress_to_chat_id, *valid_ids)
+        if awaiting_face_asset:
+            await bot.send_message(
+                send_progress_to_chat_id,
+                "⏳ Подготавливаем фото, стартуем автоматически…",
+                reply_markup=main_menu_keyboard(),
+            )
+            await state.clear()
+            logger.info("take_created_awaiting_face_id", extra={"user_id": telegram_id, "take_id": created_take_id})
+            return True
+        from app.core.celery_app import celery_app
         main_kb = main_menu_keyboard()
         intro_message_id = None
         if not is_paid_active_flow:
@@ -376,11 +445,12 @@ async def _create_job_and_start_generation(
                 },
             )
             enqueued = True
-        except Exception:
+        except Exception as e:
+            enqueue_error = f"{e.__class__.__name__}: {e}"
             logger.exception("take_enqueue_failed", extra={"user_id": telegram_id, "take_id": created_take_id})
             if created_take_id:
                 try:
-                    _mark_take_enqueue_failed(created_take_id, actor_id=telegram_id)
+                    _mark_take_enqueue_failed(created_take_id, actor_id=telegram_id, reason=enqueue_error)
                 except Exception:
                     logger.exception("take_enqueue_failed_compensation_error", extra={"take_id": created_take_id})
             await answer_alert("Не удалось запустить генерацию. Попробуйте ещё раз.", show_alert=True)
@@ -389,11 +459,12 @@ async def _create_job_and_start_generation(
         await state.clear()
         logger.info("take_created", extra={"user_id": telegram_id, "take_id": created_take_id})
         return True
-    except Exception:
+    except Exception as e:
+        enqueue_error = f"{e.__class__.__name__}: {e}"
         logger.exception("Error in _create_job_and_start_generation", extra={"user_id": telegram_id})
         if created_take_id and not enqueued:
             try:
-                _mark_take_enqueue_failed(created_take_id, actor_id=telegram_id)
+                _mark_take_enqueue_failed(created_take_id, actor_id=telegram_id, reason=enqueue_error)
             except Exception:
                 logger.exception("take_enqueue_failed_compensation_error", extra={"take_id": created_take_id})
         await answer_alert(t("errors.try_again", "Ошибка. Попробуйте ещё раз."), show_alert=True)

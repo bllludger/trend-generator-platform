@@ -1,0 +1,13 @@
+{
+  "asset_id": "4c1c6d07-45e0-45cb-ab4a-7163ae511d15",
+  "status": "failed_multi_face",
+  "faces_detected": 2,
+  "selected_path": null,
+  "source_path": "/data/generated_images/face_id_probe/source/4c1c6d07-45e0-45cb-ab4a-7163ae511d15.jpg",
+  "detector_meta": {
+    "latency_ms": 108,
+    "model_version": "mediapipe-face-detection-v1",
+    "reason": "multi_face"
+  },
+  "event_id": "d73183f6-3e61-4d3b-9857-8a460f70dfca"
+}

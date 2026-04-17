@@ -27,6 +27,11 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
     healthcheck:
       test: ["CMD-SHELL", "curl -f --connect-timeout 5 --max-time 10 http://localhost:8000/health || exit 1"]
       interval: 10s
@@ -53,6 +58,11 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   beat:
     build: .
@@ -86,6 +96,11 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   cleanup:
     build: .
@@ -110,6 +125,47 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+
+  face-id-api:
+    build:
+      context: ./face-id-service
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8010:8010"
+    volumes:
+      - ./data/generated_images:/data/generated_images
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  face-id-worker:
+    build:
+      context: ./face-id-service
+      dockerfile: Dockerfile
+    command: ["celery", "-A", "face_id_app.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=2", "-Q", "face_id"]
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:9094:9094"
+    environment:
+      FACE_ID_WORKER_METRICS_PORT: "9094"
+      CALLBACK_ALLOWED_HOSTS: "api,localhost,127.0.0.1,172.18.0.1,host.docker.internal"
+    volumes:
+      - ./data/generated_images:/data/generated_images
+    depends_on:
+      redis:
+        condition: service_healthy
+      face-id-api:
+        condition: service_healthy
+    restart: unless-stopped
 
   db:
     image: postgres:16
@@ -168,8 +224,35 @@ services:
       - "127.0.0.1:3001:3000"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/dashboards:/etc/grafana/dashboards:ro
     depends_on:
       - prometheus
+      - loki
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:2.9.8
+    command: ["-config.file=/etc/loki/config.yml"]
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./monitoring/loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:2.9.8
+    command: ["-config.file=/etc/promtail/config.yml"]
+    ports:
+      - "127.0.0.1:9080:9080"
+    volumes:
+      - ./monitoring/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail_positions:/var/lib/promtail
+    depends_on:
+      - loki
     restart: unless-stopped
 
   node_exporter:
@@ -210,3 +293,5 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  loki_data:
+  promtail_positions:

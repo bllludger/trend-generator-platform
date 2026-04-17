@@ -267,10 +267,9 @@ def deliver_hd(
             session_obj = db.query(Session).filter(Session.id == fav.session_id).one_or_none()
             if session_obj:
                 session_svc = SessionService(db)
-                used_ok = session_svc.use_hd(session_obj)
-                if not used_ok:
+                if not session_svc.consume_hd_credit_after_wallet_charge(session_obj):
                     logger.error(
-                        "deliver_hd_session_counter_desync",
+                        "deliver_hd_session_missing_after_charge",
                         extra={
                             "favorite_id": favorite_id,
                             "session_id": fav.session_id,

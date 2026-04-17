@@ -1,0 +1,11 @@
+fastapi==0.115.8
+uvicorn==0.30.6
+celery==5.4.0
+redis==5.2.0
+httpx==0.27.2
+pydantic==2.9.2
+pydantic-settings==2.5.2
+prometheus-client==0.21.0
+Pillow>=10.4.0
+numpy>=1.26.4
+mediapipe>=0.10.14

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>2 Примера: Вход и Выход Генерации</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --card: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+    }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      color: var(--text);
+      background: radial-gradient(circle at 10% 0%, #eef2ff, var(--bg) 45%);
+    }
+    .wrap {
+      max-width: 1080px;
+      margin: 28px auto;
+      padding: 0 16px 32px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    .sub {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.05);
+    }
+    .meta {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #fff;
+    }
+    .label {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+      font-weight: 600;
+      background: #f9fafb;
+    }
+    img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+    @media (max-width: 760px) {
+      .pair {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>2 Фото Входа и Что Получили Пользователи</h1>
+    <p class="sub">Реальные данные из успешных генераций (`takes.status = ready`, вариант A preview).</p>
+
+    <div class="grid">
+      <section class="card">
+        <div class="meta">
+          <strong>Кейс 1</strong> · Тренд: <strong>Дикая Стихия 🌿</strong> · Take ID: <code>e2d006a0-0231-4e10-aee0-a9263b4407cf</code>
+        </div>
+        <div class="pair">
+          <div class="item">
+            <div class="label">Входное фото</div>
+            <img src="./input_1.jpg" alt="Input 1" />
+          </div>
+          <div class="item">
+            <div class="label">Выход пользователя</div>
+            <img src="./output_1.webp" alt="Output 1" />
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="meta">
+          <strong>Кейс 2</strong> · Тренд: <strong>Черная Грация 🖤</strong> · Take ID: <code>38352aed-f70d-4aa8-a671-457ae46bc458</code>
+        </div>
+        <div class="pair">
+          <div class="item">
+            <div class="label">Входное фото</div>
+            <img src="./input_2.jpg" alt="Input 2" />
+          </div>
+          <div class="item">
+            <div class="label">Выход пользователя</div>
+            <img src="./output_2.webp" alt="Output 2" />
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</body>
+</html>

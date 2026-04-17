@@ -4,17 +4,21 @@ For collection sessions with SLA: issues idempotent compensation (HD credit retu
 For standalone sessions: simple reset to 'none'.
 """
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import update
 from sqlalchemy.exc import ProgrammingError
 
 from app.core.celery_app import celery_app
+from app.core.config import settings
 from app.db.session import SessionLocal
+from app.models.face_asset import FaceAsset
 from app.models.favorite import Favorite
 from app.models.session import Session
+from app.models.take import Take
 from app.services.audit.service import AuditService
-from app.utils.metrics import favorites_hd_stuck_rendering_reset_total
+from app.utils.metrics import favorites_hd_stuck_rendering_reset_total, face_id_pending_takes
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +175,109 @@ def detect_collection_drops() -> dict:
         return {"ok": False}
     except Exception:
         logger.exception("detect_collection_drops_error")
+        db.rollback()
+        return {"ok": False}
+    finally:
+        db.close()
+
+
+def _resolve_take_fallback_input_path(db, take: Take) -> str | None:
+    if take.session_id:
+        session = db.query(Session).filter(Session.id == take.session_id).one_or_none()
+        if session and session.input_photo_path and os.path.isfile(session.input_photo_path):
+            return session.input_photo_path
+    if isinstance(take.input_local_paths, list) and take.input_local_paths:
+        candidate = take.input_local_paths[0] if isinstance(take.input_local_paths[0], str) else None
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+@celery_app.task(
+    name="app.workers.tasks.watchdog_rendering.recover_stuck_face_id_takes",
+    time_limit=60,
+    soft_time_limit=55,
+)
+def recover_stuck_face_id_takes() -> dict:
+    """
+    Recover takes waiting for face-id too long:
+    - if processed asset already ready -> enqueue generation
+    - if still pending -> fallback to original image and enqueue
+    - if multi-face/error/no image -> fail with compensation path
+    """
+    db = SessionLocal()
+    try:
+        timeout_seconds = max(30, int(getattr(settings, "face_id_await_timeout_seconds", 180) or 180))
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)
+        stuck_takes = (
+            db.query(Take)
+            .filter(Take.status == "awaiting_face_id", Take.created_at < cutoff)
+            .order_by(Take.created_at.asc())
+            .all()
+        )
+        if not stuck_takes:
+            face_id_pending_takes.set(int(db.query(Take.id).filter(Take.status == "awaiting_face_id").count()))
+            return {"ok": True, "recovered": 0, "failed": 0}
+
+        from app.bot.handlers.generation import _mark_take_enqueue_failed
+
+        recovered = 0
+        failed = 0
+        for take in stuck_takes:
+            asset = None
+            if take.face_asset_id:
+                asset = db.query(FaceAsset).filter(FaceAsset.id == take.face_asset_id).one_or_none()
+
+            if asset and asset.status in {"failed_multi_face", "failed_error"}:
+                _mark_take_enqueue_failed(take.id, actor_id="face_id_watchdog", reason=str(asset.status))
+                failed += 1
+                continue
+
+            selected_path = None
+            if asset and asset.status in {"ready", "ready_fallback"} and asset.selected_path and os.path.isfile(asset.selected_path):
+                selected_path = asset.selected_path
+            if not selected_path and asset and asset.source_path and os.path.isfile(asset.source_path):
+                selected_path = asset.source_path
+                asset.status = "ready_fallback"
+                asset.selected_path = selected_path
+                asset.reason_code = "watchdog_timeout_fallback"
+                db.add(asset)
+            if not selected_path:
+                selected_path = _resolve_take_fallback_input_path(db, take)
+                if asset and selected_path:
+                    asset.status = "ready_fallback"
+                    asset.selected_path = selected_path
+                    asset.reason_code = "watchdog_timeout_fallback"
+                    db.add(asset)
+            if not selected_path:
+                _mark_take_enqueue_failed(take.id, actor_id="face_id_watchdog", reason="missing_input_after_timeout")
+                failed += 1
+                continue
+
+            kwargs = {}
+            if asset and asset.chat_id:
+                kwargs["status_chat_id"] = str(asset.chat_id)
+            try:
+                celery_app.send_task(
+                    "app.workers.tasks.generate_take.generate_take",
+                    args=[take.id],
+                    kwargs=kwargs,
+                )
+            except Exception:
+                logger.exception("face_id_watchdog_enqueue_failed", extra={"take_id": take.id, "asset_id": take.face_asset_id})
+                continue
+
+            take.status = "generating"
+            db.add(take)
+            recovered += 1
+
+        db.commit()
+        face_id_pending_takes.set(int(db.query(Take.id).filter(Take.status == "awaiting_face_id").count()))
+        if recovered or failed:
+            logger.warning("face_id_watchdog_processed", extra={"recovered": recovered, "failed": failed})
+        return {"ok": True, "recovered": recovered, "failed": failed}
+    except Exception:
+        logger.exception("face_id_watchdog_error")
         db.rollback()
         return {"ok": False}
     finally:

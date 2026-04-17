@@ -74,6 +74,7 @@ class TestPaymentsHistoryResponseStructure:
 
         db = MagicMock()
         q = MagicMock()
+        q.filter.return_value = q
         chain1 = MagicMock()
         chain1.group_by.return_value.order_by.return_value.all.return_value = [mock_row]
         chain2 = MagicMock()

@@ -37,8 +37,8 @@ class Trend(Base):
     prompt_size = Column(String(32), nullable=True)
     prompt_format = Column(String(16), nullable=True)
     # Playground profile: Gemini-native + reproducibility (1:1 в тренд)
-    prompt_aspect_ratio = Column(String(16), nullable=True, default="1:1")
-    prompt_image_size_tier = Column(String(8), nullable=True, default="1K")
+    prompt_aspect_ratio = Column(String(16), nullable=True)
+    prompt_image_size_tier = Column(String(8), nullable=True)
     prompt_temperature = Column(Float, nullable=True)  # 0.0 .. 2.0
     prompt_seed = Column(Integer, nullable=True)
     prompt_top_p = Column(Float, nullable=True)  # 0.0 .. 1.0

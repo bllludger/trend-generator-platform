@@ -1,7 +1,7 @@
 import logging
 from uuid import uuid4
 
-from sqlalchemy import case, update
+from sqlalchemy import case, func, update
 from sqlalchemy.orm import Session as DBSession
 
 from app.models.pack import Pack
@@ -234,6 +234,28 @@ class SessionService:
             update(Session)
             .where(Session.id == session.id, Session.hd_used < Session.hd_limit)
             .values(hd_used=Session.hd_used + 1)
+        )
+        self.db.flush()
+        if result.rowcount > 0:
+            self.db.refresh(session)
+            return True
+        return False
+
+    def consume_hd_credit_after_wallet_charge(self, session: Session) -> bool:
+        """
+        Increment session HD usage after User HD balance was already charged.
+
+        Unlike use_hd(), never fails when hd_used >= hd_limit: expands hd_limit to
+        match (wallet and session counters can diverge after top-ups, trial paths,
+        or deliver_hd_one without collection caps).
+        """
+        result = self.db.execute(
+            update(Session)
+            .where(Session.id == session.id)
+            .values(
+                hd_used=Session.hd_used + 1,
+                hd_limit=func.greatest(Session.hd_limit, Session.hd_used + 1),
+            )
         )
         self.db.flush()
         if result.rowcount > 0:

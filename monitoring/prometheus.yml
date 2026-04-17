@@ -23,6 +23,18 @@ scrape_configs:
     metrics_path: /metrics
     scrape_interval: 15s
 
+  - job_name: face-id-api
+    static_configs:
+      - targets: ["face-id-api:8010"]
+    metrics_path: /metrics
+    scrape_interval: 15s
+
+  - job_name: face-id-worker
+    static_configs:
+      - targets: ["face-id-worker:9094"]
+    metrics_path: /metrics
+    scrape_interval: 15s
+
   - job_name: node
     static_configs:
       - targets: ["node_exporter:9100"]
